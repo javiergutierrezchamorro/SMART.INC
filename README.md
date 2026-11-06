@@ -3,7 +3,7 @@
 **SMART.INC** is a single, dependency-free include file that brings back the
 code-generation conveniences that **Borland Turbo Assembler (TASM)** used to
 provide out of the box, for use with **MASM 6.0+**, **[ASMC](https://github.com/nidud/asmc)**
-and **[JWasm](https://github.com/jwasm/jwasm)**.
+and **[JWasm](https://github.com/jwasm/jwasm)**. It is based in previous **[SMART.INC by Javier Gutiérrez Chamorro (Guti)](https://www.javiergutierrezchamorro.com/smart-inc/)**.
 
 It targets classic x86 assembly — 8086 through 386 and up — where every cycle
 counts: DOS applications and games, boot sectors, demoscene productions, ROM
