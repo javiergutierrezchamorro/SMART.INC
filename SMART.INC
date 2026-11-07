@@ -1,26 +1,30 @@
 ;=====================================================================
-;  SMART.INC  v2.0  --  "TASM style" optimization macros
-;                       for MASM 6.0+ and ASMC (also JWasm)
+;  SMART.INC  v2.2  --  "TASM style" optimization macros
+;                       for ASMC, JWasm and UASM
 ;=====================================================================
-;  Brings to MASM/ASMC the facilities Turbo Assembler used to provide
+;  Brings to ASMC/JWasm the facilities Turbo Assembler used to provide
 ;  out of the box, and adds bit manipulation utilities:
 ;
 ;    1. SHL/SHR/SAL/SAR/ROL/ROR/RCL/RCR with a constant count on the
 ;       8086 (the 8086 only accepts shifting by 1 or by CL; with a
 ;       constant count the macro expands into 1-bit instructions).
 ;    2. MOVZX/MOVSX emulated on CPUs older than the 386.
-;    3. PUSH/POP with several operands (TASM 4 style; in MASM macro
-;       arguments are comma separated:  push ax, bx, cx).
+;    3. PUSH/POP with several operands (TASM 4 style; the macro
+;       argument separator is the comma:  push ax, bx, cx).
 ;    4. FastIMul dest, src, const : signed multiplication by a
 ;       constant using shifts and adds only (8086).
 ;    5. FastMul const : DX:AX = AX * const unsigned, like MUL r16.
 ;    6. setflag/clrflag/flipflag/testflag/maskflag : single bits.
 ;    7. setfield/getfield : bit field insertion and extraction.
 ;
-;  Requirements: MASM 6.0 or later, or ASMC/JWasm. Uses OPTION
-;  RENAMEKEYWORD, OPATTR, ELSEIFIDNI, FOR/VARARG, macro functions
-;  (EXITM %) and REPEAT/WHILE. The default CPU is 8086; with .186 or
-;  higher the shift macros and MOVZX/MOVSX are not defined because
+;  Requirements: an assembler that implements OPTION RENAMEKEYWORD:
+;  ASMC 2.40, JWasm 2.06+ or UASM. OPATTR, ELSEIFIDNI, FOR/VARARG,
+;  macro functions (EXITM %) and REPEAT/WHILE are used as well.
+;  Microsoft MASM CANNOT use this file: ml.exe has no RENAMEKEYWORD
+;  (its OPTION NOKEYWORD deletes the keyword instead of renaming it,
+;  so the original instruction becomes unreachable from the macro).
+;  TASM is not supported either. The default CPU is 8086; with .186
+;  or higher the shift macros and MOVZX/MOVSX are not defined because
 ;  equivalent native instructions already exist.
 ;
 ;  General notes:
@@ -28,6 +32,13 @@
 ;     (.8086/.186/.286/.386): @Cpu is evaluated at the include point.
 ;   - Include it BEFORE using the instructions it replaces (the
 ;     include enables OPTION RENAMEKEYWORD).
+;   - ASMC quirk: the replacement names used to reach the renamed
+;     instruction MUST start with a letter, digit, '$' or '?'. An
+;     identifier starting with '@' or '_' is always looked up in the
+;     user symbol table and never matches a keyword (JWasm/UASM
+;     accept any valid identifier, which hides the bug). This file
+;     uses the "??"-prefix convention of ASMC's own test suite
+;     (??shl, ??push, ...).
 ;   - On 8086, OPTION RENAMEKEYWORD:<shl>/<shr> also disables the
 ;     SHL and SHR expression OPERATORS (they share the token with
 ;     the instructions). The macros in this file compensate for it
@@ -38,12 +49,50 @@
 ;     assembly time.
 ;   - Protected against multiple inclusion.
 ;
-;  Verification: automated test bank of 104 cases (assembly,
-;  disassembly and result simulation) with JWasm 2.31, the same
-;  macro engine as ASMC; cross-checked against the test suite and
-;  the ASMC 2.40 source code.
+;  Verification: assembled with ASMC 2.40 (8086/186/286/386 targets)
+;  and JWasm 2.12 (4VIEW 1.04 itself also uses ASMC-only extensions
+;  such as .switch and inline "proto asmcall", so it builds with
+;  ASMC). FastIMul/FastMul verified numerically: every emitted
+;  instruction sequence is executed by an 8086 simulator for 220
+;  FastIMul and 150 FastMul (constant, seed) combinations, plus the
+;  -3 spot checks and a byte-level check of the shift/push/pop/bit
+;  expansions. The v2.0 "104 cases" bank only ever ran on JWasm,
+;  which is why none of this showed up there - see v2.1 below.
 ;
 ;  History:
+;   v2.2  Documentation only - no macro code was touched: the
+;         requirements no longer claim MASM 6.0+ support (OPTION
+;         RENAMEKEYWORD is an ASMC/JWasm/UASM extension; Microsoft
+;         MASM does not implement it), and the FastIMul doc block,
+;         accidentally duplicated four times, is a single copy
+;         again. Re-verified end to end on the unchanged macros:
+;         ASMC on the four CPU targets, JWasm, the error battery,
+;         the 8086 simulator suite and the 4VIEW 1.04 builds
+;         (byte-identical modulo the @Time stamp).
+;   v2.1  ASMC fix, three independent problems:
+;         1. The renamed instructions were invoked through "@@"-
+;            prefixed names (@@push, @@shl, ...). ASMC never looks up
+;            identifiers starting with '@' or '_' in the keyword
+;            table, so every expansion died with "error A2008: syntax
+;            error : @@push" (JWasm accepts any identifier, which is
+;            why the v2.0 test bank did not catch it). All replacement
+;            names now use the "??" prefix ASMC's own test suite uses.
+;         2. FastIMul produced silently WRONG code under ASMC for
+;            about a third of the constants (neg missing or shifted
+;            garbage, e.g. -6, -320, -1000, -16384): the expansion
+;            re-read its own assembly-time variables after WHILE
+;            bodies had been re-processed, and ASMC returns corrupted
+;            values for such reads (JWasm is unaffected). The macro
+;            now contains no assembly-time variables at all: every
+;            condition is a literal expression over the cte
+;            parameter, emitted as an MSB-first Horner chain that
+;            also preserves src (v2.0 destroyed it in the general
+;            case). FastIMul also rejects dest and src being both
+;            memory operands up front.
+;         3. setfield emitted the unencodable mask NOT 0FFFFh when
+;            the field filled the whole 16-bit operand (below 386)
+;            and silently assembled wrong code for fields wider than
+;            16 bits on those CPUs; both cases are now handled.
 ;   v2.0  Rewrite: restored the <...> arguments lost in
 ;         ifidni/renamekeyword; fixed movzx with ah/bh/ch/dh as
 ;         source; SHx accepts CL, no count and detects negative
@@ -94,160 +143,160 @@ ENDM
 ;
 ;  A count of 0 emits nothing; a negative count raises an error.
 ;  OPTION RENAMEKEYWORD frees the instruction name (it becomes
-;  @@shl) so the macro can take it over.
+;  ??shl) so the macro can take it over.
 ;  They work on registers and on memory as well (shl [bx], 3).
 ;=====================================================================
 
 IF ((@Cpu AND 0FFh) EQ 1)       ; 8086 only: 186+ accepts immediate counts
 
-    option renamekeyword:<shl>=@@shl
+    option renamekeyword:<shl>=??shl
 shl MACRO reg, val
     IFB <val>
-        @@shl reg, 1
+        ??shl reg, 1
     ELSEIFIDNI <val>, <1>
-        @@shl reg, 1
+        ??shl reg, 1
     ELSEIFIDNI <val>, <cl>
-        @@shl reg, cl
+        ??shl reg, cl
     ELSE
         IF (val) LT 0
             .ERR <shl: count cannot be negative>
             EXITM
         ENDIF
         REPEAT (val)
-            @@shl reg, 1
+            ??shl reg, 1
         ENDM
     ENDIF
 ENDM
 
-    option renamekeyword:<shr>=@@shr
+    option renamekeyword:<shr>=??shr
 shr MACRO reg, val
     IFB <val>
-        @@shr reg, 1
+        ??shr reg, 1
     ELSEIFIDNI <val>, <1>
-        @@shr reg, 1
+        ??shr reg, 1
     ELSEIFIDNI <val>, <cl>
-        @@shr reg, cl
+        ??shr reg, cl
     ELSE
         IF (val) LT 0
             .ERR <shr: count cannot be negative>
             EXITM
         ENDIF
         REPEAT (val)
-            @@shr reg, 1
+            ??shr reg, 1
         ENDM
     ENDIF
 ENDM
 
-    option renamekeyword:<sal>=@@sal
+    option renamekeyword:<sal>=??sal
 sal MACRO reg, val
     IFB <val>
-        @@sal reg, 1
+        ??sal reg, 1
     ELSEIFIDNI <val>, <1>
-        @@sal reg, 1
+        ??sal reg, 1
     ELSEIFIDNI <val>, <cl>
-        @@sal reg, cl
+        ??sal reg, cl
     ELSE
         IF (val) LT 0
             .ERR <sal: count cannot be negative>
             EXITM
         ENDIF
         REPEAT (val)
-            @@sal reg, 1
+            ??sal reg, 1
         ENDM
     ENDIF
 ENDM
 
-    option renamekeyword:<sar>=@@sar
+    option renamekeyword:<sar>=??sar
 sar MACRO reg, val
     IFB <val>
-        @@sar reg, 1
+        ??sar reg, 1
     ELSEIFIDNI <val>, <1>
-        @@sar reg, 1
+        ??sar reg, 1
     ELSEIFIDNI <val>, <cl>
-        @@sar reg, cl
+        ??sar reg, cl
     ELSE
         IF (val) LT 0
             .ERR <sar: count cannot be negative>
             EXITM
         ENDIF
         REPEAT (val)
-            @@sar reg, 1
+            ??sar reg, 1
         ENDM
     ENDIF
 ENDM
 
-    option renamekeyword:<rol>=@@rol
+    option renamekeyword:<rol>=??rol
 rol MACRO reg, val
     IFB <val>
-        @@rol reg, 1
+        ??rol reg, 1
     ELSEIFIDNI <val>, <1>
-        @@rol reg, 1
+        ??rol reg, 1
     ELSEIFIDNI <val>, <cl>
-        @@rol reg, cl
+        ??rol reg, cl
     ELSE
         IF (val) LT 0
             .ERR <rol: count cannot be negative>
             EXITM
         ENDIF
         REPEAT (val)
-            @@rol reg, 1
+            ??rol reg, 1
         ENDM
     ENDIF
 ENDM
 
-    option renamekeyword:<ror>=@@ror
+    option renamekeyword:<ror>=??ror
 ror MACRO reg, val
     IFB <val>
-        @@ror reg, 1
+        ??ror reg, 1
     ELSEIFIDNI <val>, <1>
-        @@ror reg, 1
+        ??ror reg, 1
     ELSEIFIDNI <val>, <cl>
-        @@ror reg, cl
+        ??ror reg, cl
     ELSE
         IF (val) LT 0
             .ERR <ror: count cannot be negative>
             EXITM
         ENDIF
         REPEAT (val)
-            @@ror reg, 1
+            ??ror reg, 1
         ENDM
     ENDIF
 ENDM
 
-    option renamekeyword:<rcl>=@@rcl
+    option renamekeyword:<rcl>=??rcl
 rcl MACRO reg, val
     IFB <val>
-        @@rcl reg, 1
+        ??rcl reg, 1
     ELSEIFIDNI <val>, <1>
-        @@rcl reg, 1
+        ??rcl reg, 1
     ELSEIFIDNI <val>, <cl>
-        @@rcl reg, cl
+        ??rcl reg, cl
     ELSE
         IF (val) LT 0
             .ERR <rcl: count cannot be negative>
             EXITM
         ENDIF
         REPEAT (val)
-            @@rcl reg, 1
+            ??rcl reg, 1
         ENDM
     ENDIF
 ENDM
 
-    option renamekeyword:<rcr>=@@rcr
+    option renamekeyword:<rcr>=??rcr
 rcr MACRO reg, val
     IFB <val>
-        @@rcr reg, 1
+        ??rcr reg, 1
     ELSEIFIDNI <val>, <1>
-        @@rcr reg, 1
+        ??rcr reg, 1
     ELSEIFIDNI <val>, <cl>
-        @@rcr reg, cl
+        ??rcr reg, cl
     ELSE
         IF (val) LT 0
             .ERR <rcr: count cannot be negative>
             EXITM
         ENDIF
         REPEAT (val)
-            @@rcr reg, 1
+            ??rcr reg, 1
         ENDM
     ENDIF
 ENDM
@@ -271,7 +320,7 @@ ENDIF   ; @Cpu = 8086
 
 IF ((@Cpu AND 0FFh) LT 8)       ; 8086/186/286 (386+ has native MOVZX/MOVSX)
 
-    option renamekeyword:<movzx>=@@movzx
+    option renamekeyword:<movzx>=??movzx
 movzx MACRO reg, val
     IFIDNI <reg>, <ax>
         mov al, val
@@ -290,7 +339,7 @@ movzx MACRO reg, val
     ENDIF
 ENDM
 
-    option renamekeyword:<movsx>=@@movsx
+    option renamekeyword:<movsx>=??movsx
 movsx MACRO reg, val
     IFIDNI <reg>, <ax>
         mov al, val
@@ -317,8 +366,8 @@ ENDIF   ; CPU < 386
 ;=====================================================================
 ;  3. PUSH/POP WITH SEVERAL OPERANDS (TASM 4 style)
 ;=====================================================================
-;  TASM 4+ accepted "PUSH AX BX CX". In MASM the macro argument
-;  separator is the comma, so the form here is:
+;  TASM 4+ accepted "PUSH AX BX CX". Here the macro argument
+;  separator is the comma, so the form is:
 ;
 ;       push ax, bx, cx        ; three PUSHes in written order
 ;       pop  cx, bx, ax        ; three POPs in written order
@@ -328,25 +377,25 @@ ENDIF   ; CPU < 386
 ;  PUSHA/PUSHF/POPA/POPF are left untouched.
 ;=====================================================================
 
-    option renamekeyword:<push>=@@push
+    option renamekeyword:<push>=??push
 push MACRO ops:VARARG
     IFB <ops>
         .ERR <push: missing operands>
         EXITM
     ENDIF
     FOR o, <ops>
-        @@push o
+        ??push o
     ENDM
 ENDM
 
-    option renamekeyword:<pop>=@@pop
+    option renamekeyword:<pop>=??pop
 pop MACRO ops:VARARG
     IFB <ops>
         .ERR <pop: missing operands>
         EXITM
     ENDIF
     FOR o, <ops>
-        @@pop o
+        ??pop o
     ENDM
 ENDM
 
@@ -354,28 +403,31 @@ ENDM
 ;  4. FastIMul dest, src, const
 ;=====================================================================
 ;  Multiplies signed by a constant without using IMUL (which on the
-;  8086 costs 118-133 cycles). Shifts, adds and subtracts only.
+;  8086 costs 118-133 cycles). Shifts and adds only; the expansion is
+;  an MSB-first Horner chain:
+;
+;       mov dest, src              ; the highest set bit of |const|
+;       shl dest, 1                ; one run per lower bit...
+;       IF bit:  add dest, src     ; ...plus the set ones
+;       ...
+;       IF negative:  neg dest
 ;
 ;    dest : register (or memory with a declared size) that receives
 ;           the result; same size as src (WORD on 8086; with .386
 ;           DWORD works too: the macro is size agnostic).
-;    src  : register or memory of the same size. DESTROYED in the
-;           general case; PRESERVED when const is 0, +-2^j or of the
-;           form (2^k - 1)*2^j with k >= 4 (shortcuts, see below).
+;    src  : register or memory of the same size. PRESERVED (the v2.1
+;           expansion accumulates into dest and never shifts src).
 ;    const: signed constant, -32768 to 65535 (values 32768..65535
 ;           are taken as their 16-bit two's complement). Must be
 ;           known at assembly time.
 ;
-;  Besides the general method the macro uses two shortcuts:
-;    - const = +-2^j                    : dest = (src << j)  (+ NEG)
-;    - const = (2^k - 1) * 2^j, k >= 4  : dest = ((src << k) - src) << j
-;      (the "Mersenne" shortcut: one SUB instead of k-1 ADDs; in v1
-;      this shortcut needed two extra MOVs and destroyed src).
-;
-;  General method (from least to most significant):
-;    const = 2^a0 + 2^a1 + ...  =>  shl src up to 2^a0, mov dest, src,
-;    and for each following bit: shl src and, if the bit is set,
-;    add dest, src.
+;  The expansion contains no assembly-time variables at all: every
+;  condition is a literal expression over the cte parameter, which
+;  the assembler substitutes textually on each expansion. ASMC (not
+;  JWasm) returns corrupted values when an expansion re-reads its
+;  own assembly-time variables, which silently scrambled v2.0's
+;  results for a third of the constants; parameter-only expressions
+;  are immune. See the v2.1 history entry.
 ;
 ;  Examples:  FastIMul ax, bx, 45    ; ax = bx * 45
 ;             FastIMul cx, dx, -7    ; cx = -7 * dx
@@ -387,84 +439,206 @@ FastIMul MACRO dest, src, cte
         .ERR <FastIMul: dest and src must be different operands>
         EXITM
     ENDIF
+    IF ((OPATTR (dest)) AND 2) AND ((OPATTR (src)) AND 2)
+        .ERR <FastIMul: dest and src cannot both be memory>
+        EXITM
+    ENDIF
     IF ((cte) LT -32768) OR ((cte) GT 0FFFFh)
         .ERR <FastIMul: const out of range (-32768..65535)>
         EXITM
     ENDIF
 
-    fmV = (cte) AND 0FFFFh          ; 16-bit pattern of the constant
-    IF fmV AND 8000h                ; negative?
-        fmV = (0 - fmV) AND 0FFFFh  ; absolute value
-        fmNeg = 1
-    ELSE
-        fmNeg = 0
-    ENDIF
-
-    IF fmV EQ 0                     ; x * 0 = 0 (preserves src and flags)
+    IF (((cte) AND 0FFFFh)) EQ 0                       ; const = 0 (16-bit pattern)
         mov dest, 0
         EXITM
     ENDIF
-
-    fmJ = 0                         ; trailing zeros: fmV = fmM * 2^fmJ
-    fmM = fmV
-    WHILE (fmM AND 1) EQ 0
-        fmM = fmM / 2               ; (SHR operator is unavailable here: see __Pow2)
-        fmJ = fmJ + 1
-    ENDM
-
-    IF fmM EQ 1                     ; const = +-2^fmJ : preserves src
+    IF ((cte) AND 0FFFFh) AND 8000h                       ; negative (bit 15 of the pattern)
+;       t = 10000h - (cte AND 0FFFFh), result negated at the end
         mov dest, src
-        fmI = fmJ
-        WHILE fmI
+        IF ((10000h - ((cte) AND 0FFFFh))) / 8000h
             shl dest, 1
-            fmI = fmI - 1
-        ENDM
-    ELSE
-        fmK = 0                     ; number of bits of fmM
-        fmT = fmM
-        WHILE fmT
-            fmK = fmK + 1
-            fmT = fmT / 2
-        ENDM
-
-        fmP = __Pow2(fmK)
-        IF (fmM EQ (fmP - 1)) AND (fmK GE 4)
-            ; Mersenne shortcut: x*((2^k - 1)*2^j) = ((x << k) - x) << j
-            ; preserves src (v1 shifted src in place and needed 2 more MOVs)
-            mov dest, src
-            fmI = fmK
-            WHILE fmI
-                shl dest, 1
-                fmI = fmI - 1
-            ENDM
-            sub dest, src
-            fmI = fmJ               ; restore the stripped trailing zeros
-            WHILE fmI
-                shl dest, 1
-                fmI = fmI - 1
-            ENDM
-        ELSE
-            ; general case: src is shifted in place, dest accumulates
-            ; (v1's fmA equalled fmJ: redundant computation removed)
-            fmI = fmJ
-            WHILE fmI
-                shl src, 1
-                fmI = fmI - 1
-            ENDM
-            mov dest, src
-            fmT = fmV / __Pow2(fmJ + 1) ; bits above fmJ
-            WHILE fmT
-                shl src, 1
-                IF fmT AND 1
-                    add dest, src
-                ENDIF
-                fmT = fmT / 2
-            ENDM
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 4000h
+                add dest, src
+            ENDIF
         ENDIF
-    ENDIF
-
-    IF fmNeg
+        IF ((10000h - ((cte) AND 0FFFFh))) / 4000h
+            shl dest, 1
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 2000h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF ((10000h - ((cte) AND 0FFFFh))) / 2000h
+            shl dest, 1
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 1000h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF ((10000h - ((cte) AND 0FFFFh))) / 1000h
+            shl dest, 1
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 800h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF ((10000h - ((cte) AND 0FFFFh))) / 800h
+            shl dest, 1
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 400h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF ((10000h - ((cte) AND 0FFFFh))) / 400h
+            shl dest, 1
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 200h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF ((10000h - ((cte) AND 0FFFFh))) / 200h
+            shl dest, 1
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 100h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF ((10000h - ((cte) AND 0FFFFh))) / 100h
+            shl dest, 1
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 80h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF ((10000h - ((cte) AND 0FFFFh))) / 80h
+            shl dest, 1
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 40h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF ((10000h - ((cte) AND 0FFFFh))) / 40h
+            shl dest, 1
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 20h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF ((10000h - ((cte) AND 0FFFFh))) / 20h
+            shl dest, 1
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 10h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF ((10000h - ((cte) AND 0FFFFh))) / 10h
+            shl dest, 1
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 8h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF ((10000h - ((cte) AND 0FFFFh))) / 8h
+            shl dest, 1
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 4h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF ((10000h - ((cte) AND 0FFFFh))) / 4h
+            shl dest, 1
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 2h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF ((10000h - ((cte) AND 0FFFFh))) / 2h
+            shl dest, 1
+            IF ((10000h - ((cte) AND 0FFFFh))) AND 1
+                add dest, src
+            ENDIF
+        ENDIF
         neg dest
+    ELSE
+;       t = cte AND 0FFFFh
+        mov dest, src
+        IF (((cte) AND 0FFFFh)) / 8000h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 4000h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF (((cte) AND 0FFFFh)) / 4000h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 2000h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF (((cte) AND 0FFFFh)) / 2000h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 1000h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF (((cte) AND 0FFFFh)) / 1000h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 800h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF (((cte) AND 0FFFFh)) / 800h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 400h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF (((cte) AND 0FFFFh)) / 400h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 200h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF (((cte) AND 0FFFFh)) / 200h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 100h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF (((cte) AND 0FFFFh)) / 100h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 80h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF (((cte) AND 0FFFFh)) / 80h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 40h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF (((cte) AND 0FFFFh)) / 40h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 20h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF (((cte) AND 0FFFFh)) / 20h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 10h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF (((cte) AND 0FFFFh)) / 10h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 8h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF (((cte) AND 0FFFFh)) / 8h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 4h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF (((cte) AND 0FFFFh)) / 4h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 2h
+                add dest, src
+            ENDIF
+        ENDIF
+        IF (((cte) AND 0FFFFh)) / 2h
+            shl dest, 1
+            IF (((cte) AND 0FFFFh)) AND 1
+                add dest, src
+            ENDIF
+        ENDIF
     ENDIF
 ENDM
 
@@ -647,6 +821,12 @@ ENDM
 ;           Inserts the constant val into the field (truncated to
 ;           width bits); the rest of the operand is preserved.
 ;           Emits:  AND rm, NOT (mask)  +  OR rm, (val * 2^lo)
+;           except when the field fills the whole 16-bit operand on
+;           a CPU below the 386: then the AND would need the
+;           unencodable mask NOT 0FFFFh and is skipped (nothing to
+;           preserve). On those CPUs a field wider than the 16-bit
+;           operand is an error instead of silently emitting wrong
+;           code; on a 386+ build 32-bit fields work as documented.
 ;
 ;       getfield dest, src, lo, width
 ;           Extracts the field with zero extension: copies src into
@@ -654,7 +834,8 @@ ENDM
 ;           dest and src are the same operand no MOV is emitted;
 ;           the two operands cannot both be memory.
 ;
-;  Compatible with MASM/TASM RECORD (native in MASM 6+/ASMC):
+;  Compatible with the RECORD syntax (native in ASMC/JWasm, as in
+;  MASM 6+):
 ;       DOOR RECORD CLOSED:1, MODE:2, SPEED:5   ; SPEED = bits 3..7
 ;  allows writing   setfield ax, 3, WIDTH SPEED, 17
 ;  and              getfield bx, ax, 3, WIDTH SPEED
@@ -665,6 +846,16 @@ ENDM
 setfield MACRO rm, lo, width, val
     IF ((lo) LT 0) OR ((width) LT 1) OR ((width) GT 31) OR (((lo) + (width)) GT 32)
         .ERR <setfield: invalid range of lo/width (lo + width up to 32)>
+        EXITM
+    ENDIF
+    IF ((@Cpu AND 0FFh) LT 8) AND (((lo) + (width)) GT 16)
+        .ERR <setfield: field does not fit the 16-bit operand of this CPU>
+        EXITM
+    ENDIF
+    IF ((@Cpu AND 0FFh) LT 8) AND (((lo) + (width)) EQ 16)
+            ; the field covers the whole 16-bit operand: nothing to
+            ; preserve, and NOT 0FFFFh (0FFFF0000h) does not encode
+        or  rm, ((val) AND (__Pow2(width) - 1)) * __Pow2(lo)
         EXITM
     ENDIF
     and rm, NOT ((__Pow2(width) - 1) * __Pow2(lo))
