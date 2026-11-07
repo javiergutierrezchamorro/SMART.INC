@@ -1,5 +1,5 @@
 ;=====================================================================
-;  SMART.INC  v2.2  --  "TASM style" optimization macros
+;  SMART.INC  v2.3  --  "TASM style" optimization macros
 ;                       for ASMC, JWasm and UASM
 ;=====================================================================
 ;  Brings to ASMC/JWasm the facilities Turbo Assembler used to provide
@@ -59,7 +59,22 @@
 ;  expansions. The v2.0 "104 cases" bank only ever ran on JWasm,
 ;  which is why none of this showed up there - see v2.1 below.
 ;
+;  v2.3 was assembled with UASM 2.57 on the 8086 and 386 targets
+;  (the ASMC 2.40 Linux binary was not runnable in the build
+;  environment of this pass: it is a 32-bit image and the host
+;  forbids 32-bit system calls). The changed expansions were checked
+;  by disassembly, and the new FastMul power-of-two paths
+;  were executed - instruction by instruction - for EVERY 16-bit
+;  multiplicand (0..65535) and every factor 256/512/.../32768 by
+;  the 8086 simulator, against a 32-bit reference product.
+;
 ;  History:
+;   v2.3  FastMul, power-of-two factors: the 386+ build now emits
+;         movzx eax,ax / shl eax,k (two instructions, no BX), and
+;         the 8086 build switches to two half-window shifts for
+;         k >= 8 (six instructions instead of up to 30; CL is
+;         destroyed in that path, and BX is not). k < 8 keeps the
+;         old shl/rcl loop. Every other path is byte-identical.
 ;   v2.2  Documentation only - no macro code was touched: the
 ;         requirements no longer claim MASM 6.0+ support (OPTION
 ;         RENAMEKEYWORD is an ASMC/JWasm/UASM extension; Microsoft
@@ -646,12 +661,20 @@ ENDM
 ;  5. FastMul const  ->  DX:AX = AX * const, unsigned (like MUL r16)
 ;=====================================================================
 ;  const: constant from 0 to 0FFFFh, known at assembly time.
-;  Destroys BX (and CX when a real MUL wins) and the flags. It does
-;  not reproduce the CF/OF values MUL would leave, only the result.
+;  Destroys BX (not on the 386+ power-of-two path), CL (8086
+;  power-of-two factors from 256 up) and CX (when a real MUL wins),
+;  plus the flags. It does not reproduce the CF/OF values MUL would
+;  leave, only the result.
 ;
 ;  Strategies, best first depending on the bit pattern:
 ;    - const = 0                          : XOR AX / XOR DX
 ;    - const = 2^k                        : 32-bit shift
+;      (v2.3) 386+: movzx eax,ax / shl eax,k - two instructions and
+;      BX is not touched. 8086 with k >= 8: two half-window shifts
+;      (mov dx,ax / shr dx,cl with 16-k, then the low bits left and
+;      shifted k) - six instructions instead of the old 2*k shl/rcl
+;      pairs, which cost up to 30 instructions for 32768. 8086 with
+;      k < 8 keeps the original shl ax,1 / rcl dx,1 loop.
 ;    - const = (2^k - 1) * 2^j, k >= 4    : 32-bit Mersenne shortcut
 ;      (new in v2.0): ((x << k) - x) << j with SUB/SBB; turns dense
 ;      factors like 0FFFFh into ~2/3 of the instructions.
@@ -684,13 +707,25 @@ FastMul MACRO factor
     fmHi = fmHi - 1
 
     IF fmOnes EQ 1                  ; factor = power of 2
-        xor dx, dx
-        fmI = fmHi
-        WHILE fmI
-            shl ax, 1
-            rcl dx, 1
-            fmI = fmI - 1
-        ENDM
+        IF ((@Cpu AND 0FFh) GE 8)   ; 386+: one native wide shift (v2.3)
+            movzx eax, ax           ; EAX = zero-extended multiplicand
+            shl  eax, fmHi          ; DX:AX = AX << k, no BX touched
+        ELSEIF fmHi GE 8            ; 8086, k >= 8: two halves (v2.3)
+            mov  dx, ax
+            mov  cl, 16 - fmHi      ; (16-k) is a constant
+            shr  dx, cl             ; DX = X >> (16-k) = high word
+            and  ax, __Pow2(16 - fmHi) - 1  ; keep the low 16-k bits
+            mov  cl, fmHi
+            shl  ax, cl             ; AX = (X AND mask) << k = low word
+        ELSE                        ; 8086, k < 8: the short way (v1)
+            xor dx, dx
+            fmI = fmHi
+            WHILE fmI
+                shl ax, 1
+                rcl dx, 1
+                fmI = fmI - 1
+            ENDM
+        ENDIF
         EXITM
     ENDIF
 
