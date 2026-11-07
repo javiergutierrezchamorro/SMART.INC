@@ -1,5 +1,5 @@
 ;=====================================================================
-;  SMART.INC  v2.3  --  "TASM style" optimization macros
+;  SMART.INC  v2.4  --  "TASM style" optimization macros
 ;                       for ASMC, JWasm and UASM
 ;=====================================================================
 ;  Brings to ASMC/JWasm the facilities Turbo Assembler used to provide
@@ -59,16 +59,26 @@
 ;  expansions. The v2.0 "104 cases" bank only ever ran on JWasm,
 ;  which is why none of this showed up there - see v2.1 below.
 ;
-;  v2.3 was assembled with UASM 2.57 on the 8086 and 386 targets
-;  (the ASMC 2.40 Linux binary was not runnable in the build
+;  v2.4 was assembled with UASM 2.57 on the 8086 and 386 targets
+;  (the ASMC 2.40 Linux binary is not runnable in the build
 ;  environment of this pass: it is a 32-bit image and the host
 ;  forbids 32-bit system calls). The changed expansions were checked
-;  by disassembly, and the new FastMul power-of-two paths
-;  were executed - instruction by instruction - for EVERY 16-bit
-;  multiplicand (0..65535) and every factor 256/512/.../32768 by
-;  the 8086 simulator, against a 32-bit reference product.
+;  by disassembly, the 8086 target stayed byte-identical to v2.3
+;  (verified on the test battery), and the new FastMul IMUL path was
+;  executed - instruction by instruction - for EVERY 16-bit
+;  multiplicand (0..65535) and a factor battery (dense, sparse,
+;  Mersenne and MUL-worst cases) against a 32-bit reference product.
 ;
 ;  History:
+;   v2.4  FastMul, 386+ every non-power-of-two factor: the Horner
+;         chain, the Mersenne shortcut and the real MUL fallback are
+;         replaced by one native IMUL: movzx eax,ax / imul edx,eax,f
+;         (the 32-bit product of AX*f always fits EDX, so DX:AX is
+;         exact). Two instructions instead of 10-30, BX and CL are
+;         not touched, and factors that used to fall back to the
+;         ~118-137-cycle MUL now take the ~13-38-cycle IMUL. The
+;         power-of-two path stays movzx/shl (cheaper than IMUL), and
+;         the 8086 build is byte-identical to v2.3.
 ;   v2.3  FastMul, power-of-two factors: the 386+ build now emits
 ;         movzx eax,ax / shl eax,k (two instructions, no BX), and
 ;         the 8086 build switches to two half-window shifts for
@@ -661,10 +671,10 @@ ENDM
 ;  5. FastMul const  ->  DX:AX = AX * const, unsigned (like MUL r16)
 ;=====================================================================
 ;  const: constant from 0 to 0FFFFh, known at assembly time.
-;  Destroys BX (not on the 386+ power-of-two path), CL (8086
-;  power-of-two factors from 256 up) and CX (when a real MUL wins),
-;  plus the flags. It does not reproduce the CF/OF values MUL would
-;  leave, only the result.
+;  Destroys BX (not on the 386+ paths), CL (8086 power-of-two
+;  factors from 256 up) and CX (when a real MUL wins), plus the
+;  flags; the 386+ paths also rewrite the high word of EAX. It does
+;  not reproduce the CF/OF values MUL would leave, only the result.
 ;
 ;  Strategies, best first depending on the bit pattern:
 ;    - const = 0                          : XOR AX / XOR DX
@@ -675,12 +685,22 @@ ENDM
 ;      shifted k) - six instructions instead of the old 2*k shl/rcl
 ;      pairs, which cost up to 30 instructions for 32768. 8086 with
 ;      k < 8 keeps the original shl ax,1 / rcl dx,1 loop.
+;    - any other const, 386+ (v2.4): one native IMUL -
+;      movzx eax,ax / imul edx,eax,const. The 32-bit product of
+;      AX*f (both under 65536) always fits EDX, so DX = high word
+;      and AX (preserved by IMUL) = low word are the exact result.
+;      Replaces the Mersenne shortcut, the Horner chain (10-30
+;      instructions) and the ~118-137-cycle real-MUL fallback with
+;      one ~13-38-cycle instruction; BX and CL are not touched and
+;      the high word of EAX is cleared by the MOVZX.
 ;    - const = (2^k - 1) * 2^j, k >= 4    : 32-bit Mersenne shortcut
 ;      (new in v2.0): ((x << k) - x) << j with SUB/SBB; turns dense
-;      factors like 0FFFFh into ~2/3 of the instructions.
-;    - MSB-to-LSB Horner with the DX:AX accumulator (v1)
+;      factors like 0FFFFh into ~2/3 of the instructions. 8086 only
+;      since v2.4.
+;    - MSB-to-LSB Horner with the DX:AX accumulator (v1, 8086 only
+;      since v2.4)
 ;    - real MUL when the expansion would come out worse
-;      (~118-137 cycles)
+;      (~118-137 cycles; 8086 only since v2.4)
 ;=====================================================================
 
 FastMul MACRO factor
@@ -726,6 +746,12 @@ FastMul MACRO factor
                 fmI = fmI - 1
             ENDM
         ENDIF
+        EXITM
+    ENDIF
+
+    IF ((@Cpu AND 0FFh) GE 8)       ; 386+: one native IMUL (v2.4)
+        movzx eax, ax               ; EAX = zero-extended multiplicand
+        imul edx, eax, fmF          ; EDX = AX*f; fits 32 bits, exact
         EXITM
     ENDIF
 
