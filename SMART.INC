@@ -1,5 +1,5 @@
 ;=====================================================================
-;  SMART.INC  v2.4  --  "TASM style" optimization macros
+;  SMART.INC  v2.42  --  "TASM style" optimization macros
 ;                       for ASMC, JWasm and UASM
 ;=====================================================================
 ;  Brings to ASMC/JWasm the facilities Turbo Assembler used to provide
@@ -58,6 +58,10 @@
 ;  -3 spot checks and a byte-level check of the shift/push/pop/bit
 ;  expansions. The v2.0 "104 cases" bank only ever ran on JWasm,
 ;  which is why none of this showed up there - see v2.1 below.
+;  Since v2.42 the -3 battery compares the DX:AX PAIR (not EAX and
+;  not EDX) against the reference product for every 16-bit
+;  multiplicand: v2.4's EDX check was exactly what the broken path
+;  produced, which is how the bug shipped.
 ;
 ;  v2.4 was assembled with UASM 2.57 on the 8086 and 386 targets
 ;  (the ASMC 2.40 Linux binary is not runnable in the build
@@ -70,6 +74,18 @@
 ;  Mersenne and MUL-worst cases) against a 32-bit reference product.
 ;
 ;  History:
+;   v2.42 FastMul, 386+ paths: THE DX:AX CONTRACT REALLY HOLDS NOW.
+;         v2.4's "movzx eax,ax / imul edx,eax,f" left the product in
+;         EDX (DX = its LOW word, AX = the untouched multiplicand)
+;         and v2.41's one-word repair "imul eax,eax,f" fixed AX but
+;         STILL never wrote DX - the high word of the product was
+;         lost in both, and every caller that divides DX:AX 16-bit
+;         (4VIEW's DrwSt/DrwBar percents, fix 90's freeze) got a
+;         garbage dividend. Both 386 paths now end with "shld
+;         edx,eax,16" so DX carries the high word (factor 1
+;         collapses to "xor dx,dx"), and the battery compares the
+;         full DX:AX pair for every 16-bit multiplicand. The 8086
+;         target is byte-identical to v2.3/v2.41.
 ;   v2.4  FastMul, 386+ every non-power-of-two factor: the Horner
 ;         chain, the Mersenne shortcut and the real MUL fallback are
 ;         replaced by one native IMUL: movzx eax,ax / imul edx,eax,f
@@ -673,23 +689,33 @@ ENDM
 ;  const: constant from 0 to 0FFFFh, known at assembly time.
 ;  Destroys BX (not on the 386+ paths), CL (8086 power-of-two
 ;  factors from 256 up) and CX (when a real MUL wins), plus the
-;  flags; the 386+ paths also rewrite the high word of EAX. It does
+;  flags; the 386+ paths rewrite the whole EAX and the whole EDX
+;  (DX is half of the RESULT, so EDX is fully owned by the macro
+;  since v2.42). It does
 ;  not reproduce the CF/OF values MUL would leave, only the result.
 ;
 ;  Strategies, best first depending on the bit pattern:
 ;    - const = 0                          : XOR AX / XOR DX
 ;    - const = 2^k                        : 32-bit shift
-;      (v2.3) 386+: movzx eax,ax / shl eax,k - two instructions and
-;      BX is not touched. 8086 with k >= 8: two half-window shifts
+;      (v2.3) 386+: movzx eax,ax / shl eax,k, plus (v2.42) shld
+;      edx,eax,16 to deliver DX - three instructions and
+;      BX is not touched (factor 1 is just "xor dx,dx"). 8086 with
+;      k >= 8: two half-window shifts
 ;      (mov dx,ax / shr dx,cl with 16-k, then the low bits left and
 ;      shifted k) - six instructions instead of the old 2*k shl/rcl
 ;      pairs, which cost up to 30 instructions for 32768. 8086 with
 ;      k < 8 keeps the original shl ax,1 / rcl dx,1 loop.
-;    - any other const, 386+ (v2.4): one native IMUL -
-;      movzx eax,ax / imul edx,eax,const. The 32-bit product of
-;      AX*f (both under 65536) always fits EDX, so DX = high word
-;      and AX (preserved by IMUL) = low word are the exact result.
-;      Replaces the Mersenne shortcut, the Horner chain (10-30
+;    - any other const, 386+: one native IMUL -
+;      movzx eax,ax / imul eax,eax,const / shld edx,eax,16 (v2.42).
+;      The 32-bit product of AX*f (both under 65536) always fits
+;      EAX, so AX = its low word for free and the SHLD lifts its
+;      high word into DX: the DX:AX pair the macro promises. (v2.4
+;      emitted "imul edx,eax,const" - the product landed in EDX,
+;      DX took its LOW word and AX stayed the multiplicand; v2.41
+;      fixed AX but still never wrote DX. Both broke every caller
+;      that divides the pair, 4VIEW's fix 90 percent freeze being
+;      the reported case.) Replaces the Mersenne shortcut, the
+;      Horner chain (10-30
 ;      instructions) and the ~118-137-cycle real-MUL fallback with
 ;      one ~13-38-cycle instruction; BX and CL are not touched and
 ;      the high word of EAX is cleared by the MOVZX.
@@ -728,8 +754,16 @@ FastMul MACRO factor
 
     IF fmOnes EQ 1                  ; factor = power of 2
         IF ((@Cpu AND 0FFh) GE 8)   ; 386+: one native wide shift (v2.3)
-            movzx eax, ax           ; EAX = zero-extended multiplicand
-            shl  eax, fmHi          ; DX:AX = AX << k, no BX touched
+            IF fmHi EQ 0            ; x*1: DX:AX = 0:AX, AX untouched
+                xor dx, dx          ; (v2.42)
+            ELSE
+                movzx eax, ax       ; EAX = zero-extended multiplicand
+                shl  eax, fmHi      ; EAX = the 32-bit product
+                shld edx, eax, 16   ; DX = its high word (v2.42: the
+            ENDIF                   ; macro's DX:AX contract - up to
+                                    ; v2.41 DX was never written in
+                                    ; this path, so the caller's 16-bit
+                                    ; DIVs divided a stale high word)
         ELSEIF fmHi GE 8            ; 8086, k >= 8: two halves (v2.3)
             mov  dx, ax
             mov  cl, 16 - fmHi      ; (16-k) is a constant
@@ -751,8 +785,17 @@ FastMul MACRO factor
 
     IF ((@Cpu AND 0FFh) GE 8)       ; 386+: one native IMUL (v2.4)
         movzx eax, ax               ; EAX = zero-extended multiplicand
-        imul edx, eax, fmF          ; EDX = AX*f; fits 32 bits, exact
-        EXITM
+        imul eax, eax, fmF          ; EAX = AX*f, exact: it always fits
+        shld edx, eax, 16           ; 32 bits. v2.42: SHLD lifts the high
+        EXITM                       ; word into DX so the macro's DX:AX
+                                    ; contract really holds - v2.4 put
+                                    ; the product in EDX with "imul
+                                    ; edx,eax,f" and v2.41 kept the
+                                    ; one-word "imul eax,eax,f" repair
+                                    ; but still never wrote DX: both
+                                    ; left the caller's 16-bit DIV with
+                                    ; a garbage high word (4VIEW's fix
+                                    ; 90 percent freeze was one case)
     ENDIF
 
     fmJ = 0                         ; trailing zeros (odd factor * 2^fmJ)
