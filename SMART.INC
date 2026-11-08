@@ -1,5 +1,5 @@
 ;=====================================================================
-;  SMART.INC  v2.42  --  "TASM style" optimization macros
+;  SMART.INC  v2.43  --  "TASM style" optimization macros
 ;                       for ASMC, JWasm and UASM
 ;=====================================================================
 ;  Brings to ASMC/JWasm the facilities Turbo Assembler used to provide
@@ -74,6 +74,16 @@
 ;  Mersenne and MUL-worst cases) against a 32-bit reference product.
 ;
 ;  History:
+;   v2.43 Source simplification, ZERO code change: the eight 8086
+;         shift macros each repeated the same 15-line body and only
+;         differed in the instruction they emit. The body now lives
+;         once in the internal __SHx helper and every macro is a
+;         two-line wrapper that just names its instruction (SAL
+;         keeps its own ??sal - it encodes exactly as SHL anyway).
+;         The negative-count error text is uniform ("shift: ...").
+;         The assembled output is byte-identical to v2.42 on the
+;         full 8086 battery; the 386 target defines none of these
+;         macros.
 ;   v2.42 FastMul, 386+ paths: THE DX:AX CONTRACT REALLY HOLDS NOW.
 ;         v2.4's "movzx eax,ax / imul edx,eax,f" left the product in
 ;         EDX (DX = its LOW word, AX = the untouched multiplicand)
@@ -186,160 +196,73 @@ ENDM
 ;  OPTION RENAMEKEYWORD frees the instruction name (it becomes
 ;  ??shl) so the macro can take it over.
 ;  They work on registers and on memory as well (shl [bx], 3).
+;  All eight share one expansion body (v2.43): the internal __SHx
+;  helper receives the renamed instruction as its first argument and
+;  every macro is a two-line wrapper. SAL keeps its own ??sal rename
+;  (SAL and SHL are the same opcode, so the bytes match shl's).
 ;=====================================================================
 
 IF ((@Cpu AND 0FFh) EQ 1)       ; 8086 only: 186+ accepts immediate counts
 
-    option renamekeyword:<shl>=??shl
-shl MACRO reg, val
+;  __SHx op, reg, val - the shared body of all eight macros (v2.43):
+;  expands op (the renamed instruction) under the rules below. Every
+;  macro is a two-line wrapper that only names its instruction.
+__SHx MACRO op, reg, val
     IFB <val>
-        ??shl reg, 1
+        op reg, 1
     ELSEIFIDNI <val>, <1>
-        ??shl reg, 1
+        op reg, 1
     ELSEIFIDNI <val>, <cl>
-        ??shl reg, cl
+        op reg, cl
     ELSE
         IF (val) LT 0
-            .ERR <shl: count cannot be negative>
+            .ERR <shift: count cannot be negative>
             EXITM
         ENDIF
         REPEAT (val)
-            ??shl reg, 1
+            op reg, 1
         ENDM
     ENDIF
+ENDM
+
+    option renamekeyword:<shl>=??shl
+shl MACRO reg, val
+    __SHx ??shl, reg, val
 ENDM
 
     option renamekeyword:<shr>=??shr
 shr MACRO reg, val
-    IFB <val>
-        ??shr reg, 1
-    ELSEIFIDNI <val>, <1>
-        ??shr reg, 1
-    ELSEIFIDNI <val>, <cl>
-        ??shr reg, cl
-    ELSE
-        IF (val) LT 0
-            .ERR <shr: count cannot be negative>
-            EXITM
-        ENDIF
-        REPEAT (val)
-            ??shr reg, 1
-        ENDM
-    ENDIF
+    __SHx ??shr, reg, val
 ENDM
 
     option renamekeyword:<sal>=??sal
 sal MACRO reg, val
-    IFB <val>
-        ??sal reg, 1
-    ELSEIFIDNI <val>, <1>
-        ??sal reg, 1
-    ELSEIFIDNI <val>, <cl>
-        ??sal reg, cl
-    ELSE
-        IF (val) LT 0
-            .ERR <sal: count cannot be negative>
-            EXITM
-        ENDIF
-        REPEAT (val)
-            ??sal reg, 1
-        ENDM
-    ENDIF
+    __SHx ??sal, reg, val          ; SAL encodes as SHL: same bytes
 ENDM
 
     option renamekeyword:<sar>=??sar
 sar MACRO reg, val
-    IFB <val>
-        ??sar reg, 1
-    ELSEIFIDNI <val>, <1>
-        ??sar reg, 1
-    ELSEIFIDNI <val>, <cl>
-        ??sar reg, cl
-    ELSE
-        IF (val) LT 0
-            .ERR <sar: count cannot be negative>
-            EXITM
-        ENDIF
-        REPEAT (val)
-            ??sar reg, 1
-        ENDM
-    ENDIF
+    __SHx ??sar, reg, val
 ENDM
 
     option renamekeyword:<rol>=??rol
 rol MACRO reg, val
-    IFB <val>
-        ??rol reg, 1
-    ELSEIFIDNI <val>, <1>
-        ??rol reg, 1
-    ELSEIFIDNI <val>, <cl>
-        ??rol reg, cl
-    ELSE
-        IF (val) LT 0
-            .ERR <rol: count cannot be negative>
-            EXITM
-        ENDIF
-        REPEAT (val)
-            ??rol reg, 1
-        ENDM
-    ENDIF
+    __SHx ??rol, reg, val
 ENDM
 
     option renamekeyword:<ror>=??ror
 ror MACRO reg, val
-    IFB <val>
-        ??ror reg, 1
-    ELSEIFIDNI <val>, <1>
-        ??ror reg, 1
-    ELSEIFIDNI <val>, <cl>
-        ??ror reg, cl
-    ELSE
-        IF (val) LT 0
-            .ERR <ror: count cannot be negative>
-            EXITM
-        ENDIF
-        REPEAT (val)
-            ??ror reg, 1
-        ENDM
-    ENDIF
+    __SHx ??ror, reg, val
 ENDM
 
     option renamekeyword:<rcl>=??rcl
 rcl MACRO reg, val
-    IFB <val>
-        ??rcl reg, 1
-    ELSEIFIDNI <val>, <1>
-        ??rcl reg, 1
-    ELSEIFIDNI <val>, <cl>
-        ??rcl reg, cl
-    ELSE
-        IF (val) LT 0
-            .ERR <rcl: count cannot be negative>
-            EXITM
-        ENDIF
-        REPEAT (val)
-            ??rcl reg, 1
-        ENDM
-    ENDIF
+    __SHx ??rcl, reg, val
 ENDM
 
     option renamekeyword:<rcr>=??rcr
 rcr MACRO reg, val
-    IFB <val>
-        ??rcr reg, 1
-    ELSEIFIDNI <val>, <1>
-        ??rcr reg, 1
-    ELSEIFIDNI <val>, <cl>
-        ??rcr reg, cl
-    ELSE
-        IF (val) LT 0
-            .ERR <rcr: count cannot be negative>
-            EXITM
-        ENDIF
-        REPEAT (val)
-            ??rcr reg, 1
-        ENDM
-    ENDIF
+    __SHx ??rcr, reg, val
 ENDM
 
 ENDIF   ; @Cpu = 8086
