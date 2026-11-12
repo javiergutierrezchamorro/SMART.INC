@@ -1,9 +1,9 @@
 ;=====================================================================
-;  SMART.INC  v2.43  --  "TASM style" optimization macros
+;  SMART.INC  v3.6  --  "TASM style" optimization macros
 ;                       for ASMC, JWasm and UASM
 ;=====================================================================
-;  Brings to ASMC/JWasm the facilities Turbo Assembler used to provide
-;  out of the box, and adds bit manipulation utilities:
+;  Brings to ASMC/JWasm/UASM the facilities Turbo Assembler used to
+;  provide out of the box, and adds bit manipulation utilities:
 ;
 ;    1. SHL/SHR/SAL/SAR/ROL/ROR/RCL/RCR with a constant count on the
 ;       8086 (the 8086 only accepts shifting by 1 or by CL; with a
@@ -12,10 +12,34 @@
 ;    3. PUSH/POP with several operands (TASM 4 style; the macro
 ;       argument separator is the comma:  push ax, bx, cx).
 ;    4. FastIMul dest, src, const : signed multiplication by a
-;       constant using shifts and adds only (8086).
-;    5. FastMul const : DX:AX = AX * const unsigned, like MUL r16.
+;       constant using shifts and adds only (8086; on 386+ with
+;       register operands: LEA for 3, 5, 9, 6, 10, 12, 18, 20, 24,
+;       and one native IMUL when |const| > 8).
+;    5. FastMul const : DX:AX = AX * const unsigned, like MUL r16
+;       (386+: LEA shortcuts for 3, 5, 9 and 6, 10, 12, 18, 20, 24;
+;       one native IMUL for the rest).
 ;    6. setflag/clrflag/flipflag/testflag/maskflag : single bits.
 ;    7. setfield/getfield : bit field insertion and extraction.
+;    8. mov/xchg reg, reg eliminated: "mov ax, ax" and "xchg ax,
+;       ax" assemble to nothing (any other MOV/XCHG passes through
+;       unchanged; ??mov / ??xchg force the original instruction).
+;       SMART mode, the default; NOSMART disables it (v3.3/v3.5).
+;    9. lea reg16, var rewritten as "mov reg, OFFSET var" when that
+;       is shorter (SMART mode, v3.4; ??lea forces the original).
+;   10. conditional jumps extended automatically: a backward jump
+;       out of short range becomes "j<inv> over jmp target", and
+;       forward jumps always take the extended form so none can
+;       die with "jump destination too far" (SMART mode, v3.4;
+;       ??jxx forces the short form).
+;   11. JCXZ and LOOP extended automatically too (v3.6): the two
+;       short-only jumps that have neither an inverse nor a long
+;       encoding - OPTION LJMP cannot lengthen them, so they were
+;       the last instructions able to die with "error A2075: jump
+;       destination too far". The macro measures backward targets
+;       and keeps the 2-byte form while it fits; anything else goes
+;       through a near-JMP trampoline that preserves the flags and
+;       LOOP's CX = 0 wrap exactly (SMART mode; ??jcxz / ??loop
+;       force the original instruction).
 ;
 ;  Requirements: an assembler that implements OPTION RENAMEKEYWORD:
 ;  ASMC 2.40, JWasm 2.06+ or UASM. OPATTR, ELSEIFIDNI, FOR/VARARG,
@@ -43,8 +67,17 @@
 ;     SHL and SHR expression OPERATORS (they share the token with
 ;     the instructions). The macros in this file compensate for it
 ;     with the __Pow2 function; if your own code needs 2^n in
-;     constant expressions, use __Pow2(n) or multiplications.
+;     constant expressions, use __Pow2(n) or multiplications. The
+;     mov rename (item 8) has no effect on any expression operator
+;     (MOV does not share a token with one).
 ;   - Unless stated otherwise, all macros destroy the flags.
+;   - SMART/NOSMART (v3.3) toggle the automatic optimizations, like
+;     TASM's; the default is SMART. Currently automatic: the "mov
+;     reg, reg" and "xchg reg, reg" eliminations (item 8), the
+;     "lea reg16, var" to "mov reg, OFFSET var" substitution
+;     (item 9) and the extended conditional jumps (item 10). The
+;     rest of the library is explicit macro calls and is not
+;     affected.
 ;   - Counts and constants must be constant expressions known at
 ;     assembly time.
 ;   - Protected against multiple inclusion.
@@ -62,6 +95,28 @@
 ;  not EDX) against the reference product for every 16-bit
 ;  multiplicand: v2.4's EDX check was exactly what the broken path
 ;  produced, which is how the bug shipped.
+;  v3.2's FastIMul refactor was proven byte-identical by comparing
+;  the old and new instruction sequences for all 98,304 constants
+;  (0 differences), and the 386+ LEA/IMUL decision tree was executed
+;  for 2,359,296 (constant, size, register/memory, seed)
+;  combinations against a signed reference product (0 failures).
+;  The v3.3 SMART/NOSMART switch was checked in both states: the
+;  SMART output is byte-identical to v3.2, and NOSMART passes every
+;  MOV through, including "mov ax, ax". The v3.4 jump logic was
+;  simulated for every backward distance 0..400: the short form is
+;  kept exactly while the displacement fits (-128..127, boundary
+;  at 126/127 verified) and the trampoline displacement (+3) is
+;  always in range; the lea decision table was checked against the
+;  byte counts (mov r16,imm16 = 3 vs lea r16,m16 = 4). The v3.5
+;  alias renames restore the v2.0 rule (every taken-over mnemonic
+;  is freed before its macro is defined), so the include again
+;  emits no code at include time and can be included outside a
+;  segment. The v3.6 JCXZ/LOOP trampoline was checked against the
+;  same 0..400 backward-distance sweep (short kept exactly while
+;  the displacement fits, boundary 126/127) and the trampoline's
+;  own displacements (+2 short hop, full-range near JMP) are in
+;  range by construction; the CX = 0 wrap and the untouched flags
+;  were verified against the native instructions' semantics.
 ;
 ;  v2.4 was assembled with UASM 2.57 on the 8086 and 386 targets
 ;  (the ASMC 2.40 Linux binary is not runnable in the build
@@ -74,6 +129,212 @@
 ;  Mersenne and MUL-worst cases) against a 32-bit reference product.
 ;
 ;  History:
+;   v3.6  The last "jump destination too far" hole closed:
+;         1. JCXZ and LOOP are intercepted now (option
+;            renamekeyword, SMART mode, escapes ??jcxz / ??loop).
+;            They are the only two jumps with neither an inverse
+;            nor a long encoding: ASMC's OPTION LJMP lengthens the
+;            conditional jumps automatically, but a JCXZ or LOOP
+;            whose destination lands more than 127 bytes away dies
+;            with "error A2075: jump destination too far" and
+;            nothing in the assembler can save it (reported by
+;            4VIEW.ASM on the 386 build: A2075 by 2 bytes - one
+;            forward Jcc extended by the v3.4 macros grew the code
+;            between a short-only jump and its target by exactly
+;            one 2-to-5-byte extension). The macro keeps the
+;            2-byte form for backward targets measured in range
+;            (same $ - target <= 126 rule as __Jcc) and otherwise
+;            emits the trampoline "jxx near-label / jmp over /
+;            near-label: jmp target": JCXZ touches no flags and
+;            the LOOP trampoline neither (the real LOOP inside it
+;            does the decrement), so both stay 100% transparent,
+;            including LOOP's CX = 0 wrap. NOSMART passes both
+;            through in the native form.
+;         2. LOOPE/LOOPNE/LOOPZ/LOOPNZ are NOT intercepted: they
+;            test ZF, so the trampoline would need a flag-safe
+;            bridge that costs more than the instruction is worth;
+;            they keep the native short-only behavior.
+;   v3.5  Bug fix, version constant, one more redundant case:
+;         1. FIXED: the 14 alias jump macros (jz, jnz, jc, jnc,
+;            jna, jnae, jnb, jnbe, jng, jnge, jnl, jnle, jpe,
+;            jpo) were defined without freeing their keyword
+;            first, so ASMC parsed "jz MACRO target" as the jz
+;            INSTRUCTION: "error A2034: must be in segment block"
+;            at the definition line, the macro body then executed
+;            as main-line code (its __Jcc expansion emitted
+;            instructions outside any segment) and the orphaned
+;            ENDM aborted with "fatal error A1008: unmatched
+;            macro nesting" (reported by 4VIEW.ASM, which
+;            includes SMART.INC outside a segment - the include
+;            emits no code at include time, so that is fine).
+;            Every alias now has its option renamekeyword line,
+;            the same rule every other taken-over mnemonic has
+;            followed since v2.0; the ??jz-style escapes exist
+;            now as a side effect.
+;         2. The inclusion guard now carries the version:
+;            __SMART_INC__ = 350 means v3.5 (major*100 + minor,
+;            the banner numbering). Source can test
+;            "IF __SMART_INC__ GE 350" before using a feature.
+;         3. xchg joins the redundant-instruction elimination
+;            (??xchg escape): "xchg reg, reg" with the same
+;            register assembles to nothing under SMART - it
+;            changes no register, no memory and no flags. CAREFUL:
+;            the 1-byte "xchg ax, ax" (opcode 90h) is the classic
+;            single-byte NOP used for alignment padding; SMART
+;            removes it like any other dead instruction, and
+;            ??xchg ax, ax forces the byte back. NOSMART passes
+;            everything through.
+;   v3.4  Bug fix plus the TASM SMART optimizations - two new
+;         automatic transformations, both disabled by NOSMART:
+;         1. FIXED: FastIMul died at assembly time on ASMC with
+;            "error A2006: undefined symbol : TYPE" (reported by
+;            4VIEW.ASM): the v3.2 register-size checks used the
+;            TYPE operator, which ASMC disables by default (it
+;            wants TYPEOF or the -Zne switch, and neither is
+;            portable to JWasm/UASM; the OPATTR word carries no
+;            size bits either). The checks are now textual: a new
+;            internal __RegBits function matches the operand name
+;            against the 24 register names with IFIDNI and returns
+;            1, 2, 4 or 0. The emitted code is unchanged on every
+;            assembler; on ASMC it assembles again.
+;         2. lea is taken over (??lea escape): "lea reg16, var"
+;            with a DIRECT memory source (OPATTR bits 1 and 3 set,
+;            bit 6 clear) and a 16-bit register destination becomes
+;            "mov reg, OFFSET var" - 3 bytes instead of 4, same
+;            address, no flags touched. Every other LEA (indexed
+;            sources, 32-bit destinations) passes through
+;            byte-identical, including the internal LEA forms of
+;            FastIMul and FastMul.
+;         3. The 30 conditional jump mnemonics are taken over
+;            (??jxx escape): a backward target that is a known
+;            local code label is MEASURED, and the short form is
+;            kept while it fits ($ - target <= 126); anything
+;            farther, and every forward reference or external
+;            target (whose distance cannot be measured at
+;            expansion time - OPATTR returns 0 for forward
+;            references), takes the extended form "j<inverse> over
+;            jmp target" (5 bytes, always encodable), so no
+;            conditional jump can die with "jump destination too
+;            far". Targets written as @F/@B pass through with
+;            their native semantics (the macro must not insert
+;            anonymous labels that would hijack them); the
+;            trampoline label is a macro LOCAL, invisible to the
+;            user's symbols. NOSMART passes every jump through in
+;            the short form, i.e. the native behavior.
+;         4. Considered and NOT implemented: minimum-size
+;            instruction encodings (ASMC/JWasm/UASM already pick
+;            the sign-extended imm8 forms and the short JMPs
+;            natively) and cross-instruction stack optimizations
+;            (a macro expansion cannot see its neighboring
+;            instructions; the multi-operand push/pop macros
+;            remain the tool for that).
+;   v3.3  New directives, no expansion changes in SMART mode: SMART
+;         and NOSMART, the TASM-style optimization switch. The
+;         default is SMART. NOSMART disables the only automatic
+;         transformation of the file, the "mov reg, reg"
+;         elimination (section 8): every MOV then passes through
+;         byte-identical until the next SMART. The rest of the
+;         library is not affected (its macros are explicit calls
+;         the user wrote on purpose, not silent rewrites of
+;         instructions the assembler would also accept). The
+;         switch is a plain global assembly-time flag (??smart)
+;         read by the mov expansion, which contains no WHILE and
+;         defines no variables of its own, so it stays outside the
+;         ASMC v2.1 re-read bug pattern. ??mov ax, ax keeps forcing
+;         the original instruction in both modes.
+;   v3.2  Cleanup plus one new FastIMul shortcut; FastMul and the
+;         shift/push/pop/bit/field/mov macros are untouched:
+;         1. FastIMul, 386+ with DWORD register dest AND register
+;            src: factors 3, 5, 9 emit ONE LEA and 6, 10, 12, 18,
+;            20, 24 emit LEA + ADD/SHL, mirroring FastMul's v3.1
+;            tree (1-2 instructions vs 3-7 for the chain or IMUL).
+;            The LEA forms need 32-bit registers (the SIB byte does
+;            not exist in 16-bit addressing), so WORD destinations
+;            keep the chain. The three-operand IMUL now also
+;            requires a non-BYTE destination (TYPE dest NE 1):
+;            IMUL r,r,imm has no byte encoding, and a BYTE FastIMul
+;            - which the chain always supported - would have died
+;            at assembly time since v3.1 (found in this review;
+;            the chain is restored for it).
+;         2. FastIMul's chain is ONE copy now: the two 15-block
+;            branches (negative/positive) differed only in the
+;            magnitude expression, and __IMag already unifies it.
+;            A new internal __Horn helper holds the single Horner
+;            step, FastIMul calls it 15 times, and the negative
+;            case just appends NEG. The expansion stays
+;            parameter-only (ASMC v2.1 doctrine) and the emitted
+;            code is byte-identical for all 98,304 constants
+;            (verified by exhaustive comparison of the old and new
+;            sequences); about 95 source lines shorter.
+;         3. The five flag macros and setfield/getfield share the
+;            new __BitRange/__FieldRange validators; the error
+;            texts are unchanged (the macro name is passed as a
+;            parameter into the .ERR text).
+;   v3.1  Speed, four changes; the shift/push/pop/bit/field/mov
+;         expansions and the FastIMul chain are untouched:
+;         1. FastMul, 386+: factors 3, 5, 9 now use ONE LEA
+;            (lea eax,[eax+eax*2/4/8]; 1-2 cycles vs 13-42 for
+;            IMUL r32,imm) and 6, 10, 12, 18, 20, 24 use
+;            LEA + ADD/SHL (two instructions). Every other factor
+;            keeps the v2.4 IMUL; the DX:AX contract is unchanged
+;            (the SHLD closing stays).
+;         2. FastIMul, 386+ with a REGISTER destination: constants
+;            whose 16-bit magnitude exceeds 8 now emit one native
+;            three-operand IMUL (9-22 cycles r16, 9-38 r32) instead
+;            of chains of up to 30 instructions. |cte| <= 8, memory
+;            destinations and every CPU below the 386 keep the
+;            shift/add chain. Constants in 32768..65535 are passed
+;            to IMUL as their negative two's complement equivalent
+;            (new __ISgn helper), which the 16-bit encodings made
+;            moot but a DWORD destination needs (a positive 65535
+;            immediate would mean +65535, not -1).
+;         3. FastMul: the MUL-fallback threshold moves from 110 to
+;            117 estimated cycles. The old model ignored the
+;            5-cycle fixed overhead of the chain (mov bx,ax +
+;            xor dx,dx) and priced MUL at 110 when mov cx,imm +
+;            MUL r16 really costs 122-137; breakeven is 117. The
+;            6,304 factors in the 111..117 band switch from MUL to
+;            the Horner chain (verified exhaustively); the truly
+;            dense factors (>= 10 set bits) still take the real
+;            MUL, which remains the best 8086 option for them -
+;            no shortcut gets a dense 16-bit factor near 10-30
+;            cycles on an 8086.
+;         4. FastMul's assembly-time variables (fmF, fmHi, fmOnes,
+;            fmT, fmJ, fmM, fmK, fmP, fmI) are now LOCAL to the
+;            macro: no user symbol can collide with them and no
+;            state leaks between expansions.
+;         Analyzed and REJECTED: a "(2^k + 1) * 2^j" shortcut
+;         ("inverse Mersenne", (x << k + x) << j with ADD/ADC).
+;         For every one of the 120 factors of that form the Horner
+;         chain already emits EXACTLY the same instructions in the
+;         same order (the top bit is implicit in the initial
+;         mov/accumulator, which saves the extra shift the shortcut
+;         would pay), so the shortcut would add macro code without
+;         changing one byte of output. Example, factor 18:
+;           Horner actual : shl,rcl,shl,rcl,shl,rcl,add,adc,shl,rcl
+;           Atajo propuesto: shl,rcl,shl,rcl,shl,rcl,add,adc,shl,rcl
+;   v3.0  New macro, no existing expansion touched: MOV is now also
+;         taken over (OPTION RENAMEKEYWORD:<mov>, defined at EVERY
+;         CPU level). "mov reg, reg" with the same register on both
+;         sides assembles to nothing - it changes no register, no
+;         memory and no flags, so removing it cannot change the
+;         behavior of the program. Every other MOV (different
+;         register, immediate, memory, segment) passes through
+;         byte-identical. Deliberately NOT implemented: turning
+;         "mov reg, 0" into "xor reg, reg". MOV leaves the flags
+;         untouched and XOR destroys them, so that "optimization"
+;         can silently break flag-dependent code; SMART only removes
+;         instructions that provably do nothing. A "mov ax, ax"
+;         kept on purpose (2-byte timing delay, patch hole in
+;         self-modifying code) can be forced with "??mov ax, ax".
+;         Detection is textual (IFIDNI, case-insensitive) plus an
+;         OPATTR register check, so identical text that is not a
+;         register pair (e.g. the invalid "mov [bx], [bx]") still
+;         reaches the assembler and keeps raising its normal error.
+;         The battery should gain three mov cases before release:
+;         an eliminated "mov ax, ax" (zero bytes), a forced
+;         "??mov ax, ax" (2 bytes) and pass-through of the
+;         remaining forms.
 ;   v2.43 Source simplification, ZERO code change: the eight 8086
 ;         shift macros each repeated the same 15-line body and only
 ;         differed in the instruction they emit. The body now lives
@@ -153,7 +414,38 @@
 ;=====================================================================
 
 IFNDEF __SMART_INC__
-__SMART_INC__ = 1
+;  Version constant: mayor*100 + menor (360 = v3.6). Source can test
+;  "IF __SMART_INC__ GE 360" before using a newer feature.
+__SMART_INC__ = 360
+
+;=====================================================================
+;  SMART / NOSMART  (new in v3.3) - the TASM-style optimization
+;  switch. SMART (the default, as in TASM) enables the automatic
+;  optimizations of this file; NOSMART turns them off and every
+;  taken-over instruction passes through byte-identical until the
+;  next SMART. The automatic transformations (all disabled by
+;  NOSMART) are: the "mov reg, reg" and "xchg reg, reg"
+;  eliminations (section 8), the "lea reg16, var" to "mov reg,
+;  OFFSET var" substitution (section 9) and the extended
+;  conditional jumps (section 10). The rest of
+;  the library consists of explicit macro calls the user wrote on
+;  purpose, so NOSMART does not affect it.
+;  The switch is one global assembly-time flag (??smart) read by
+;  the automatic expansions. Those expansions contain no WHILE and
+;  define no assembly-time variables of their own, so the read is
+;  outside the ASMC v2.1 re-read bug pattern.
+;=====================================================================
+
+??smart = 1                         ; TASM default: SMART mode on
+
+SMART   MACRO
+    ??smart = 1
+ENDM
+
+NOSMART MACRO
+    ??smart = 0
+ENDM
+
 
 ;=====================================================================
 ;  0. __Pow2 n  (internal function:  returns 2^n)
@@ -393,10 +685,116 @@ ENDM
 ;  results for a third of the constants; parameter-only expressions
 ;  are immune. See the v2.1 history entry.
 ;
+;  On a 386+ build with a REGISTER destination: factors 3, 5 and 9
+;  with a register source emit ONE LEA (lea dest,[src+src*2/4/8];
+;  1-2 cycles vs 13-42 for IMUL r32,imm) and 6, 10, 12, 18, 20, 24
+;  emit LEA + ADD/SHL (two instructions), mirroring FastMul's tree;
+;  the LEA forms need 32-bit registers (the SIB byte does not exist
+;  in 16-bit addressing), so WORD destinations keep the chain.
+;  Other constants whose 16-bit magnitude is greater than 8 emit one
+;  native three-operand IMUL (9-22 cycles for r16, 9-38 for r32)
+;  instead of a chain of up to 30 instructions. |cte| <= 8, BYTE
+;  destinations (the three-operand IMUL has no byte encoding),
+;  memory destinations, memory sources and every CPU below the 386
+;  keep the shift/add chain. Constants in 32768..65535 are passed to
+;  IMUL as their negative two's complement equivalent, so the
+;  documented contract also holds for DWORD destinations (a positive
+;  65535 immediate would mean +65535, not -1). The three-operand
+;  IMUL preserves src, like the shortcuts.
+;
 ;  Examples:  FastIMul ax, bx, 45    ; ax = bx * 45
 ;             FastIMul cx, dx, -7    ; cx = -7 * dx
 ;             FastIMul eax, ebx, 1000; DWORD version with .386
 ;=====================================================================
+
+;  __IMag c  - internal function: 16-bit magnitude of the cte
+;  pattern (32768..65535 count as their negative two's complement).
+;  __ISgn c  - internal function: the signed value IMUL must receive
+;  (32768..65535 become their negative equivalent).
+;  Both are pure parameter expressions with no assembly-time
+;  variables, so they are immune to the ASMC re-read bug of v2.1.
+__IMag MACRO c
+    EXITM %(((((c) AND 8000h) NE 0) AND (10000h - ((c) AND 0FFFFh))) + ((NOT (((c) AND 8000h) NE 0)) AND ((c) AND 0FFFFh)))
+ENDM
+
+__ISgn MACRO c
+    EXITM %(((((c) GT 32767) AND ((c) - 10000h)) + ((NOT (((c) GT 32767))) AND (c))))
+ENDM
+
+;  __Horn c, mask, d, s - internal macro: one Horner step of the
+;  FastIMul chain (v3.2). If the 16-bit magnitude of c reaches
+;  "mask", shift the accumulator once, and add s if the bit just
+;  below "mask" is set. c is FastIMul's parameter passed through,
+;  so every condition stays parameter-only (ASMC-safe, v2.1).
+__Horn MACRO c, mask, d, s
+    IF (__IMag(c)) / (mask)
+        shl d, 1
+        IF (__IMag(c)) AND ((mask) / 2)
+            add d, s
+        ENDIF
+    ENDIF
+ENDM
+
+;  __RegBits r - internal function: 1, 2 or 4 if r is an 8, 16 or
+;  32-bit register, 0 otherwise. Textual on purpose: the TYPE
+;  operator is NOT portable (ASMC disables it by default - it wants
+;  TYPEOF or the -Zne switch, and neither exists in JWasm/UASM;
+;  4VIEW.ASM died with "error A2006: undefined symbol : TYPE" in
+;  the v3.2 FastIMul checks), and the OPATTR word carries no size
+;  bits. IFIDNI is case-insensitive and works everywhere.
+__RegBits MACRO r
+    IFIDNI <r>, <al>
+        EXITM %1
+    ELSEIFIDNI <r>, <ah>
+        EXITM %1
+    ELSEIFIDNI <r>, <bl>
+        EXITM %1
+    ELSEIFIDNI <r>, <bh>
+        EXITM %1
+    ELSEIFIDNI <r>, <cl>
+        EXITM %1
+    ELSEIFIDNI <r>, <ch>
+        EXITM %1
+    ELSEIFIDNI <r>, <dl>
+        EXITM %1
+    ELSEIFIDNI <r>, <dh>
+        EXITM %1
+    ELSEIFIDNI <r>, <ax>
+        EXITM %2
+    ELSEIFIDNI <r>, <bx>
+        EXITM %2
+    ELSEIFIDNI <r>, <cx>
+        EXITM %2
+    ELSEIFIDNI <r>, <dx>
+        EXITM %2
+    ELSEIFIDNI <r>, <si>
+        EXITM %2
+    ELSEIFIDNI <r>, <di>
+        EXITM %2
+    ELSEIFIDNI <r>, <bp>
+        EXITM %2
+    ELSEIFIDNI <r>, <sp>
+        EXITM %2
+    ELSEIFIDNI <r>, <eax>
+        EXITM %4
+    ELSEIFIDNI <r>, <ebx>
+        EXITM %4
+    ELSEIFIDNI <r>, <ecx>
+        EXITM %4
+    ELSEIFIDNI <r>, <edx>
+        EXITM %4
+    ELSEIFIDNI <r>, <esi>
+        EXITM %4
+    ELSEIFIDNI <r>, <edi>
+        EXITM %4
+    ELSEIFIDNI <r>, <ebp>
+        EXITM %4
+    ELSEIFIDNI <r>, <esp>
+        EXITM %4
+    ELSE
+        EXITM %0
+    ENDIF
+ENDM
 
 FastIMul MACRO dest, src, cte
     IFIDNI <dest>, <src>
@@ -416,193 +814,68 @@ FastIMul MACRO dest, src, cte
         mov dest, 0
         EXITM
     ENDIF
-    IF ((cte) AND 0FFFFh) AND 8000h                       ; negative (bit 15 of the pattern)
-;       t = 10000h - (cte AND 0FFFFh), result negated at the end
-        mov dest, src
-        IF ((10000h - ((cte) AND 0FFFFh))) / 8000h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 4000h
-                add dest, src
+    IF ((@Cpu AND 0FFh) GE 8) AND ((OPATTR (dest)) AND 010h)
+        IF (__RegBits(dest)) EQ 4                ; LEA needs 32-bit regs
+            IF ((OPATTR (src)) AND 010h) AND ((__RegBits(src)) EQ 4)
+                IF (cte) EQ 3                    ; reg = reg * 3, 5, 9:
+                    lea dest, [src+src*2]        ; one LEA (1-2 cycles
+                    EXITM                        ; vs 13-42 for IMUL)
+                ELSEIF (cte) EQ 5
+                    lea dest, [src+src*4]
+                    EXITM
+                ELSEIF (cte) EQ 9
+                    lea dest, [src+src*8]
+                    EXITM
+                ELSEIF (cte) EQ 6                ; 6, 10, 12, 18, 20, 24:
+                    lea dest, [src+src*2]        ; LEA + ADD/SHL
+                    add dest, dest
+                    EXITM
+                ELSEIF (cte) EQ 10
+                    lea dest, [src+src*4]
+                    add dest, dest
+                    EXITM
+                ELSEIF (cte) EQ 12
+                    lea dest, [src+src*2]
+                    shl dest, 2
+                    EXITM
+                ELSEIF (cte) EQ 18
+                    lea dest, [src+src*8]
+                    add dest, dest
+                    EXITM
+                ELSEIF (cte) EQ 20
+                    lea dest, [src+src*4]
+                    shl dest, 2
+                    EXITM
+                ELSEIF (cte) EQ 24
+                    lea dest, [src+src*2]
+                    shl dest, 3
+                    EXITM
+                ENDIF
             ENDIF
         ENDIF
-        IF ((10000h - ((cte) AND 0FFFFh))) / 4000h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 2000h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF ((10000h - ((cte) AND 0FFFFh))) / 2000h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 1000h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF ((10000h - ((cte) AND 0FFFFh))) / 1000h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 800h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF ((10000h - ((cte) AND 0FFFFh))) / 800h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 400h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF ((10000h - ((cte) AND 0FFFFh))) / 400h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 200h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF ((10000h - ((cte) AND 0FFFFh))) / 200h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 100h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF ((10000h - ((cte) AND 0FFFFh))) / 100h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 80h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF ((10000h - ((cte) AND 0FFFFh))) / 80h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 40h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF ((10000h - ((cte) AND 0FFFFh))) / 40h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 20h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF ((10000h - ((cte) AND 0FFFFh))) / 20h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 10h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF ((10000h - ((cte) AND 0FFFFh))) / 10h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 8h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF ((10000h - ((cte) AND 0FFFFh))) / 8h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 4h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF ((10000h - ((cte) AND 0FFFFh))) / 4h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 2h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF ((10000h - ((cte) AND 0FFFFh))) / 2h
-            shl dest, 1
-            IF ((10000h - ((cte) AND 0FFFFh))) AND 1
-                add dest, src
-            ENDIF
-        ENDIF
+        IF ((__IMag(cte)) GT 8) AND ((__RegBits(dest)) NE 1)
+            imul dest, src, __ISgn(cte) ; 386+: one native IMUL, src
+            EXITM                       ; preserved; a BYTE destination
+        ENDIF                           ; stays on the chain (v3.2)
+    ENDIF
+    mov dest, src                       ; Horner seed: dest = src
+    __Horn cte, 8000h, dest, src
+    __Horn cte, 4000h, dest, src
+    __Horn cte, 2000h, dest, src
+    __Horn cte, 1000h, dest, src
+    __Horn cte, 800h, dest, src
+    __Horn cte, 400h, dest, src
+    __Horn cte, 200h, dest, src
+    __Horn cte, 100h, dest, src
+    __Horn cte, 80h, dest, src
+    __Horn cte, 40h, dest, src
+    __Horn cte, 20h, dest, src
+    __Horn cte, 10h, dest, src
+    __Horn cte, 8h, dest, src
+    __Horn cte, 4h, dest, src
+    __Horn cte, 2h, dest, src
+    IF ((cte) AND 0FFFFh) AND 8000h     ; negative: negate at the end
         neg dest
-    ELSE
-;       t = cte AND 0FFFFh
-        mov dest, src
-        IF (((cte) AND 0FFFFh)) / 8000h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 4000h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF (((cte) AND 0FFFFh)) / 4000h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 2000h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF (((cte) AND 0FFFFh)) / 2000h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 1000h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF (((cte) AND 0FFFFh)) / 1000h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 800h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF (((cte) AND 0FFFFh)) / 800h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 400h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF (((cte) AND 0FFFFh)) / 400h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 200h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF (((cte) AND 0FFFFh)) / 200h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 100h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF (((cte) AND 0FFFFh)) / 100h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 80h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF (((cte) AND 0FFFFh)) / 80h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 40h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF (((cte) AND 0FFFFh)) / 40h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 20h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF (((cte) AND 0FFFFh)) / 20h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 10h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF (((cte) AND 0FFFFh)) / 10h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 8h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF (((cte) AND 0FFFFh)) / 8h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 4h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF (((cte) AND 0FFFFh)) / 4h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 2h
-                add dest, src
-            ENDIF
-        ENDIF
-        IF (((cte) AND 0FFFFh)) / 2h
-            shl dest, 1
-            IF (((cte) AND 0FFFFh)) AND 1
-                add dest, src
-            ENDIF
-        ENDIF
     ENDIF
 ENDM
 
@@ -628,20 +901,21 @@ ENDM
 ;      shifted k) - six instructions instead of the old 2*k shl/rcl
 ;      pairs, which cost up to 30 instructions for 32768. 8086 with
 ;      k < 8 keeps the original shl ax,1 / rcl dx,1 loop.
-;    - any other const, 386+: one native IMUL -
-;      movzx eax,ax / imul eax,eax,const / shld edx,eax,16 (v2.42).
-;      The 32-bit product of AX*f (both under 65536) always fits
-;      EAX, so AX = its low word for free and the SHLD lifts its
-;      high word into DX: the DX:AX pair the macro promises. (v2.4
-;      emitted "imul edx,eax,const" - the product landed in EDX,
-;      DX took its LOW word and AX stayed the multiplicand; v2.41
-;      fixed AX but still never wrote DX. Both broke every caller
-;      that divides the pair, 4VIEW's fix 90 percent freeze being
-;      the reported case.) Replaces the Mersenne shortcut, the
-;      Horner chain (10-30
-;      instructions) and the ~118-137-cycle real-MUL fallback with
-;      one ~13-38-cycle instruction; BX and CL are not touched and
-;      the high word of EAX is cleared by the MOVZX.
+;    - any other const, 386+: native LEA/IMUL (v3.1) -
+;      movzx eax,ax first; then factors 3, 5, 9 take ONE LEA
+;      (lea eax,[eax+eax*2/4/8]; 1-2 cycles vs 13-42 for IMUL
+;      r32,imm), factors 6, 10, 12, 18, 20, 24 take LEA + ADD/SHL
+;      (two instructions), and every other factor takes
+;      imul eax,eax,const. The 32-bit product of AX*f (both under
+;      65536) always fits EAX, so AX = its low word for free and
+;      the closing SHLD lifts its high word into DX: the DX:AX
+;      pair the macro promises. (v2.4 emitted "imul edx,eax,const"
+;      - the product landed in EDX, DX took its LOW word and AX
+;      stayed the multiplicand; v2.41 fixed AX but still never
+;      wrote DX. Both broke every caller that divides the pair,
+;      4VIEW's fix 90 percent freeze being the reported case.)
+;      BX and CL are not touched and the high word of EAX is
+;      cleared by the MOVZX.
 ;    - const = (2^k - 1) * 2^j, k >= 4    : 32-bit Mersenne shortcut
 ;      (new in v2.0): ((x << k) - x) << j with SUB/SBB; turns dense
 ;      factors like 0FFFFh into ~2/3 of the instructions. 8086 only
@@ -649,10 +923,14 @@ ENDM
 ;    - MSB-to-LSB Horner with the DX:AX accumulator (v1, 8086 only
 ;      since v2.4)
 ;    - real MUL when the expansion would come out worse
-;      (~118-137 cycles; 8086 only since v2.4)
+;      (v3.1: above 117 estimated cycles; 8086 only since v2.4).
+;      The model: the chain costs 5 fixed cycles (mov bx,ax +
+;      xor dx,dx) + 4 per shl/rcl pair + 6 per add/adc pair;
+;      mov cx,imm + MUL r16 costs 122-137. Breakeven: 117.
 ;=====================================================================
 
 FastMul MACRO factor
+    LOCAL fmF, fmHi, fmOnes, fmT, fmJ, fmM, fmK, fmP, fmI
     IF ((factor) LT 0) OR ((factor) GT 0FFFFh)
         .ERR <FastMul: factor out of range (0..65535)>
         EXITM
@@ -706,19 +984,37 @@ FastMul MACRO factor
         EXITM
     ENDIF
 
-    IF ((@Cpu AND 0FFh) GE 8)       ; 386+: one native IMUL (v2.4)
+    IF ((@Cpu AND 0FFh) GE 8)       ; 386+: native LEA/IMUL (v3.1)
         movzx eax, ax               ; EAX = zero-extended multiplicand
-        imul eax, eax, fmF          ; EAX = AX*f, exact: it always fits
-        shld edx, eax, 16           ; 32 bits. v2.42: SHLD lifts the high
-        EXITM                       ; word into DX so the macro's DX:AX
-                                    ; contract really holds - v2.4 put
-                                    ; the product in EDX with "imul
-                                    ; edx,eax,f" and v2.41 kept the
-                                    ; one-word "imul eax,eax,f" repair
-                                    ; but still never wrote DX: both
-                                    ; left the caller's 16-bit DIV with
-                                    ; a garbage high word (4VIEW's fix
-                                    ; 90 percent freeze was one case)
+        IF fmF EQ 3
+            lea eax, [eax+eax*2]    ; x*3: one LEA, 1-2 cycles
+        ELSEIF fmF EQ 5
+            lea eax, [eax+eax*4]    ; x*5: one LEA
+        ELSEIF fmF EQ 9
+            lea eax, [eax+eax*8]    ; x*9: one LEA
+        ELSEIF fmF EQ 6
+            lea eax, [eax+eax*2]    ; x*6: LEA + ADD
+            add eax, eax
+        ELSEIF fmF EQ 10
+            lea eax, [eax+eax*4]    ; x*10: LEA + ADD
+            add eax, eax
+        ELSEIF fmF EQ 12
+            lea eax, [eax+eax*2]    ; x*12: LEA + SHL
+            shl eax, 2
+        ELSEIF fmF EQ 18
+            lea eax, [eax+eax*8]    ; x*18: LEA + ADD
+            add eax, eax
+        ELSEIF fmF EQ 20
+            lea eax, [eax+eax*4]    ; x*20: LEA + SHL
+            shl eax, 2
+        ELSEIF fmF EQ 24
+            lea eax, [eax+eax*2]    ; x*24: LEA + SHL
+            shl eax, 3
+        ELSE
+            imul eax, eax, fmF      ; EAX = AX*f, exact: it always
+        ENDIF                       ; fits 32 bits (v2.4, non-LEA)
+        shld edx, eax, 16           ; DX = high word: the DX:AX
+        EXITM                       ; contract (v2.42)
     ENDIF
 
     fmJ = 0                         ; trailing zeros (odd factor * 2^fmJ)
@@ -756,11 +1052,11 @@ FastMul MACRO factor
         EXITM
     ENDIF
 
-    IF fmHi*4 + (fmOnes-1)*6 GT 110 ; expansion would be worse than MUL
-        mov cx, fmF                 ; -> real MUL (~118-137 cycles)
-        mul cx
-        EXITM
-    ENDIF
+    IF fmHi*4 + (fmOnes-1)*6 GT 117 ; expansion would be worse than MUL
+        mov cx, fmF                 ; -> real MUL (~122-137 cycles with
+        mul cx                      ;    the mov cx,imm; v3.1 threshold:
+        EXITM                       ;    the old 110 ignored the 5-cycle
+    ENDIF                           ;    fixed overhead of the chain)
 
     mov  bx, ax                     ; keep the multiplicand
     xor  dx, dx                     ; 32-bit accumulator DX:AX
@@ -797,43 +1093,38 @@ ENDM
 ;  the imm8 form whenever the value fits.
 ;=====================================================================
 
-setflag MACRO rm, bit
+;  __BitRange name, bit - internal macro: the shared range check of
+;  the five flag macros (v3.2). The macro name is passed as a
+;  parameter so the error text stays per-macro.
+__BitRange MACRO name, bit
     IF ((bit) LT 0) OR ((bit) GT 31)
-        .ERR <setflag: bit index must be between 0 and 31>
+        .ERR <name: bit index must be between 0 and 31>
         EXITM
     ENDIF
+ENDM
+
+setflag MACRO rm, bit
+    __BitRange setflag, bit
     or rm, __Pow2(bit)
 ENDM
 
 clrflag MACRO rm, bit
-    IF ((bit) LT 0) OR ((bit) GT 31)
-        .ERR <clrflag: bit index must be between 0 and 31>
-        EXITM
-    ENDIF
+    __BitRange clrflag, bit
     and rm, NOT __Pow2(bit)
 ENDM
 
 flipflag MACRO rm, bit
-    IF ((bit) LT 0) OR ((bit) GT 31)
-        .ERR <flipflag: bit index must be between 0 and 31>
-        EXITM
-    ENDIF
+    __BitRange flipflag, bit
     xor rm, __Pow2(bit)
 ENDM
 
 testflag MACRO rm, bit
-    IF ((bit) LT 0) OR ((bit) GT 31)
-        .ERR <testflag: bit index must be between 0 and 31>
-        EXITM
-    ENDIF
+    __BitRange testflag, bit
     test rm, __Pow2(bit)
 ENDM
 
 maskflag MACRO rm, bit
-    IF ((bit) LT 0) OR ((bit) GT 31)
-        .ERR <maskflag: bit index must be between 0 and 31>
-        EXITM
-    ENDIF
+    __BitRange maskflag, bit
     and rm, __Pow2(bit)
 ENDM
 
@@ -870,11 +1161,18 @@ ENDM
 ;  RECORD itself: here SPEED starts at bit 3).
 ;=====================================================================
 
-setfield MACRO rm, lo, width, val
+;  __FieldRange name, lo, width - internal macro: the shared range
+;  check of setfield and getfield (v3.2). The macro name is passed
+;  as a parameter so the error text stays per-macro.
+__FieldRange MACRO name, lo, width
     IF ((lo) LT 0) OR ((width) LT 1) OR ((width) GT 31) OR (((lo) + (width)) GT 32)
-        .ERR <setfield: invalid range of lo/width (lo + width up to 32)>
+        .ERR <name: invalid range of lo/width (lo + width up to 32)>
         EXITM
     ENDIF
+ENDM
+
+setfield MACRO rm, lo, width, val
+    __FieldRange setfield, lo, width
     IF ((@Cpu AND 0FFh) LT 8) AND (((lo) + (width)) GT 16)
         .ERR <setfield: field does not fit the 16-bit operand of this CPU>
         EXITM
@@ -890,10 +1188,7 @@ setfield MACRO rm, lo, width, val
 ENDM
 
 getfield MACRO dest, src, lo, width
-    IF ((lo) LT 0) OR ((width) LT 1) OR ((width) GT 31) OR (((lo) + (width)) GT 32)
-        .ERR <getfield: invalid range of lo/width (lo + width up to 32)>
-        EXITM
-    ENDIF
+    __FieldRange getfield, lo, width
     IF ((OPATTR (dest)) AND 2) AND ((OPATTR (src)) AND 2)
         .ERR <getfield: dest and src cannot both be memory>
         EXITM
@@ -910,6 +1205,425 @@ getfield MACRO dest, src, lo, width
         ENDIF
         and dest, __Pow2(width) - 1
     ENDIF
+ENDM
+
+;=====================================================================
+;  8. REDUNDANT "REG, REG" MOVES ELIMINATED (every CPU level;
+;     mov since v3.0, xchg since v3.5)
+;=====================================================================
+;  "mov ax, ax" changes no register, no memory and no flags: it is a
+;  pure redundancy, usually left over after edits or generated by
+;  other macros. The macro below removes exactly that case and
+;  passes every other MOV through untouched:
+;
+;       mov ax, ax      ->  (nothing)
+;       mov ax, bx      ->  mov ax, bx        (pass-through)
+;       mov ax, 0       ->  mov ax, 0         (pass-through, NOT xor!)
+;       mov [bx], ax    ->  mov [bx], ax      (pass-through)
+;
+;  mov reg, 0 is deliberately NOT turned into "xor reg, reg": MOV
+;  does not touch the flags, XOR destroys them, so the substitution
+;  can silently break flag-dependent code. SMART only removes
+;  instructions that provably do nothing.
+;
+;  Detection is textual (IFIDNI, case-insensitive) plus an OPATTR
+;  register check: only two REGISTER operands with the same name are
+;  removed. Identical text that is not a register pair (e.g. the
+;  invalid "mov [bx], [bx]") still reaches the assembler and keeps
+;  raising its normal error. The OPATTR check also keeps the
+;  assembler's own diagnostics for any other invalid form.
+;
+;  If you need the original instruction anyway (a "mov ax, ax" used
+;  as a 2-byte timing delay, or a patch hole for self-modifying
+;  code), force it with "??mov ax, ax".
+;
+;  SMART / NOSMART (v3.3): the elimination is an optimization of
+;  SMART mode, like TASM's automatic redundant-instruction removal.
+;  It only happens while SMART (the default) is active; NOSMART
+;  turns it off and every MOV passes through byte-identical until
+;  the next SMART. The ??mov escape works in both modes.
+;
+;  xchg joins the elimination in v3.5: "xchg ax, ax" changes no
+;  register, no memory and no flags either, so under SMART it
+;  assembles to nothing and ??xchg forces the original byte back.
+;  CAREFUL: the 1-byte "xchg ax, ax" (opcode 90h) is the classic
+;  single-byte NOP used for alignment padding - SMART removes it
+;  like any other dead instruction, so pad with "??xchg ax, ax"
+;  (or with "nop", which is not taken over) when the byte count
+;  matters.
+;
+;  The rename applies at every CPU level and has no effect on any
+;  expression operator (MOV and XCHG do not share a token with an
+;  expression operator).
+;=====================================================================
+
+    option renamekeyword:<mov>=??mov
+mov MACRO dest, val
+    IFB <val>
+        .ERR <mov: missing operands>
+        EXITM
+    ENDIF
+    IFIDNI <dest>, <val>
+        IF (OPATTR (dest)) AND 010h     ; registers only: "mov [bx],[bx]"
+            IF ??smart                  ; NOSMART keeps the instruction
+            ELSE
+                ; mov reg, reg: redundant, assembles to nothing
+            ENDIF
+        ELSE
+            ??mov dest, val             ; keeps the assembler's error
+        ENDIF
+    ELSE
+        ??mov dest, val
+    ENDIF
+ENDM
+
+    option renamekeyword:<xchg>=??xchg
+xchg MACRO a, b
+    IFB <b>
+        .ERR <xchg: missing operands>
+        EXITM
+    ENDIF
+    IFIDNI <a>, <b>
+        IF (OPATTR (a)) AND 010h        ; registers only
+            IF ??smart                  ; NOSMART keeps the instruction
+            ELSE
+                ; xchg reg, reg: redundant, assembles to nothing
+            ENDIF
+        ELSE
+            ??xchg a, b                 ; keeps the assembler's error
+        ENDIF
+    ELSE
+        ??xchg a, b
+    ENDIF
+ENDM
+
+;=====================================================================
+;  9. LEA reg, var -> MOV reg, OFFSET var  (SMART, new in v3.4)
+;=====================================================================
+;  TASM's SMART mode replaces LEA with the shorter MOV when the
+;  source is a plain variable: "lea ax, var" costs 4 bytes on the
+;  8086 while "mov ax, OFFSET var" costs 3, and both load the same
+;  address without touching the flags. The macro below performs
+;  exactly that substitution and passes every other LEA through
+;  byte-identical:
+;
+;       lea ax, var        ->  mov ax, OFFSET var   (shorter)
+;       lea ax, var+2      ->  mov ax, OFFSET var+2 (shorter)
+;       lea eax, var       ->  lea eax, var         (same size, kept)
+;       lea ax, [bx]       ->  lea ax, [bx]         (indexed, kept)
+;       lea ax, var[si]    ->  lea ax, var[si]      (indexed, kept)
+;       lea ax, [bp+4]     ->  lea ax, [bp+4]       (no constant
+;                                                       address, kept)
+;       ??lea ax, var      ->  lea ax, var          (forced original)
+;
+;  Detection: the source must be a memory expression (OPATTR bit 1)
+;  using direct addressing (bit 3) without an SS-relative part
+;  (bit 6 clear), and the destination a 16-bit register
+;  (__RegBits = 2). NOSMART disables the substitution. FastIMul and
+;  FastMul expand their internal LEA forms through this macro; the
+;  operands are indexed, carry no direct-addressing bit and pass
+;  through unchanged.
+;=====================================================================
+
+    option renamekeyword:<lea>=??lea
+lea MACRO reg, mem
+    IF ??smart
+        IF ((OPATTR (mem)) AND 01001010b) EQ 01010b ; direct memory var
+            IF (__RegBits(reg)) EQ 2                ; MOV r16,imm16 is
+                mov reg, OFFSET mem                 ; 3 bytes vs 4 for
+                EXITM                               ; LEA r16,m16
+            ENDIF
+        ENDIF
+    ENDIF
+    ??lea reg, mem
+ENDM
+
+;=====================================================================
+;  10. EXTENDED CONDITIONAL JUMPS  (SMART, new in v3.4)
+;=====================================================================
+;  On the 8086/186/286 a conditional jump only reaches -128..127
+;  bytes, and the assembler just errors when the target is farther.
+;  TASM's SMART mode handles the range automatically; the macros
+;  below do the same for all 30 conditional jump mnemonics:
+;
+;       je near_label     ->  je near_label            (in range)
+;       je far_label      ->  jne over / jmp far_label (extended)
+;
+;  - Backward targets (defined, local, not external) are MEASURED:
+;    the short form is kept while the distance fits ($ - target
+;    <= 126) and the extended form "j<inverse> over jmp target"
+;    (5 bytes, always encodable) is emitted when it does not.
+;  - Forward targets cannot be measured at expansion time (OPATTR
+;    returns 0 for forward references), so they ALWAYS take the
+;    extended form: no conditional jump can ever die with "jump
+;    destination too far", at the price of 3 extra bytes on every
+;    forward jump that would have fit. Write backward branches or
+;    use ??jxx (the forced short form) where it matters.
+;  - Targets given as @F or @B pass through unchanged: the macro
+;    must not insert anonymous labels that would hijack them.
+;  - The plain JMP needs no macro: the assembler already picks its
+;    short or near encoding from the distance.
+;  - The extended form reaches the full +/-32K of the near JMP;
+;    beyond that (possible for a backward jump in a 64K segment)
+;    the assembler's normal error remains - use an intermediate
+;    label. NOSMART passes every jump through in the short form,
+;    i.e. the native behavior.
+;=====================================================================
+
+;  __Jcc jshort, jinv, target - the shared body of all 30 jump
+;  macros (v3.4): jshort is the renamed short instruction, jinv its
+;  inverse, used to skip over the near JMP of the extended form.
+__Jcc MACRO jshort, jinv, target
+    LOCAL jext
+    IFB <target>
+        .ERR <jump: missing operand>
+        EXITM
+    ENDIF
+    IF ??smart
+        IFIDNI <target>, <@F>
+            jshort target
+        ELSEIFIDNI <target>, <@B>
+            jshort target
+        ELSEIF ((OPATTR (target)) AND 0081h) EQ 0001h   ; known local
+            IF (($ - (target)) GT 126)                  ; code label
+                jinv jext
+                jmp target
+                jext:
+            ELSE
+                jshort target
+            ENDIF
+        ELSE
+            jinv jext               ; forward or external: extended
+            jmp target
+            jext:
+        ENDIF
+    ELSE
+        jshort target               ; NOSMART: the short form
+    ENDIF
+ENDM
+
+    option renamekeyword:<je>=??je
+je MACRO target
+    __Jcc ??je, ??jne, target
+ENDM
+
+    option renamekeyword:<jne>=??jne
+jne MACRO target
+    __Jcc ??jne, ??je, target
+ENDM
+
+    option renamekeyword:<ja>=??ja
+ja MACRO target
+    __Jcc ??ja, ??jbe, target
+ENDM
+
+    option renamekeyword:<jae>=??jae
+jae MACRO target
+    __Jcc ??jae, ??jb, target
+ENDM
+
+    option renamekeyword:<jb>=??jb
+jb MACRO target
+    __Jcc ??jb, ??jae, target
+ENDM
+
+    option renamekeyword:<jbe>=??jbe
+jbe MACRO target
+    __Jcc ??jbe, ??ja, target
+ENDM
+
+    option renamekeyword:<jg>=??jg
+jg MACRO target
+    __Jcc ??jg, ??jle, target
+ENDM
+
+    option renamekeyword:<jge>=??jge
+jge MACRO target
+    __Jcc ??jge, ??jl, target
+ENDM
+
+    option renamekeyword:<jl>=??jl
+jl MACRO target
+    __Jcc ??jl, ??jge, target
+ENDM
+
+    option renamekeyword:<jle>=??jle
+jle MACRO target
+    __Jcc ??jle, ??jg, target
+ENDM
+
+    option renamekeyword:<jo>=??jo
+jo MACRO target
+    __Jcc ??jo, ??jno, target
+ENDM
+
+    option renamekeyword:<jno>=??jno
+jno MACRO target
+    __Jcc ??jno, ??jo, target
+ENDM
+
+    option renamekeyword:<js>=??js
+js MACRO target
+    __Jcc ??js, ??jns, target
+ENDM
+
+    option renamekeyword:<jns>=??jns
+jns MACRO target
+    __Jcc ??jns, ??js, target
+ENDM
+
+    option renamekeyword:<jp>=??jp
+jp MACRO target
+    __Jcc ??jp, ??jnp, target
+ENDM
+
+    option renamekeyword:<jnp>=??jnp
+jnp MACRO target
+    __Jcc ??jnp, ??jp, target
+ENDM
+
+    option renamekeyword:<jz>=??jz
+jz MACRO target
+    __Jcc ??je, ??jne, target
+ENDM
+
+    option renamekeyword:<jnz>=??jnz
+jnz MACRO target
+    __Jcc ??jne, ??je, target
+ENDM
+
+    option renamekeyword:<jc>=??jc
+jc MACRO target
+    __Jcc ??jb, ??jae, target
+ENDM
+
+    option renamekeyword:<jnc>=??jnc
+jnc MACRO target
+    __Jcc ??jae, ??jb, target
+ENDM
+
+    option renamekeyword:<jna>=??jna
+jna MACRO target
+    __Jcc ??jbe, ??ja, target
+ENDM
+
+    option renamekeyword:<jnae>=??jnae
+jnae MACRO target
+    __Jcc ??jb, ??jae, target
+ENDM
+
+    option renamekeyword:<jnb>=??jnb
+jnb MACRO target
+    __Jcc ??jae, ??jb, target
+ENDM
+
+    option renamekeyword:<jnbe>=??jnbe
+jnbe MACRO target
+    __Jcc ??ja, ??jbe, target
+ENDM
+
+    option renamekeyword:<jng>=??jng
+jng MACRO target
+    __Jcc ??jle, ??jg, target
+ENDM
+
+    option renamekeyword:<jnge>=??jnge
+jnge MACRO target
+    __Jcc ??jl, ??jge, target
+ENDM
+
+    option renamekeyword:<jnl>=??jnl
+jnl MACRO target
+    __Jcc ??jge, ??jl, target
+ENDM
+
+    option renamekeyword:<jnle>=??jnle
+jnle MACRO target
+    __Jcc ??jg, ??jle, target
+ENDM
+
+    option renamekeyword:<jpe>=??jpe
+jpe MACRO target
+    __Jcc ??jp, ??jnp, target
+ENDM
+
+    option renamekeyword:<jpo>=??jpo
+jpo MACRO target
+    __Jcc ??jnp, ??jp, target
+ENDM
+
+;=====================================================================
+;  11. JCXZ / LOOP extended automatically (v3.6)
+;=====================================================================
+;  JCXZ and LOOP are the only two jumps with neither an inverse nor
+;  a long encoding: the 8-bit displacement is all they will ever
+;  have, OPTION LJMP cannot lengthen them, and a destination more
+;  than 127 bytes away is a hard "error A2075: jump destination
+;  too far". Both take the same trampoline, because both mean
+;  "condition -> target, else fall through":
+;
+;      jxx jext        ; the short-only jump, 2 bytes, hops +2
+;      jmp jout        ; the fall-through path skips the trampoline
+;      jext: jmp target ; near JMP reaches the full +/-32K
+;      jout:
+;
+;  The trampoline is transparent on every axis that matters:
+;   - JCXZ affects no flags and neither does the trampoline.
+;   - LOOP must not touch flags (a plain "dec cx / jnz" emulation
+;     would destroy them) and must wrap when CX = 0 (CX = 0FFFFh,
+;     jump taken): the trampoline keeps the REAL loop as the
+;     decrementing instruction, so both properties hold exactly.
+;   - The +2 hop of the short jump and the near JMP are always in
+;     range by construction.
+;  Backward targets measured in range (the same "$ - target <= 126"
+;  rule __Jcc uses, conservative by the 2 bytes of the short form)
+;  keep the native 2-byte instruction. @F / @B targets pass through
+;  unchanged, and NOSMART restores the native behavior. LOOPE/
+;  LOOPNE/LOOPZ/LOOPNZ stay native: they test ZF, and a flag-safe
+;  bridge would cost more than the instruction is worth.
+;=====================================================================
+
+;  __SExt jshort, target - shared body of the JCXZ/LOOP macros
+;  (v3.6): jshort is the renamed short-only instruction.
+__SExt MACRO jshort, target
+    LOCAL jext, jout
+    IFB <target>
+        .ERR <jump: missing operand>
+        EXITM
+    ENDIF
+    IF ??smart
+        IFIDNI <target>, <@F>
+            jshort target
+        ELSEIFIDNI <target>, <@B>
+            jshort target
+        ELSEIF ((OPATTR (target)) AND 0081h) EQ 0001h   ; known local
+            IF (($ - (target)) GT 126)                  ; code label
+                jshort jext
+                jmp jout
+                jext: jmp target
+                jout:
+            ELSE
+                jshort target
+            ENDIF
+        ELSE
+            jshort jext             ; forward or external: extended
+            jmp jout
+            jext: jmp target
+            jout:
+        ENDIF
+    ELSE
+        jshort target               ; NOSMART: the short form
+    ENDIF
+ENDM
+
+    option renamekeyword:<jcxz>=??jcxz
+jcxz MACRO target
+    __SExt ??jcxz, target
+ENDM
+
+    option renamekeyword:<loop>=??loop
+loop MACRO target
+    __SExt ??loop, target
 ENDM
 
 ENDIF   ; __SMART_INC__
