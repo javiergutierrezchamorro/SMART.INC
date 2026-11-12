@@ -1162,7 +1162,7 @@
 #define SMARTPP_HAS_ISATTY 0
 #endif
 
-#define SMARTPP_VERSION "1.87"
+#define SMARTPP_VERSION "1.88"
 
 #define MAXTOK  256              /* operand / label / target buffer   */
 #define MAXCMT  512              /* trailing comment buffer           */
@@ -1312,11 +1312,11 @@ static struct pinfo g_pscan;     /* flags_clear                      */
 static char g_scratch[MAXLINE];                      /* shared copy  */
 static char g_build[MAXLINE + MAXTOK + MAXCMT];      /* rewrite buf  */
 
-static int  opt_verbose = 1;        /* default ON since v1.86; -v turns it OFF */
+static int  opt_verbose = 1;        /* default ON; -nv disables, -v enables */
 static int  g_curcpu    = 1;
 static int  opt_nz      = 0;     /* -nz: keep xor+mov / shift pairs     */
 static int  g_use32     = 0;     /* a 32-bit segment may exist (no P36)  */
-static int  opt_mark    = 1;     /* default ON since v1.86; -mark turns it OFF */
+static int  opt_mark    = 1;     /* default ON; -nomark disables, -mark enables */
 static int  opt_zopt    = 0;     /* -Oz: size over speed (favor shorter form) */
 static int  g_passes_run = 0;   /* number of passes actually executed */
 static int  g_nofpu     = 0;    /* .NO87 disables FPU rules; .287/.387/.8087 enable */
@@ -8565,200 +8565,29 @@ static long run_pass(void)
 
 static void usage(FILE *f)
 {
-    fprintf(f, "SMARTPP %s - conservative peephole pre-processor for 8086..Pentium Pro and x86-64\n",
+    fprintf(f, "SMARTPP %s - conservative peephole pre-processor for 8086..x86-64\n",
             SMARTPP_VERSION);
-    fprintf(f, "usage: smartpp [-m86|-m186|-m286|-m386|-m486|-m586|-m686|-m64] [-att|-intel]\n");
-    fprintf(f, "               [-nz] [-Oz] [-mark] [-nomark] [-v] [-nv] [--ncolor] [-o out] [in [out]]\n");
-    fprintf(f, "  syntax: MASM/JWasm/UASM/ASMC auto, GNU AS auto-detected\n");
-    fprintf(f, "  (-att / -intel force AT&T / Intel operand order)\n");
-    fprintf(f, "  -mark / -nomark : toggle the '; SMARTPP ... (PN)' trailing comments\n");
-    fprintf(f, "                    (default ON since v1.86; pass -mark to turn OFF)\n");
-    fprintf(f, "  -v / -nv        : toggle the per-line 'rule Pn fired' notices\n");
-    fprintf(f, "                    (default ON since v1.86; pass -v to silence)\n");
-    fprintf(f, "                    The end-of-run summary table always prints.\n");
-    fprintf(f, "  -nz             : keep xor+mov / shift pairs (movzx slower on 486/P5)\n");
-    fprintf(f, "  -Oz             : optimize for size (favor shorter forms)\n");
-    fprintf(f, "  -mNN            : target CPU level (default 8086):\n");
-    fprintf(f, "                      -m86/-m8086  -m186  -m286  -m386  -m486  -m586  -m686  -m64\n");
-    fprintf(f, "                    (.386/.486/.586/.686/.X64 directives in the source override)\n");
-    fprintf(f, "  --ncolor        : disable colored diagnostic output (v1.87). By default\n");
-    fprintf(f, "                    color is emitted to stderr only when stderr is a TTY\n");
-    fprintf(f, "                    (GCC -fdiagnostics-color=auto behavior); redirecting stderr\n");
-    fprintf(f, "                    to a file or pipe produces plain text automatically.\n");
-    fprintf(f, "                    Color is ONLY on stderr; stdout (the optimized .asm) is\n");
-    fprintf(f, "                    never colored and stays a valid assembler input.\n");
-    fprintf(f, "  P1 delete mov/xchg R,R        P2 delete dead register store\n");
-    fprintf(f, "  P3 delete push X / pop X      P4 merge shifts (CPU 186+)\n");
-    fprintf(f, "  P5 thread jmp/jcc through an unconditional jmp\n");
-    fprintf(f, "  P6 delete jump to the next code line\n");
-    fprintf(f, "  P7 invert jcc over a bridge jmp\n");
-    fprintf(f, "  P8 or/and R,R -> test R,R\n");
-    fprintf(f, "  P9 mov R,0 -> xor R,R (flag-liveness scan)\n");
-    fprintf(f, "  P10 add/sub R,1 -> inc/dec R (CF dead)\n");
-    fprintf(f, "  P11 cmp R,0 -> test R,R (AF dead)\n");
-    fprintf(f, "  P12 duplicate consecutive jumps to the same target\n");
-    fprintf(f, "  P13 unreachable instructions after an unconditional jmp\n");
-    fprintf(f, "  P14 double xchg R,S   P15 mov R,S / mov S,R\n");
-    fprintf(f, "  P16 fold add/sub R,c1 / R,c2 (OF dead)\n");
-    fprintf(f, "  P17 lea R,[R+const] -> add/sub/inc/dec (FPC-style)\n");
-    fprintf(f, "     plus exact lea R,[const] / lea R,[S] -> mov forms\n");
-    fprintf(f, "  P18 add/sub R,0 deleted (all flags dead)\n");
-    fprintf(f, "  P19 duplicate consecutive cmp/test R,S\n");
-    fprintf(f, "  P20 shift/rotate R,0 deleted\n");
-    fprintf(f, "  P21 duplicate consecutive cld/std/cli/sti\n");
-    fprintf(f, "  P22 inc R / dec R pair deleted (all flags dead)\n");
-    fprintf(f, "  P23 not R / not R pair   P24 neg R / neg R pair\n");
-    fprintf(f, "  P25 cmc / cmc pair deleted\n");
-    fprintf(f, "  P26 dead xor R,R before a full-cover writer\n");
-    fprintf(f, "  P27 add R,S / sub R,S pair deleted (all flags dead)\n");
-    fprintf(f, "  P28 duplicate consecutive cbw/cwde/cwd/cdq\n");
-    fprintf(f, "  P29 xor T,T / mov L,SRC -> movzx T,SRC (386+, -nz off)\n");
-    fprintf(f, "  P30 same with a 0..255 constant -> mov T,imm\n");
-    fprintf(f, "  P31 mov al,SRC / cbw -> movsx ax,SRC (and cwde) (386+)\n");
-    fprintf(f, "  P32 push R / pop S -> mov S,R\n");
-    fprintf(f, "  P33 shl/shr (sar) R,16|24|8 pair -> movzx/movsx (386+, -nz off)\n");
-    fprintf(f, "  P34 and R16,0FFh -> xor Rh,Rh;  and R32,0FFh/0FFFFh -> movzx\n");
-    fprintf(f, "  P35 mov R32,-1 -> or R32,-1 (386+)\n");
-    fprintf(f, "  P36 mov sp,bp / pop bp -> leave (186+, 16-bit code)\n");
-    fprintf(f, "  v1.80 new rules (research: FPC, GCC RTL, LLVM X86Peephole, Watcom):\n");
-    fprintf(f, "  P37 xor R,-1 -> not R (all six flags dead)\n");
-    fprintf(f, "  P38 imul R,2^k -> shl R,k (k>=1); imul R,1 -> deleted (186+)\n");
-    fprintf(f, "  P39 add/sub R,c / sub/add R,c -> both deleted (all six flags dead)\n");
-    fprintf(f, "  P40 mov R,imm1 / add R,imm2 -> mov R,imm1+imm2 (all six flags dead)\n");
-    fprintf(f, "  P41 lea R,[R+S] -> add R,S (all six flags dead; 386+ general)\n");
-    fprintf(f, "  P42 push bp/mov bp,sp/sub sp,N -> enter N,0 (186+, 16-bit)\n");
-    fprintf(f, "  P43 xor R,R / add|sub|or|xor R,imm -> mov R,imm (all six flags dead)\n");
-    fprintf(f, "  P44 xor R,R / inc R -> mov R,1 (all six flags dead)\n");
-    fprintf(f, "  P45 xor R,R / dec R -> mov R,-1 (all six flags dead)\n");
-    fprintf(f, "  P46 push imm / pop R -> mov R,imm (186+; size-gated for 32-bit)\n");
-    fprintf(f, "  P47 mov R,S / add|sub R,imm -> lea R,[S+imm] (386+ general)\n");
-    fprintf(f, "  P48 xor R,R / test R,R -> delete test (no scan)\n");
-    fprintf(f, "  P49 add/sub sp,c / sub/add sp,c -> both deleted (all six flags dead)\n");
-    fprintf(f, "  P50 imul R,2^k+1 -> lea R,[R+R*k] for k=1,2,3 (386+; Intel-only)\n");
-    fprintf(f, "  P51 imul R,-1 -> neg R (all six flags dead; 186+)\n");
-    fprintf(f, "  -nz keeps xor+mov and shift pairs (movzx is slower on a 486/Pentium)\n");
-    fprintf(f, "  v1.80: runs up to %d passes (chained rewrites converge)\n", MAX_PASSES);
-    fprintf(f, "  v1.81 new rules + extensions (research: FPC, GCC RTL, LLVM, Watcom,\n");
-    fprintf(f, "  Massalin-Stone superoptimizer):\n");
-    fprintf(f, "  P8 (ext) drop >=16-bit gate (8-bit too); and R,0xFF/0xFFFF/0xFFFFFFFF\n");
-    fprintf(f, "    all recognized; delete-if-flags-dead branch added\n");
-    fprintf(f, "  P19 (ext) idempotent or/and now also: dup op1 -> first deleted\n");
-    fprintf(f, "  P52 mov R,imm / shl R,k -> mov R,imm<<k (all six flags dead)\n");
-    fprintf(f, "  P53 mov R,imm / and R,mask -> mov R,imm&mask (all six flags dead)\n");
-    fprintf(f, "  P54 mov R,imm / or R,imm2 -> mov R,imm|imm2 (all six flags dead)\n");
-    fprintf(f, "  P55 mov R,imm / xor R,imm2 -> mov R,imm^imm2 (all six flags dead)\n");
-    fprintf(f, "  P56 add/sub R,c1 / sub/add R,c2 (mixed, c1!=c2) -> single add/sub\n");
-    fprintf(f, "    by |c1-c2| (all six flags dead; R not SP)\n");
-    fprintf(f, "  P57 lea R,[R+R] -> shl R,1 (386+, Intel-only; all six flags dead)\n");
-    fprintf(f, "  P58 xor R,X / xor R,X -> both deleted (all six flags dead;\n");
-    fprintf(f, "    R not SP; X is reg or imm, not memory)\n");
-    fprintf(f, "  v1.82 new rules (research: FPC aoptx86, GCC i386.md peephole2,\n");
-    fprintf(f, "    LLVM X86OptimizeLEAs, Open Watcom peepopt):\n");
-    fprintf(f, "  P59 and R,0 -> mov R,0 (reg only; all six flags dead; chains P9)\n");
-    fprintf(f, "  P60 or R16,-1 -> mov R16,-1 (16-bit only; all six flags dead)\n");
-    fprintf(f, "  P61 and R,c1 / and R,c2 -> and R,(c1&c2) (all six flags dead;\n");
-    fprintf(f, "    R not SP)\n");
-    fprintf(f, "  P62 and R,c1 / or R,c2 -> tighten mask: and R,(c1&~c2) / or R,c2\n");
-    fprintf(f, "    (NO flag scan: identical flag stream)\n");
-    fprintf(f, "  P62b or R,c1 / and R,c2 with (c2&c1)==c2 -> mov R,c2 (all six\n");
-    fprintf(f, "    flags dead; subset collapse)\n");
-    fprintf(f, "  P63 lea R,[R*K] (K in 2,4,8) -> shl R,log2 K (386+, all six\n");
-    fprintf(f, "    flags dead; generalizes P57 to scales 4 and 8)\n");
-    fprintf(f, "  P65 dec R / cmp R,-1 -> dec R (all six flags dead; the cmp is\n");
-    fprintf(f, "    redundant when no flag is observed)\n");
-    fprintf(f, "  P68 xchg R,S (one operand dead) -> mov (no flags; SP excluded;\n");
-    fprintf(f, "    same-width registers only)\n");
-    fprintf(f, "  P70 lea R,[S+off1] / lea D,[R+off2] (R dead) -> lea D,[S+off1+off2]\n");
-    fprintf(f, "    (no flags; intermediate dead)\n");
-    fprintf(f, "  Bug fixes in v1.81:\n");
-    fprintf(f, "    P12 case 2, P14, P16 (total==0): a label carried by\n");
-    fprintf(f, "      line i used to be lost when i was deleted; the new\n");
-    fprintf(f, "      delete_keep_label() helper keeps the label (and any\n");
-    fprintf(f, "      comment) on a label-only line and only removes the\n");
-    fprintf(f, "      dead instruction.\n");
-    fprintf(f, "    P40/P43/P46 AT&T output: pi->op0/pj->op0 already carry\n");
-    fprintf(f, "      the '%%' prefix (att_fix swaps but does not strip), so\n");
-    fprintf(f, "      the previous \", %%%%eax\" (double-percent) output is\n");
-    fprintf(f, "      corrected to \", %%eax\" (single-percent).  P38 and the\n");
-    fprintf(f, "      new P52-P55 carry the same fix.\n");
-    fprintf(f, "    att_fix: \"imul\" added to the size-suffix base list so\n");
-    fprintf(f, "      AT&T `imull $8,%%eax` is recognized as `imul` and\n");
-    fprintf(f, "      P38/P50/P51 can fire on it.\n");
-    fprintf(f, "    emit_lea_scaled: dead AT&T branch (P50 is !g_att) and the\n");
-    fprintf(f, "      unused `num` buffer removed.\n");
-    fprintf(f, "  v1.82 refactor: a shared reg_dead_after(start, r) helper now\n");
-    fprintf(f, "    serves P68 (xchg->mov) and P70 (lea+lea fusion); previously\n");
-    fprintf(f, "    the dead-register walk was inlined in P68 only.\n");
-    fprintf(f, "  v1.83 bug fixes (10 correctness fixes from review):\n");
-    fprintf(f, "    P4 shift fusion now requires F_OF dead (F_OF|F_CF for rotates)\n");
-    fprintf(f, "      when the fused total exceeds 1.\n");
-    fprintf(f, "    P50 imul->lea gated to 32-bit dest, excludes ESP (SIB index).\n");
-    fprintf(f, "    P16/P56 add/sub fold uses width_imm_limit(w) so 8-bit folds\n");
-    fprintf(f, "      stay within imm8 (-128..127) and 32-bit folds are allowed.\n");
-    fprintf(f, "    P42 enter closed to !g_att (was emitting Intel-syntax in GAS).\n");
-    fprintf(f, "    P58 xor-double uses positive test (reg or imm only).\n");
-    fprintf(f, "    P3 push/pop SP requires 286+ (8086 PUSH SP pushes the\n");
-    fprintf(f, "      already-decremented value, so push sp/pop sp is not identity).\n");
-    fprintf(f, "    P2 dead store no longer deletes `mov R, <mem>` (MMIO risk).\n");
-    fprintf(f, "    detect_use32 scans USE32 anywhere on the line, not just when\n");
-    fprintf(f, "      'segment' is the first token (matches `_TEXT SEGMENT USE32`).\n");
-    fprintf(f, "    P47 mov+add->lea requires src width == dest width on 386+.\n");
-    fprintf(f, "  v1.83 new rules:\n");
-    fprintf(f, "    P13b unreachable after ret/retf/iret/hlt/ud2/int3 (like P13).\n");
-    fprintf(f, "    P71 sub R,R -> xor R,R (AF dead; SP excluded)\n");
-    fprintf(f, "    P72 mov+shr fold; P73 mov+sar fold; P74 mov+rol fold;\n");
-    fprintf(f, "    P75 mov+ror fold (extend P52 to non-rcl/rcr shifts).\n");
-    fprintf(f, "    P76 xor R,R / {add|or|xor} R,S -> mov R,S (S reg, same width).\n");
-    fprintf(f, "    P77 dup mov/lea/movzx (same dest, same textual source).\n");
-    fprintf(f, "    P78 lea R,[R+off1] / lea R,[R+off2] -> lea R,[R+off1+off2].\n");
-    fprintf(f, "    P79 mov R,imm / push R (R dead) -> push imm.\n");
-    fprintf(f, "    P80 push R / <writer not reading R> / pop R -> delete push+pop.\n");
-    fprintf(f, "    P81 mov AL,SRC / movzx EAX,AL -> movzx EAX, byte ptr SRC.\n");
-    fprintf(f, "  v1.86 new rules (research: Agner Fog, Abrash Black Book, GCC i386.md,\n");
-    fprintf(f, "    LLVM X86Peephole, Intel SDM, Massalin-Stone):\n");
-    fprintf(f, "    P105 sub R,R -> xor R,R (dep-chain break; no precond; P71 fires first).\n");
-    fprintf(f, "    P111 or R,0 -> delete (flags dead).   P112 and R,-1 -> delete (flags dead).\n");
-    fprintf(f, "    P115 xor R,0 -> delete (flags dead).   P119 test R,K -> delete (flags dead).\n");
-    fprintf(f, "    P120 cmp R,K -> delete (flags dead; K != 0; P11 fires first on K==0).\n");
-    fprintf(f, "    P122 imul R,1 -> delete (flags dead; 186+; P38 fires first via 2^0).\n");
-    fprintf(f, "    P123 imul R,0 -> xor R,R (flags dead; 186+; canonical zeroing idiom).\n");
-    fprintf(f, "    P124 lea R,[R] / lea R,[R+0] -> delete (identity lea; every CPU).\n");
-    fprintf(f, "    P126 xchg R,R -> delete (canonical NOP; P1 fires first on same width).\n");
-    fprintf(f, "    P127 bswap R / bswap R -> bswap R (486+; bswap is an involution).\n");
-    fprintf(f, "    P128 xor R,R / push R -> push 0 (186+; R dead after push).\n");
-    fprintf(f, "  Output: -mark and -v default ON since v1.86 (pass them to turn OFF).\n");
-    fprintf(f, "          End-of-run prints a two-column summary table to stderr.\n");
-    fprintf(f, "  v1.87 new rules (research: Intel SDM Vol.2 x87, AMD64 APM, Agner Fog,\n");
-    fprintf(f, "    GCC i386.md, LLVM X86Peephole):\n");
-    fprintf(f, "    x87 FPU rules (require .8087/.287/.387; .NO87 disables them):\n");
-    fprintf(f, "      P129 fld st / fstp st -> delete both (push+pop pair).\n");
-    fprintf(f, "      P130 fldz / fstp st -> delete both (push 0 + pop).\n");
-    fprintf(f, "      P131 fchs / fchs -> delete both (double negation is identity).\n");
-    fprintf(f, "      P132 fabs / fabs -> fabs (abs is idempotent).\n");
-    fprintf(f, "      P134 ffree st / ffree st -> ffree st (idempotent tag-clear).\n");
-    fprintf(f, "      P135 fninit / fninit -> fninit (idempotent reset).\n");
-    fprintf(f, "      P136 fwait / fwait -> fwait (synchronization collapse).\n");
-    fprintf(f, "      P137 fxch st,st / fxch st,st -> delete both (self-swap is NOP).\n");
-    fprintf(f, "      P133 (fsqrt double) was considered and WITHDRAWN: sqrt is NOT\n");
-    fprintf(f, "        idempotent (sqrt(sqrt(x)) != sqrt(x) for x > 1).\n");
-    fprintf(f, "    x86-64 long-mode handling:\n");
-    fprintf(f, "      P138 mov R64,0 -> xor R32,R32 is handled by the P9 C-rule, which\n");
-    fprintf(f, "        detects x64 mode (g_curcpu == 128) and a 64-bit destination and\n");
-    fprintf(f, "        emits the 32-bit xor form (1 byte shorter: no REX.W; xor zero-\n");
-    fprintf(f, "        extends to 64 bits for free; breaks the dependency chain on PPro/P6).\n");
-    fprintf(f, "      P139 (test R64,R64 -> test R32,R32) was WITHDRAWN: it is unsound.\n");
-    fprintf(f, "        test rax,rax sets ZF from all 64 bits while test eax,eax sets ZF\n");
-    fprintf(f, "        from the low 32 bits only, so they differ when rax has bits set\n");
-    fprintf(f, "        above bit 31; the 32-bit form also zero-extends EAX into RAX.\n");
-    fprintf(f, "      P140 mov R64,R64 -> delete is handled by the P1 C-rule.\n");
-    fprintf(f, "    FPU directive parsing: .8087/.287/.387 enable FPU rules; .NO87\n");
-    fprintf(f, "      disables them.  .MMX/.XMM/.K3D set the integer CPU to Pentium+\n");
-    fprintf(f, "      so existing >= N gates still fire.\n");
-    fprintf(f, "    Color: --ncolor disables; otherwise auto-detected from stderr TTY.\n");
+    fprintf(f, "usage: smartpp [options] [in [out]]\n");
+    fprintf(f, "       smartpp [options] -o out in\n");
+    fprintf(f, "\n");
+    fprintf(f, "Options:\n");
+    fprintf(f, "  -m86|-m186|-m286|-m386|-m486|-m586|-m686|-m64\n");
+    fprintf(f, "                  initial CPU level (default 8086; source directives override)\n");
+    fprintf(f, "  -att|-intel     force AT&T or Intel syntax (default: auto-detect)\n");
+    fprintf(f, "  -nz             keep xor+mov / shift pairs (movzx slower on 486/Pentium)\n");
+    fprintf(f, "  -Oz             prefer size over speed where both forms exist\n");
+    fprintf(f, "  -mark|-nomark   enable/disable '; SMARTPP ...(Pn)' markers (default: on)\n");
+    fprintf(f, "  -v|-nv          enable/disable per-line rule notices (default: on)\n");
+    fprintf(f, "  --ncolor        disable colored diagnostics on stderr\n");
+    fprintf(f, "  -o FILE         output file (default stdout; '-' = stdin/stdout)\n");
+    fprintf(f, "  -h|--help       this help\n");
+    fprintf(f, "\n");
+    fprintf(f, "Applies conservative peephole rewrites (dead stores, jump threading,\n");
+    fprintf(f, "constant folding, strength reduction, compiler idioms, x87 pairs, ...).\n");
+    fprintf(f, "See README.md for the full rule catalogue (P1..P140) and design limits.\n");
+    fprintf(f, "End-of-run summary always prints on stderr.\n");
 }
 
-/* v1.86: human-readable CPU level for the summary banner.  Mirrors
- *  the -mNN switches (1=8086, 2=186, 4=286, 8=386, 16=486, 32=P5, 64=P6). */
 static const char *cpu_name(int cpu)
 {
     switch (cpu) {
@@ -8789,12 +8618,12 @@ int main(int argc, char *argv[])
                 outpath = argv[argi];
             }
             else if (a[1] == 'o' && a[2] != '\0') outpath = a + 2;
-            else if (strcmp(a, "-v") == 0) opt_verbose = 0;          /* v1.86: default ON; -v turns OFF */
-            else if (strcmp(a, "-nv") == 0) opt_verbose = 0;        /* alias */
+            else if (strcmp(a, "-v") == 0) opt_verbose = 1;          /* enable per-line notices (default ON) */
+            else if (strcmp(a, "-nv") == 0) opt_verbose = 0;         /* disable per-line notices */
             else if (strcmp(a, "--ncolor") == 0) opt_ncolor = 1;     /* v1.87: disable color */
             else if (strcmp(a, "-nz") == 0) opt_nz = 1;
-            else if (strcmp(a, "-mark") == 0) opt_mark = 0;          /* v1.86: default ON; -mark turns OFF */
-            else if (strcmp(a, "-nomark") == 0) opt_mark = 0;        /* alias */
+            else if (strcmp(a, "-mark") == 0) opt_mark = 1;          /* enable rewrite markers (default ON) */
+            else if (strcmp(a, "-nomark") == 0) opt_mark = 0;        /* disable rewrite markers */
             else if (strcmp(a, "-Oz") == 0 || strcmp(a, "-oz") == 0) opt_zopt = 1;
             else if (strcmp(a, "-att") == 0) {
                 g_att = 1; g_gas = 1; g_synforced = 1;
