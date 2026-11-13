@@ -1,7 +1,9 @@
 /*=====================================================================
-*  SMARTPP  v1.83  --  a conservative peephole pre-processor for
-*  8086..386 assembly source (MASM / JWasm / UASM / ASMC syntax,
+*  SMARTPP  --  a conservative peephole pre-processor for
+*  8086..x86-64 assembly source (MASM / JWasm / UASM / ASMC syntax,
 *  the SMART.INC family).  One file, standard C.
+*
+*  Copyright (c) Javier Gutiérrez Chamorro (Guti)
 *=====================================================================
 *  SMART.INC can only optimize inside a macro expansion: a macro
 *  sees its own arguments, never the surrounding instruction flow
@@ -385,6 +387,12 @@
 *         Saves 1 byte (3 -> 2).  Intel-only (AT&T two-register
 *         forms have an index/scale we don't parse).  Massalin-
 *         Stone doubling idiom.
+*         (v2.15: NOT implemented as a separate rule -- it is
+*         covered by the v2.21 rule P365, which canonicalizes
+*         "lea R,[S+S]" to "lea R,[S*2]", plus the v2.15 rule
+*         P63, which folds the scaled form to "shl R,log2 K"
+*         under the same all-flags-dead gate.  A separate P57
+*         could never fire; see rname[57].)
 *
 *    P58  "xor R, X / xor R, X" (X = register or immediate, NOT
 *         memory)  ->  both deleted.  xor is involution
@@ -627,6 +635,9 @@
 *    P79   "mov R, imm / push R" with R dead after the push ->
 *          single "push imm".  Inverse-direction sibling of P46.
 *          Uses reg_dead_after() (no flag scan needed).
+*          (v2.15: implemented as the ADJACENT-kill form -- the
+*          instruction right after the push already overwrites R;
+*          P87 is the general reg_dead_cf form.)
 *
 *    P80   "push R / <writer to R that does not read R> / pop R"
 *          -> push and pop both deleted (the writer is kept).  The
@@ -634,12 +645,347 @@
 *          R, and the pop's restore is redundant.  No flag scan
 *          (push/pop and the flag-neutral writers leave flags
 *          unchanged).  16/32-bit only.
+*          (v2.15 correction: the text above is UNSOUND -- the pop
+*          restores the pushed value, so the writer's store is dead
+*          and keeping it would change R.  rname[80] ("push+write+
+*          pop->nothing") was the correct intent: all three are
+*          deleted.  That is what got implemented.)
 *
 *    P81   "mov AL, SRC / movzx EAX, AL" -> "movzx EAX, byte ptr
 *          SRC" (typed_src wraps the source).  Flag-neutral and
 *          movzx reads before writing, so no scan needed.
 *          386+ only, Intel-only.
 *          [GCC combine mov+movzx; FPC OptPass2MovMovzx.]
+*
+*  v2.24 (this release)
+*  --------------------------------------------------------------
+*  THREE NEW RULES from the research-driven audit list:
+*
+*    P430  "or R,c1 / and R,c2 / or R,c3" 3-op chain -> delete the
+*          first OR when (c1 & c2) & ~c3 == 0 (i.e., c1 & c2 is a
+*          subset of c3).  Final value with OR1: (R & c2) |
+*          (c1 & c2) | c3; without OR1: (R & c2) | c3; the diff is
+*          (c1 & c2) & ~c3, which must be empty for the rewrite to
+*          be exact for every R.  No flag scan: the deleted OR is
+*          label-free adjacent to the AND, which overwrites all six
+*          status flags before reading any.  Catches the case P62b
+*          misses (P62b only fires when c2 ⊆ c1, collapsing the
+*          pair to a mov).  Three-instruction pattern via the
+*          existing MAXPAT=4 engine; the check function re-parses
+*          the three immediates from g_pcur/g_ppair/g_pnext and
+*          masks each to the destination register's width so
+*          "or al, -1" and "or al, 0FFh" are treated identically.
+*          [Open Watcom peepopt.c AndOr/OrAnd family, 3-op variant.]
+*
+*    P431  "mov R8lo, 0 / mov R8hi, 0 -> xor R16, R16" where R8lo
+*          and R8hi are the low and high byte of the SAME 8-bit
+*          register family (AL+AH -> AX, CL+CH -> CX, DL+DH -> DX,
+*          BL+BH -> BX).  Both movs together set the whole 16-bit
+*          parent to 0; a single "xor R16, R16" does the same in
+*          2 bytes vs the 4 bytes of two byte-sized mov imm8.  xor
+*          defines all six status flags; the two movs define none;
+*          PRE_FLAGS_DEAD_ALL proves the difference is unobservable.
+*          The check function (p431_al_ah_ax_check) verifies the
+*          same-family + complementary-lo relationship the table's
+*          OP_SAME cannot express (OP_SAME requires fam+width+lo
+*          equality; here we need same fam + width but DIFFERENT
+*          lo).  Families 0..3 only (SP/BP/SI/DI have no byte
+*          form).  The $a16 template resolves to the 16-bit parent
+*          regardless of which byte cap['a'] bound (AL -> AX,
+*          AH -> AX, etc.), so the order of the two movs does not
+*          matter.  Intel-only: the template emits Intel-syntax
+*          register names without the AT&T "%" prefix.
+*          [TP/BC emit this pattern when zeroing a 16-bit value
+*          through two byte-stores; Massalin-Stone zeroing idiom
+*          catalogue.]
+*
+*    P432  "movzx R, src / test R, R -> test src, src" when R is
+*          provably dead after the test (PRE_REG_DEAD_RA) AND SF is
+*          provably dead from the test onward (p432_movzx_test_check
+*          calls flags_clear(next_code(j2), F_SF)).  After the movzx
+*          the high bits of R are zero, so "test R, R" leaves SF=0;
+*          "test src, src" leaves SF = MSB of src -- they differ
+*          when src is signed-negative.  ZF/PF/CF/OF all match
+*          exactly (ZF iff src==0; PF on low byte = src in both;
+*          CF=OF=0 in both); AF is undef in both.  Only SF needs
+*          the dead-flag scan, which is more permissive than
+*          PRE_FLAGS_DEAD_ALL and lets the rule fire on the common
+*          "movzx EAX, AL / test EAX, EAX / je L" pattern (je reads
+*          only ZF, SF is dead).  The check also refuses movzx R, R
+*          identity (handled by P424) and insists R be strictly
+*          wider than src.  386+ (movzx encoding); Intel-only.
+*          [LLVM X86PeepholePass optimizeCompare; GCC i386.md
+*          combine movzx+test.]
+*
+*  P344 SOUNDNESS FIX: the constant-propagation redundant-store
+*  rule (P344) used the predicate "reg_width(pk->dreg) <=
+*  reg_width(kp[e].reg)" without checking bit-position coverage, so
+*  after "mov al, 0" it believed AH was also known to be 0 (both
+*  width 8, both fam 0, both val-mask 0) and deleted "mov ah, 0"
+*  even when AH was whatever the caller left.  That is a
+*  miscompile.  Replaced with covers(kp[e].reg, pk->dreg), which
+*  requires the known register to actually cover every bit the
+*  writing register writes.  Same blind spot as the v2.17
+*  cap_regname / OP_SAME fix, just in a different place.  Sound
+*  cases (mov ax,0 / mov ah,0) still fire because covers(AX, AH)
+*  is true; the only thing the fix loses is the unsound deletion
+*  of "mov ah, 0" after "mov al, 0", which P431 now catches
+*  instead (and rewrites to a single "xor ax, ax").
+*
+*  v2.17 (this release)
+*  --------------------------------------------------------------
+*  CRITICAL FIX (P323/P324): "shl R,1 -> lea R,[R+R]" was firing on
+*  16-bit registers, producing the invalid "lea ax,[ax+ax]" (A2031
+*  "must be index or base register") on every pre-386 build.  The
+*  [R+R] SIB form needs the 386+ SIB byte AND a 32/64-bit register;
+*  16-bit addressing allows only BX/BP/SI/DI as base/index and
+*  forbids the same register in both roles.  A new check function
+*  (p323_lea_rr_check) gates the rewrite to 386+ with 32/64-bit
+*  destinations; 8/16-bit shl R,1 stays intact.  This unblocks the
+*  4VIEW 8086/386 real-mode build (five broken sites in StatLoad,
+*  PopUp, DrwSt).
+*
+*  CRITICAL FIX (cap_regname / OP_SAME): the capture struct stored
+*  only fam+width, not the bit offset (lo).  cap_regname matched
+*  lo==0 unconditionally, so a capture of AH (fam=0, width=8, lo=8)
+*  resolved to AL (fam=0, width=8, lo=0) -- "or ah,ah" was rewritten
+*  to "test al,al" (wrong register, a miscompilation).  OP_SAME had
+*  the same blind spot: "or ah,al" (same fam+width, different lo)
+*  matched as "R,R" and could be wrongly rewritten.  Both are fixed:
+*  capent now carries lo, OP_SAME requires lo equality, and
+*  cap_regname uses the captured lo at the natural width (falling
+*  back to lo==0 for forced widths like $a32).  This also stops P1
+*  from deleting "mov al,ah" (not a no-op: different lo within the
+*  same family).
+*
+*  W124 WARNING FIXES: eight tautological comparisons in P17/P70/P79
+*  tripped Watcom's W124 ("Comparison result always 1").  The checks
+*  guarded 32-bit range bounds (d17 <= 0xFFFFFFFFL, o70a <=
+*  0x7FFFFFFFL, v79 >= -0x7FFFFFFFL-1L) that are always true because
+*  long is 32-bit signed on every SMARTPP target -- the upper bound
+*  promotes the signed long to unsigned long for the comparison.
+*  The 32-bit case is now unconditionally true (fit17=1 / fits79=1)
+*  and the P70 upper bound is dropped (the lower bound stays: it
+*  rejects INT32_MIN which could negate-overflow).
+*
+*  NEW RULES (P390-P395): width-specific all-ones masks written as
+*  UNSIGNED hex literals.  P112/P37/P60 handle the SIGNED -1 form
+*  but miss the common "and al,0FFh" / "xor ax,0FFFFh" / "or al,0FFh"
+*  notation (255 / 65535 != -1 as a signed long).  P390/P391 delete
+*  identity AND, P392/P393 rewrite all-ones OR to MOV, P394/P395
+*  rewrite all-ones XOR to NOT.  All are flag-liveness gated.
+*
+*  v2.16
+*  --------------------------------------------------------------
+*  VERBOSE LISTING: with -v, every rule firing now prints a per-line
+*  notice.  The v2.13/v2.14 wave of rules (P344, P351-P356, P360-P362,
+*  P365-P367, P371, P373, P377-P378, P380 second branch, P381-P386)
+*  incremented their st[] counters silently, so -v listed only the
+*  older rules.  A vlog() call was added at every firing site that
+*  lacked one; nothing else changed in those rules.
+*
+*  CONST-PROP SOUNDNESS FIX: the kprop walk updated its push/pop
+*  pending-slot bookkeeping but never invalidated a tracked register
+*  when a pop WITHOUT a matching push wrote it ("mov eax,5 / push ebx /
+*  pop eax" left eax "known" to be 5), and an esp write between the
+*  push and the pop ("push eax / add esp,4 / pop ebx") broke the LIFO
+*  pairing silently.  Both now kill the popped register's family /
+*  the pending slot.  The documented propagations (push R / pop T
+*  hands R's known value to T, including across pushes and pops of
+*  OTHER registers -- "ajenos" -- since the stack is LIFO, and
+*  lea T,[R+d] hands R's known value + d to T) were verified and
+*  stay in place.
+*
+*  MORE imul FACTORS (P380): the unified imul -> lea/shl engine now
+*  also covers m = 17, 19, 21, 25, 27, 37, 41, 45, 73 and 81 (two
+*  leas through a dead scratch register, same discipline as
+*  7/11/13/15), i.e. every K = m * 2^a with m in {3,5,7,9,11,13,15,
+*  17,19,21,25,27,37,41,45,73,81}.  33 and 35 are NOT reachable with
+*  two leas and legal SIB scales {1,2,4,8} (33 = 32+1 needs scale
+*  16; 35 = 5*7 needs a scale-6 step), so they are absent.  Negative
+*  factors are refused: neg+lea chain grows
+*  the code and changes the flag pattern beyond the F_ALL6 gate.
+*
+*  TAIL-CALL WITH EPILOGUE (P383, -Ox): "call F / <restoration> /
+*  ret" now also becomes "<restoration> / jmp F" when the code
+*  between the call and the ret is EXACTLY one absolute esp
+*  restoration -- "leave", or the pair "mov sp,bp / pop bp" -- and
+*  the matching prologue ("push bp" then "mov bp,sp") is found up
+*  the function with bp never rewritten in between, and no push of
+*  any kind sits between the prologue and the call (so F reads no
+*  stack arguments in a working original, and its own ret must be
+*  ret 0 -- the same argument the adjacent form uses).  The
+*  transformation deletes the call line, keeps the restoration lines
+*  in place, and rewrites the ret into "jmp F".  The
+*  pop-bp-in-pair caveat (F's entry bp is the caller's saved value,
+*  exactly as in the already-accepted epilogue-before-call form)
+*  is documented at tailcall_epilogue_ok().
+*
+*  v2.15
+*  --------------------------------------------------------------
+*  COVERAGE REVIEW + IMPLEMENTATION of the rules that were documented
+*  but had no code behind them.  Since the v1.85 table refactor, the
+*  helper parsers used by the v1.80-v1.84 rule families (lea_bracket,
+*  lea_two_regs, lea_scaled_single, emit_lea_disp, width_imm_limit,
+*  is_mem_only_reg, lea_mem_avoids_reg) sat unreferenced in the
+*  smartpp_kept_helpers[] silence array: the rules that consumed them
+*  had been lost from run_pass.  Each documented rule was checked
+*  against the rules that DO fire (the st[] counter set); results:
+*
+*   IMPLEMENTED (were not covered by any firing rule):
+*    - P17  "lea R,[R+c]" -> add/sub/inc/dec; "lea R,[const]" -> mov;
+*          "lea R,[S]" -> mov R,S; "lea R,[R]/[R+0]" -> delete (this
+*          also covers old P124, which had no code either).
+*    - P41  "lea R,[R+S]" -> "add R,S" (flags dead; 16-bit pairs
+*          restricted to BX/BP + SI/DI pre-386; Intel-only).
+*    - P47  "mov R,S / add R,imm" -> "lea R,[S+imm]" (flags dead;
+*          equal widths; Intel-only).  The sibling P382 (mov+lea)
+*          does not cover it: the second instruction differs.
+*    - P56  "add R,c1 / sub R,c2" (mixed, net != 0) -> one op with
+*          the net constant (all six flags dead).  P39 only cancels
+*          the net == 0 case and runs earlier; P16 (same-mnemonic
+*          fold) remains unimplemented and is NOT part of this list.
+*    - P63  "lea R,[R*K]" (K = 2/4/8, 386+, AT&T accepted) ->
+*          "shl R,log2 K" (flags dead).  ESP refused as index.
+*    - P68  "xchg R,S" with one operand dead after the swap ->
+*          "mov <alive>,<dead>" (reg_dead_cf; the 1-byte xchg eax,r
+*          short forms and 64-bit xchg refused so the code never
+*          grows; SP excluded).
+*    - P70  "lea R,[S+off1] / lea D,[R+off2]" (R dead) -> single
+*          "lea D,[S+off1+off2]" (Intel-only, like its sibling P382).
+*    - P79  "mov R,imm / push R" with the next instruction already
+*          killing R -> "push imm" (adjacent-kill form, no scan).
+*    - P80  "push R / <writer> / pop R" (adjacent; writer fully
+*          overwrites R without reading it, the stack, or memory) ->
+*          all three deleted.  NOTE: the v1.83 header text said
+*          "the writer is kept"; that is unsound (the pop restores
+*          the pushed value, so the writer's store is dead -- keeping
+*          it would change R).  rname[80] ("push+write+pop->nothing")
+*          was the correct intent and is what got implemented.  An
+*          "xor R,R" writer defines all six flags, so they must be
+*          dead; the other accepted writers (mov reg/imm, lea,
+*          movzx/movsx from a register) are flag-neutral.
+*    - P82  "lea r16, var" -> "mov r16, OFFSET var" (USE16, bare
+*          symbol, Intel-only; 3 bytes vs 4).
+*    - P85  "mov R,K / cmp R,K" (same K; R and all six flags dead
+*          after the pair) -> both deleted.
+*    - P86  "mov R,K / test R,K" -> both deleted (same shape).
+*    - P87  "mov R,imm / push R" -> "push imm" under reg_dead_cf
+*          (fires when a conditional jump separates the push from its
+*          kill).  P79 above is the adjacent-kill subset, so both
+*          rule numbers get real hits instead of one shadowing the
+*          other.
+*    - P89  "mov R,0 / setcc R8" (386+, R dead after the setcc) ->
+*          the mov is deleted (setcc writes only the low byte and no
+*          flags).
+*
+*   COVERED -- removed from the catalogue, not implemented:
+*    - P57  "lea R,[R+R]" -> "shl R,1": the v2.21 rule P365 already
+*          canonicalizes "lea R,[S+S]" to "lea R,[S*2]" (386+, both
+*          syntaxes, no scan), and the new P63 folds the scaled form
+*          to "shl R,1" under the same all-flags-dead gate P57
+*          documented.  A separate P57 could never fire.  See
+*          rname[57].
+*
+*   CORRECTED (documented pattern was mathematically wrong):
+*    - P88  the documented idiom "rol eax,16 / xchg al,ah /
+*          rol eax,16" does NOT compute bswap: it swaps only the two
+*          HIGH bytes (x = 0x12345678 -> 0x34125678, bswap would give
+*          0x78563412; verified exhaustively).  The canonical 486
+*          byte-swap emulation puts the xchg FIRST:
+*          "xchg al,ah / rol eax,16 / xchg al,ah" == "bswap eax"
+*          exactly.  That corrected order is what P88 now matches.
+*          The flags gate is also tightened: each rol writes CF (OF
+*          undefined at count 16) while bswap writes no flags, so the
+*          rule demands CF and OF dead (F_CFOF) instead of claiming
+*          flag-neutrality.
+*
+*  All new rules follow the v1.83 discipline: exact rewrites need no
+*  scan; flag-differing rewrites demand flags_clear(); register
+*  deadness uses reg_dead_cf(); no rule deletes a labeled line; SP is
+*  excluded where the stack window shape would change; memory reads
+*  are never deleted.
+*
+*  v2.14
+*  --------------------------------------------------------------
+*  NAMING: the end-of-run summary no longer prints "(unnamed)" for
+*  any rule that can fire.  rule_name() now consults (1) the dense
+*  rname[] table (0..216), (2) a new sparse extension table for
+*  343..387, and (3) the declarative table rule's own description,
+*  so every table rule (205..350) is named without duplicating text.
+*
+*  TASM DIRECTIVES: cpu_directive_value() accepts the full TASM
+*  processor-directive family in addition to the dot forms:
+*  P8086/P186/P286/P286N/P286P/P386/P386N/P386P/P486/P486N/P486P/
+*  P586/P586N/P586P/P686..., .286C/.386C/.486C/.586C, the FPU
+*  directives .8087/.287/.387/.487/.587 + P8087..P587 (enable x87)
+*  and .NO87/PNO87 (disable).
+*
+*  REDUNDANCIES REMOVED (all verified dead or duplicated):
+*   - P1 RESTORED in the table ("mov R,R" and "xchg R,R" -> delete):
+*     the v1.85.1 cleanup removed P106/P107 as "caught by P1", but P1
+*     itself had never been in the table, so "mov R,R" silently
+*     stopped being deleted.  Regression fix.
+*   - Table P105 removed (the C rule P71 fires first under the same
+*     conditions; the table copy was unreachable).
+*   - Table P122 removed (the C rule P38's identity case was
+*     unreachable behind the power-of-two branch; P38 fixed below).
+*   - Table P126 removed (subsumed by the restored P1 xchg entry).
+*   - C rule P50 removed ("imul 2^k+1 -> lea"): superseded by the
+*     unified P380 engine, which handles the same factors and more.
+*   - C rule P387 removed ("or/and R,R -> test"): dead behind P8.
+*
+*  NEW / EXTENDED:
+*   - P38 fixed: "imul R,1" (identity, delete when flags dead) was
+*     unreachable behind the power-of-two branch; now the first case.
+*   - P380 unified strength-reduction engine: decomposes K = m*2^a
+*     (m odd); m = 3/5/9 -> single lea (+ trailing shl via
+*     insert_line_after); m = 7/11/13/15 -> two leas through a dead
+*     scratch register found by the new find_dead_scratch() helper.
+*     Covers 3,5,6,7,9,10,11,12,13,14,15 and every m*2^a form (18,
+*     20, 24, 28, 30, 36, 40, 56, ...).  Width-gated to 32/64-bit
+*     (SIB needs it) and excludes SP as index.
+*   - Const-propagation window widened (P344/P385/P386): up to four
+*     known (reg, value) pairs; propagation through push R/pop T,
+*     lea T,[R+d], mov/movzx/movsx/xchg, inc/dec/not/neg,
+*     imul-by-imm and shifts-by-imm; all comparisons masked to the
+*     written register's width.
+*   - P381 (LEA CSE) now compares semantically: [eax+4] and
+*     [eax+2+2] match via the new lea_expr_eq() decomposition.
+*   - P383 (call/ret -> jmp tail-call, -Ox) gained a soundness guard:
+*     tailcall_stack_ok() walks backwards accumulating the esp delta
+*     to a boundary and refuses to fire when the stack at the call is
+*     not at function-entry depth -- previously "call F / ret" after
+*     "push args" was rewritten to "jmp F" with F's ret popping the
+*     argument payload (miscompile).  v2.14 also implements the
+*     epilogue variant SOUNDLY: a "mov sp,bp / pop bp" (or "leave")
+*     restoration pair immediately before the call is accepted when
+*     the matching "push bp / mov bp,sp" prologue is found further up
+*     (absolute esp restoration), or when pure push/pop/add/sub
+*     arithmetic brings the walk back to zero at the entry boundary.
+*     The call-first form ("call F / add esp,N / ret") stays
+*     unimplemented: F's stack arguments are consumed before the jmp
+*     could pass them, and without the callee's signature that cannot
+*     be proven equivalent.
+*
+*  SOUNDNESS FIXES in existing rules:
+*   - P344 (redundant xor R,R in the const-prop window): deletion now
+*     requires all six status flags dead.  v2.13 deleted it
+*     unconditionally, so "xor eax,eax / cmp ebx,ecx / xor eax,eax /
+*     jz L" lost the jz's flag source (miscompile).
+*   - P344/P385/P386: value comparisons are masked to the written
+*     register's width; v2.13 compared by family only, so
+*     "mov eax,K / mov ax,K" style sequences could fold on stale
+*     high bits.
+*   - P385 (cmp R,S -> ZF known): now requires S == R; v2.13 treated
+*     any same-family pair ("cmp al,ah") as always-equal.
+*   - P386 (ALU fold -> mov): new size gate -- the rewrite fires only
+*     when the mov is not larger than the original (result 0, or an
+*     ALU op whose immediate needed the long form); v2.13 could bloat
+*     "add ax, 1" (3 bytes) into "mov ax, K+1" (3..4 bytes).
+*   - Const-prop walk: opaque instructions (cpuid, rdtsc, adc/sbb,
+*     setcc, ...) now break the walk; v2.13 kept scanning through
+*     them with stale knowledge.
 *
 *  v1.86 (this release)
 *  --------------------------------------------------------------
@@ -875,6 +1221,14 @@
 *     three ops are flag-neutral; the idiom's CF/OF are unused by
 *     the next user (the v1.83 review of P4 already proved this
 *     for the byte-swap idiom).  Intel-only, 32-bit register only.
+*     (v2.15 CORRECTION: the order documented above is NOT an
+*     identity for bswap -- it swaps only the two HIGH bytes
+*     (0x12345678 -> 0x34125678, bswap would give 0x78563412).
+*     The canonical 486 byte-swap emulation puts the xchg FIRST:
+*     "xchg al,ah / rol eax,16 / xchg al,ah" == "bswap eax"
+*     exactly.  Each rol writes CF (OF undefined at count 16)
+*     while bswap writes no flags, so the rule demands CF and OF
+*     dead (F_CFOF) instead of claiming flag-neutrality.)
 *
 *  NEW RULES (research: GCC i386.md, FPC aoptx86, Open Watcom
 *  peepopt, classic superoptimizer literature)
@@ -1096,12 +1450,12 @@
 *
 *  USAGE
 *  -----
-*     smartpp [-m86|-m186|-m286|-m386] [-nz] [-mark] [-v] [-o OUT] [IN [OUT]]
+*     smartpp [-m86|-m186|-m286|-m386] [-color|-ncolor] [-mark] [-v] [-o OUT] [IN [OUT]]
 *       -m...   initial CPU level (8086 if not given).  A .8086 /
 *               .186 / .286 / .386 / ... directive in the source
 *               overrides it from its line on.
-*       -nz     keep "xor+mov" and shift pairs (P29, P33, P34 movzx
-*               forms): movzx is smaller but slower on a 486/Pentium
+*       -color / -ncolor  force colored stderr diagnostics on/off
+*               (default: color when stderr is a TTY)
 *       -mark   append a trailing "; SMARTPP 1.84: <desc> (PN)" comment
 *               to every line the program rewrites (and a "was '...'"
 *               comment to every line it deletes), so the user can see
@@ -1131,8 +1485,10 @@
 *
 *  LIMITS
 *  ------
-*   - One file per run: INCLUDEd files are not followed (run it on
-*     each file, or on the assembler's preprocessed output).
+*   - INCLUDE / include / .include are followed recursively (v1.90).
+*     Use -I DIR for extra search paths, -noinclude to disable.
+*     Cycles are detected and skipped.  Missing includes warn and
+*     leave the original directive in the output.
 *   - Lines longer than 8191 characters pass through untouched.
 *   - Conditional assembly is not evaluated: a .386 inside a
 *     disabled {IF 0} block still raises the CPU level from its
@@ -1151,6 +1507,10 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdarg.h>
+#ifdef _WIN32
+#  include <windows.h>
+#  include <io.h>
+#endif
 
 /* isatty()/fileno() are POSIX.  On platforms without <unistd.h> we fall
  *  back to "no color" (color_enabled() returns 0 unconditionally). */
@@ -1162,7 +1522,16 @@
 #define SMARTPP_HAS_ISATTY 0
 #endif
 
-#define SMARTPP_VERSION "1.88"
+#define SMARTPP_VERSION "2.24"
+/* Author name: use CP1252 on Windows (é = 0xE9), UTF-8 elsewhere.
+ *  Windows consoles (cp850/cp1252) often mojibake UTF-8; CP1252 matches
+ *  the OEM/ANSI code pages used by Spanish Windows. */
+#ifdef _WIN32
+#  define AUTHOR_STR "Javier Guti\xE9rrez Chamorro (Guti)"
+#else
+#  define AUTHOR_STR "Javier Guti\xC3\xA9rrez Chamorro (Guti)"
+#endif
+
 
 #define MAXTOK  256              /* operand / label / target buffer   */
 #define MAXCMT  512              /* trailing comment buffer           */
@@ -1191,28 +1560,56 @@
 #define C_BLUE   "\x1b[34m"
 #define C_MAGENTA "\x1b[35m"
 #define C_CYAN   "\x1b[36m"
+#define C_WHITE  "\x1b[37m"
+#define C_BRIGHT_WHITE "\x1b[1;37m"  /* DOS color 15 */
+#define C_GRAY   "\x1b[37m"          /* DOS color 7  */
 
-/* v1.87: colored diagnostic output (GCC-style).
+#define C_BG_BLUE "\x1b[44m"
+#define C_BRIGHT "\x1b[1;36m"
+
+/* v1.92: colored diagnostic output.
  *  Behavior:
- *    - default: color ON iff stderr is a TTY (auto-detect via isatty()).
- *    - --ncolor: force color OFF (overrides TTY auto-detection).
- *  Color is ONLY applied to stderr; stdout (the optimized .asm) is
- *  never colored, so the output remains a valid assembler input that
- *  you can pipe straight into ASMC/JWasm/UASM/MASM/GAS.
- *  The SMARTPP_COLOR env var is no longer consulted (replaced by
- *  --ncolor in v1.87); if you previously relied on
- *  SMARTPP_COLOR=always, just run without --ncolor on a TTY. */
-static int  opt_ncolor = 0;       /* --ncolor: disable color            */
+ *    - default: color ON.
+ *    - -color:  force color ON.
+ *    - -ncolor: force color OFF.
+ *    - -color=auto is not exposed; opt_color=-1 still means TTY-auto
+ *      if set programmatically.
+ *  Color is ONLY on stderr; stdout stays plain assembler text. */
+static int  opt_color = 1;        /* 1=on (default), 0=off (-ncolor), -1=auto/TTY */
+
+static const char *cpu_name(int cpu);
+static void print_summary(long nout, long ndel);
+static void print_version(void);
 
 static int color_enabled(void)
 {
+    if (opt_color == 0) return 0;
+    if (opt_color == 1) return 1;
 #if SMARTPP_HAS_ISATTY
-    if (opt_ncolor) return 0;
     return isatty(fileno(stderr)) ? 1 : 0;
 #else
     return 0;
 #endif
 }
+
+/* Print startup / help banner: line1 = bright white (15), line2 = gray (7). */
+static void print_banner(FILE *f)
+{
+    int col = color_enabled();
+    if (col)
+        fprintf(f, "%sSMARTPP %s - conservative peephole pre-processor for 8086..x86-64%s\n",
+                C_BRIGHT_WHITE, SMARTPP_VERSION, C_RESET);
+    else
+        fprintf(f, "SMARTPP %s - conservative peephole pre-processor for 8086..x86-64\n",
+                SMARTPP_VERSION);
+    if (col)
+        fprintf(f, "%sCopyright (c) %s%s\n", C_GRAY, AUTHOR_STR, C_RESET);
+    else
+        fprintf(f, "Copyright (c) %s\n", AUTHOR_STR);
+    fflush(f);
+}
+
+
 
 /* ---- instruction classes ------------------------------------------*/
 
@@ -1242,6 +1639,7 @@ struct pinfo {
     int  nops;
     char op0[MAXTOK];
     char op1[MAXTOK];
+    char op2[MAXTOK];             /* v2.20: third operand (imul R,S,K) */
     int  dreg;
     int  sreg;
     int  srcimm;
@@ -1289,6 +1687,14 @@ static const struct reginfo g_regs[] = {
     { "st",  8, 0, 80 }, { "st(0)", 8, 0, 80 }, { "st(1)", 8, 1, 80 },
     { "st(2)", 8, 2, 80 }, { "st(3)", 8, 3, 80 }, { "st(4)", 8, 4, 80 },
     { "st(5)", 8, 5, 80 }, { "st(6)", 8, 6, 80 }, { "st(7)", 8, 7, 80 },
+    /* MMX mm0..mm7 (fam 20..27), 64-bit */
+    { "mm0", 20, 0, 64 }, { "mm1", 21, 0, 64 }, { "mm2", 22, 0, 64 }, { "mm3", 23, 0, 64 },
+    { "mm4", 24, 0, 64 }, { "mm5", 25, 0, 64 }, { "mm6", 26, 0, 64 }, { "mm7", 27, 0, 64 },
+    /* SSE xmm0..xmm15 (fam 30..45), 128-bit */
+    { "xmm0", 30, 0, 128 }, { "xmm1", 31, 0, 128 }, { "xmm2", 32, 0, 128 }, { "xmm3", 33, 0, 128 },
+    { "xmm4", 34, 0, 128 }, { "xmm5", 35, 0, 128 }, { "xmm6", 36, 0, 128 }, { "xmm7", 37, 0, 128 },
+    { "xmm8", 38, 0, 128 }, { "xmm9", 39, 0, 128 }, { "xmm10",40, 0, 128 }, { "xmm11",41, 0, 128 },
+    { "xmm12",42, 0, 128 }, { "xmm13",43, 0, 128 }, { "xmm14",44, 0, 128 }, { "xmm15",45, 0, 128 },
     { NULL,  0, 0,  0 }
 };
 
@@ -1312,37 +1718,75 @@ static struct pinfo g_pscan;     /* flags_clear                      */
 static char g_scratch[MAXLINE];                      /* shared copy  */
 static char g_build[MAXLINE + MAXTOK + MAXCMT];      /* rewrite buf  */
 
-static int  opt_verbose = 1;        /* default ON; -nv disables, -v enables */
+static int  opt_verbose = 0;        /* default OFF; -v enables, -nv disables */
 static int  g_curcpu    = 1;
-static int  opt_nz      = 0;     /* -nz: keep xor+mov / shift pairs     */
+/* v2.26: g_cpu_max is the HARD CEILING set by the -m flag on the
+ *  command line.  Source-file directives (.386, .286, etc.) can only
+ *  set g_curcpu UP TO this ceiling -- they cannot raise it beyond
+ *  what the user explicitly requested.  This prevents a .386
+ *  directive in the source from enabling movzx/movsx rules when
+ *  the user passed -m86 (targeting 8086 where those instructions
+ *  don't exist).  When -m is NOT given, g_cpu_max stays 0 and
+ *  directives are unrestricted (preserving v2.25 behavior). */
+static int  g_cpu_max   = 0;    /* 0 = no ceiling (directives unrestricted) */
+static int  opt_zopt    = 0;     /* -Oz: optimize for size */
+static int  opt_speed   = 1;     /* -Os: optimize for speed (default) */
+static int  opt_aggressive = 0;  /* -Ox: aggressive (non-100%-safe) folds */
+
+/* Prefer xor+mov over movzx on 486/Pentium (2 clocks vs 3).
+ *  386 and P6+/x64 take movzx (size / modern cores).  Replaces -nz.
+ *  v2.23: with -Oz (size), always prefer movzx (smaller). */
+static int prefer_xor_mov(void)
+{
+    if (opt_zopt) return 0;            /* -Oz: movzx is always smaller */
+    return (g_curcpu == 16 || g_curcpu == 32);
+}
+/* v1.92: -nz removed.  prefer_xor_mov() chooses automatically:
+ *  on 486 and Pentium, xor+mov is faster than movzx (2 vs 3 clocks);
+ *  on 386 and on P6+/x64, movzx is preferred (size / modern cores). */
 static int  g_use32     = 0;     /* a 32-bit segment may exist (no P36)  */
 static int  opt_mark    = 1;     /* default ON; -nomark disables, -mark enables */
-static int  opt_zopt    = 0;     /* -Oz: size over speed (favor shorter form) */
 static int  g_passes_run = 0;   /* number of passes actually executed */
 static int  g_nofpu     = 0;    /* .NO87 disables FPU rules; .287/.387/.8087 enable */
 
 /* Per-rule hit counters, indexed by rule number (1..STSZ).
 *  st[0] is unused.  The driver prints non-zero entries by name. */
-#define STSZ 160             /* P1..P140 + spare room for future rules */
+#define STSZ 440             /* P1..P429 + spare */
 static long st[STSZ];
 
 static int  g_gas = 0;           /* GAS conventions (comments, labels) */
 static int  g_att = 0;           /* AT&T operand order and % registers */
 static int  g_synforced = 0;     /* -att / -intel given on the command line */
 
+/* v1.90: INCLUDE following ------------------------------------------------
+ *  Search paths (-I), recursion stack (cycle detection) and a flag that
+ *  keeps the original include line as a comment when expansion succeeds. */
+#define MAX_INCL_DEPTH  64
+#define MAX_INCL_PATHS  64
+static char *g_inc_paths[MAX_INCL_PATHS];
+static int   g_ninc_paths = 0;
+static char *g_incl_stack[MAX_INCL_DEPTH];
+static int   g_incl_depth = 0;
+static int   opt_noinclude = 0;  /* -noinclude: do not follow INCLUDE at all */
+
+
 struct labent {
     char name[MAXTOK];
     long line;
     int  dup;
+    int  next;           /* v1.94: hash chain index, -1 = end */
 };
 static struct labent *g_labs  = NULL;
 static long g_nlab   = 0;
 static long g_caplab = 0;
+#define LAB_HASH 4096
+static int g_lab_hash[LAB_HASH];   /* heads; -1 = empty */
+static int g_lab_hash_ready = 0;
 
 /* ---- small helpers --------------------------------------------------*/
 
 /* v1.86: per-line rewrite/delete notices go through vlog so they obey
- *  opt_verbose (default ON; -v turns it OFF).  Errors and the final
+ *  opt_verbose (default OFF; -v turns it ON).  Errors and the final
  *  summary always print.
  *  v1.87: when color is enabled (TTY + --ncolor not given), the
  *  per-line notices get the leading "smartpp:" tag colored (cyan +
@@ -1554,13 +1998,60 @@ static int find_reg(const char *t)
     return -1;
 }
 
-/* outer fully overwrites every bit inner writes */
+/* v2.25 (S6): unified register-relation predicate.  Replaces four
+ *  near-duplicate ways the code used to ask "are these two registers
+ *  related?":
+ *    - covers() below (used by P2/P26/P68/P70 and the dead-store walk)
+ *    - OP_SAME matching in op_pat_match (fam + width + lo equality)
+ *    - kprop_find_fam's "same family" lookup (P344/P385/P386)
+ *    - p431_al_ah_ax_check's manual fam + lo comparison
+ *  All four ask the same underlying question with different masks;
+ *  reg_relation() exposes every mask shape via one enum so the
+ *  callers stop re-deriving the test. */
+enum reg_rel {
+    REL_COVER        = 1,   /* outer fully overwrites every bit inner writes */
+    REL_SAME         = 2,   /* same fam, same width, same lo (exact equality) */
+    REL_SAME_FAM     = 3,   /* same family, any width/lo */
+    REL_SAME_WIDTH   = 4,   /* same fam AND same width, any lo (e.g. AL vs AH) */
+    REL_COMPLEMENT_LO= 5,   /* same fam + same width + los sum to width
+                               (AL+AH=AX, CL+CH=CX, etc.) */
+    REL_DISJOINT     = 6    /* different family */
+};
+
+static int reg_relation(int a, int b, enum reg_rel rel)
+{
+    if (a < 0 || b < 0) return 0;
+    if (g_regs[a].fam != g_regs[b].fam) {
+        return (rel == REL_DISJOINT);
+    }
+    switch (rel) {
+        case REL_SAME_FAM:
+            return 1;
+        case REL_SAME_WIDTH:
+            return (g_regs[a].hi - g_regs[a].lo) == (g_regs[b].hi - g_regs[b].lo);
+        case REL_SAME:
+            return (g_regs[a].hi - g_regs[a].lo) == (g_regs[b].hi - g_regs[b].lo) &&
+                    g_regs[a].lo == g_regs[b].lo;
+        case REL_COMPLEMENT_LO: {
+            int wa = g_regs[a].hi - g_regs[a].lo;
+            int wb = g_regs[b].hi - g_regs[b].lo;
+            return wa == wb && (g_regs[a].lo + g_regs[b].lo) == wa;
+        }
+        case REL_COVER:
+            return g_regs[a].lo <= g_regs[b].lo &&
+                   g_regs[a].hi >= g_regs[b].hi;
+        case REL_DISJOINT:
+            return 0;   /* same fam, so not disjoint */
+    }
+    return 0;
+}
+
+/* outer fully overwrites every bit inner writes.  v2.25: thin wrapper
+ *  around reg_relation() for the existing call sites (P2's writer_ok,
+ *  P26/P68/P70 dead-store scans, P344's soundness fix). */
 static int covers(int outer, int inner)
 {
-    if (outer < 0 || inner < 0) return 0;
-    if (g_regs[outer].fam != g_regs[inner].fam) return 0;
-    return g_regs[outer].lo <= g_regs[inner].lo &&
-           g_regs[outer].hi >= g_regs[inner].hi;
+    return reg_relation(outer, inner, REL_COVER);
 }
 
 /* does the expression mention any register of the family? */
@@ -1591,6 +2082,61 @@ static int expr_uses_family(const char *e, int fam)
 #define TERM(i)   (g_tc[(i) >> CHUNK_SHIFT][(i) & (CHUNK_SIZE - 1L)])
 #define DEL(i)    (g_dc[(i) >> CHUNK_SHIFT][(i) & (CHUNK_SIZE - 1L)])
 #define INDEF(i)  (g_ic[(i) >> CHUNK_SHIFT][(i) & (CHUNK_SIZE - 1L)])
+
+/* v2.25 (S1) -- WITHDRAWN: per-line pinfo cache.
+ *
+ *  The original analysis predicted ~30-40% time saving on large
+ *  files from caching parse_line results.  The implementation
+ *  showed this was wrong:
+ *
+ *    - 4VIEW (8240 lines, 3 passes): 88ms original, 89ms cached.
+ *      Break-even; the memset-per-pass (later replaced by an O(1)
+ *      generation counter) and the 1.6KB struct copy per hit eat
+ *      the re-tokenization savings.
+ *    - 12x4VIEW (~99K lines): 1.04s original, 1.08s cached.  4%
+ *      SLOWER, plus 160MB of cache memory (1.6KB × 99K lines).
+ *
+ *  Root cause: parse_line for typical ASM lines (short operands,
+ *  simple mnemonics) is ~microseconds, comparable to the 1.6KB
+ *  struct copy a cache hit costs.  The cache only wins on lines
+ *  with very long operands or complex tokenization, which are rare.
+ *
+ *  The cache infrastructure (g_pi_cache, g_pi_gen, pi_cache_grow,
+ *  pi_cache_invalidate, pi_cache_invalidate_all) is left in place
+ *  but inert -- pi_cache_grow is never called, so g_pi_cap stays 0
+ *  and every parse_line falls through to the uncached path.  This
+ *  keeps the hooks available for future experiments (e.g., caching
+ *  only the expensive-to-compute fields like dreg/sreg/shiftcount,
+ *  not the full pinfo) without paying the cost today.
+ *
+ *  The per-entry invalidation hooks in replace_line /
+ *  delete_keep_label / insert_line_after / the pass loop are also
+ *  kept (they call pi_cache_invalidate which is a no-op when
+ *  g_pi_cap == 0); removing them would be a separate cleanup. */
+
+/* Inert stubs: g_pi_cap stays 0 so the hit/write-back checks in
+ *  parse_line always short-circuit on `g_pi_cache != NULL`.  The
+ *  invalidation calls from replace_line / delete_keep_label /
+ *  insert_line_after / the pass loop compile to no-ops. */
+static struct pinfo *g_pi_cache = NULL;
+static long         *g_pi_gen = NULL;
+static long          g_pi_cur_gen = 0;
+static long          g_pi_cap = 0;
+
+static void pi_cache_grow(long cap)
+{
+    (void)cap;   /* inert: S1 withdrawn */
+}
+
+static void pi_cache_invalidate(long idx)
+{
+    (void)idx;   /* inert: g_pi_cap == 0, nothing to invalidate */
+}
+
+static void pi_cache_invalidate_all(void)
+{
+    /* inert: g_pi_cap == 0, nothing to invalidate */
+}
 
 static void chunk_reserve(long need)
 {
@@ -1625,6 +2171,10 @@ static void chunk_reserve(long need)
         g_ic[g_nchunks] = pi;
         g_nchunks++;
     }
+    /* v2.25 (S1): pi_cache_grow() would be called here to size the
+     *  pinfo cache to g_nchunks * CHUNK_SIZE, but S1 was withdrawn
+     *  (see comment above); the call is a no-op. */
+    pi_cache_grow(g_nchunks * CHUNK_SIZE);
 }
 
 static void store_line(long i, char *s, int term)
@@ -1637,52 +2187,366 @@ static void store_line(long i, char *s, int term)
 
 /* ---- reading ---------------------------------------------------------*/
 
-static void finish_line(char *acc, long n)
+/* v1.90: dirname of a path into out (empty string if none). */
+static void path_dirname(const char *path, char *out, size_t outsz)
 {
-    int term = 0;
-    if (n >= 2 && acc[n - 1] == '\n' && acc[n - 2] == '\r') { term = 2; n -= 2; }
-    else if (n >= 1 && acc[n - 1] == '\n') { term = 1; n -= 1; }
-    else if (n >= 1 && acc[n - 1] == '\r') { term = 3; n -= 1; }
-    acc[n] = '\0';
-    store_line(g_nlines, xstrdup(acc), term);
+    const char *slash = NULL;
+    const char *p;
+    size_t n;
+    if (path == NULL || outsz == 0) { if (outsz) out[0] = '\0'; return; }
+    for (p = path; *p; p++)
+        if (*p == '/' || *p == '\\') slash = p;
+    if (slash == NULL) { out[0] = '\0'; return; }
+    n = (size_t)(slash - path);
+    if (n >= outsz) n = outsz - 1;
+    memcpy(out, path, n);
+    out[n] = '\0';
 }
 
-static void read_file(FILE *f)
+/* Join dir + name into out.  If name is absolute, copy name only. */
+static void path_join(const char *dir, const char *name, char *out, size_t outsz)
 {
-    char *acc = NULL;
-    long alen = 0, acap = 0;
-    for (;;) {
-        long cl;
-        if (fgets(g_scratch, MAXLINE, f) == NULL) break;
-        cl = (long)strlen(g_scratch);
-        if (cl > 0) {
-            if (alen + cl + 1 > acap) {
-                long ncap = (acap > 0) ? acap * 2 : (MAXLINE * 2);
-                char *na;
-                if (ncap < alen + cl + 1) ncap = alen + cl + 1;
-                na = (char *)xrealloc(acc, (size_t)ncap);
-                acc = na;
-                acap = ncap;
-            }
-            memcpy(acc + alen, g_scratch, (size_t)cl);
-            alen += cl;
-            acc[alen] = '\0';
-        }
-        if (alen > 0 && acc[alen - 1] == '\n') {
-            finish_line(acc, alen);
-            alen = 0;
+    size_t nd, nn;
+    if (name == NULL || name[0] == '\0') { out[0] = '\0'; return; }
+    if (name[0] == '/' || name[0] == '\\' ||
+        (name[0] && name[1] == ':')) {
+        strncpy(out, name, outsz - 1);
+        out[outsz - 1] = '\0';
+        return;
+    }
+    if (dir == NULL || dir[0] == '\0') {
+        strncpy(out, name, outsz - 1);
+        out[outsz - 1] = '\0';
+        return;
+    }
+    nd = strlen(dir);
+    nn = strlen(name);
+    if (nd + 1 + nn + 1 > outsz) {
+        out[0] = '\0';
+        return;
+    }
+    memcpy(out, dir, nd);
+    if (dir[nd - 1] != '/' && dir[nd - 1] != '\\') {
+        out[nd] = '/';
+        nd++;
+    }
+    memcpy(out + nd, name, nn);
+    out[nd + nn] = '\0';
+}
+
+/* True if path is already on the include stack (cycle). */
+static const char *path_basename(const char *path)
+{
+    const char *b = path ? path : "";
+    const char *p;
+    for (p = b; *p; p++)
+        if (*p == '/' || *p == '\\') b = p + 1;
+    return b;
+}
+
+static int incl_on_stack(const char *path)
+{
+    int i;
+    const char *base;
+    if (path == NULL) return 0;
+    base = path_basename(path);
+    for (i = 0; i < g_incl_depth; i++) {
+        if (g_incl_stack[i] == NULL) continue;
+        if (ci_eq(g_incl_stack[i], path)) return 1;
+        /* Windows may resolve the same file with different spellings */
+        if (ci_eq(path_basename(g_incl_stack[i]), base)) return 1;
+    }
+    return 0;
+}
+
+
+static FILE *open_include(const char *cur_dir, const char *name, char *resolved, size_t rsz)
+{
+    int i;
+    FILE *f;
+    path_join(cur_dir, name, resolved, rsz);
+    if (resolved[0] != '\0') {
+        f = fopen(resolved, "rb");
+        if (f) return f;
+    }
+    for (i = 0; i < g_ninc_paths; i++) {
+        path_join(g_inc_paths[i], name, resolved, rsz);
+        if (resolved[0] == '\0') continue;
+        f = fopen(resolved, "rb");
+        if (f) return f;
+    }
+    /* plain name relative to CWD */
+    strncpy(resolved, name, rsz - 1);
+    resolved[rsz - 1] = '\0';
+    f = fopen(resolved, "rb");
+    return f;
+}
+
+/* Parse an include directive.  Returns 1 and fills fname if the line
+ *  is INCLUDE / include / .include with a file name.  Strips quotes
+ *  and <angle> brackets.  Comments are ignored. */
+static int parse_include_line(const char *line, char *fname, size_t fsz)
+{
+    static char buf[MAXLINE];
+    char *p, *q, *end;
+    char *cmt;
+    size_t n;
+    if (line == NULL || fname == NULL || fsz == 0) return 0;
+    strncpy(buf, line, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    /* strip comment */
+    cmt = find_comment(buf);
+    if (cmt) *cmt = '\0';
+    p = skip_ws(buf);
+    /* skip optional "name:" label */
+    if (is_ident_start((unsigned char)*p)) {
+        q = p;
+        while (is_ident_char((unsigned char)*q)) q++;
+        if (*q == ':') {
+            p = skip_ws(q + 1);
         }
     }
-    if (alen > 0) finish_line(acc, alen);
-    free(acc);
+    /* .include (GAS) or INCLUDE / include (MASM) */
+    if (*p == '.') {
+        p++;
+        if (!ci_eq_n(p, "include", 7) || is_ident_char((unsigned char)p[7]))
+            return 0;
+        p = skip_ws(p + 7);
+    } else {
+        if (!ci_eq_n(p, "include", 7) || is_ident_char((unsigned char)p[7]))
+            return 0;
+        p = skip_ws(p + 7);
+    }
+    if (*p == '\0') return 0;
+    /* quoted, angled, or bare */
+    if (*p == '"' || *p == '\'') {
+        char quote = *p++;
+        q = p;
+        while (*q && *q != quote) q++;
+        n = (size_t)(q - p);
+    } else if (*p == '<') {
+        p++;
+        q = p;
+        while (*q && *q != '>') q++;
+        n = (size_t)(q - p);
+    } else {
+        q = p;
+        while (*q && *q != ' ' && *q != '\t' && *q != ';') q++;
+        n = (size_t)(q - p);
+    }
+    if (n == 0 || n >= fsz) return 0;
+    memcpy(fname, p, n);
+    fname[n] = '\0';
+    /* trim trailing whitespace */
+    end = fname + strlen(fname);
+    while (end > fname && (end[-1] == ' ' || end[-1] == '\t')) {
+        end--;
+        *end = '\0';
+    }
+    return fname[0] != '\0';
+}
+
+static void read_file_path(const char *path); /* recursive */
+
+/* Read one already-opened stream, expanding INCLUDE lines.  cur_path
+ *  is used for diagnostics and relative resolution; may be NULL. */
+
+/* Load entire stream into one malloc'd buffer (binary).  Returns NULL on
+ *  failure.  Does not use fseek - works around Windows CRT issues where
+ *  fseek/ftell before fgets can leave the FILE* unreadable. */
+static char *load_entire_stream(FILE *f, long *out_sz)
+{
+    char *buf = NULL;
+    long sz = 0, cap = 0;
+    char tmp[8192];
+    size_t n;
+    for (;;) {
+        n = fread(tmp, 1, sizeof(tmp), f);
+        if (n == 0) break;
+        if (sz + (long)n + 1 > cap) {
+            long ncap = (cap > 0) ? cap * 2 : 16384;
+            while (ncap < sz + (long)n + 1) ncap *= 2;
+            buf = (char *)xrealloc(buf, (size_t)ncap);
+            cap = ncap;
+        }
+        memcpy(buf + sz, tmp, n);
+        sz += (long)n;
+    }
+    if (buf == NULL) {
+        buf = (char *)xmalloc(1);
+        buf[0] = '\0';
+        sz = 0;
+    } else {
+        buf[sz] = '\0';
+    }
+    if (out_sz) *out_sz = sz;
+    return buf;
+}
+
+/* Feed a memory buffer through the same line/include logic as a stream.
+ *  Large buffers live on the heap so recursive INCLUDE does not blow a
+ *  small DOS/Windows stack (3 x MAXLINE = 24 KB per frame was too much). */
+static void read_memory_buffer(const char *data, long sz, const char *cur_path)
+{
+    char *cur_dir = (char *)xmalloc(MAXLINE);
+    char *linebuf = (char *)xmalloc(MAXLINE);
+    char *fname = (char *)xmalloc(MAXLINE);
+    long pos = 0;
+    long local_lines = 0;
+    long chunks = 0;
+
+    path_dirname(cur_path ? cur_path : "", cur_dir, MAXLINE);
+
+    while (pos < sz) {
+        long start = pos;
+        long ln;
+        int term = 1;
+        int maybe_inc;
+        long line_len;
+
+        while (pos < sz && data[pos] != '\n' && data[pos] != '\r') pos++;
+        ln = pos - start;
+        if (pos < sz && data[pos] == '\r') {
+            term = 3;
+            pos++;
+            if (pos < sz && data[pos] == '\n') { term = 2; pos++; }
+        } else if (pos < sz && data[pos] == '\n') {
+            term = 1;
+            pos++;
+        }
+        line_len = ln;
+        if (line_len >= MAXLINE) line_len = MAXLINE - 1;
+        if (line_len > 0) memcpy(linebuf, data + start, (size_t)line_len);
+        linebuf[line_len] = '\0';
+
+        chunks++;
+
+        maybe_inc = 0;
+        if (!opt_noinclude) {
+            const char *q;
+            for (q = linebuf; *q; q++) {
+                if (*q == 'i' || *q == 'I') { maybe_inc = 1; break; }
+            }
+        }
+
+        if (maybe_inc && parse_include_line(linebuf, fname, MAXLINE)) {
+            char *resolved = (char *)xmalloc(MAXLINE);
+            FILE *inc;
+            if (g_incl_depth >= MAX_INCL_DEPTH) {
+                fprintf(stderr, "smartpp: include nesting too deep at '%s'\n",
+                        fname);
+                store_line(g_nlines, xstrdup(linebuf), (unsigned char)term);
+                free(resolved);
+            } else {
+                inc = open_include(cur_dir, fname, resolved, MAXLINE);
+                if (inc == NULL) {
+                    fprintf(stderr, "smartpp: cannot open include '%s'\n", fname);
+                    store_line(g_nlines, xstrdup(linebuf), (unsigned char)term);
+                    free(resolved);
+                } else if (incl_on_stack(resolved)) {
+                    fprintf(stderr, "smartpp: include cycle skipped: '%s'\n",
+                            resolved);
+                    fclose(inc);
+                    store_line(g_nlines, xstrdup(linebuf), (unsigned char)term);
+                    free(resolved);
+                } else {
+                    char *mark = (char *)xmalloc(MAXLINE);
+                    long lines_before = g_nlines;
+                    long fsz = 0;
+                    char *body;
+                    snprintf(mark, MAXLINE,
+                             "; SMARTPP include begin: %.200s", resolved);
+                    store_line(g_nlines, xstrdup(mark), (unsigned char)term);
+                    body = load_entire_stream(inc, &fsz);
+                    fclose(inc);
+                    fprintf(stderr, "smartpp: including '%s' (%ld bytes)...\n",
+                            resolved, fsz);
+                    fflush(stderr);
+                    g_incl_stack[g_incl_depth++] = xstrdup(resolved);
+                    free(resolved);
+                    resolved = NULL;
+                    read_memory_buffer(body, fsz, g_incl_stack[g_incl_depth - 1]);
+                    free(body);
+                    free(g_incl_stack[--g_incl_depth]);
+                    g_incl_stack[g_incl_depth] = NULL;
+                    snprintf(mark, MAXLINE, "; SMARTPP include end");
+                    store_line(g_nlines, xstrdup(mark), (unsigned char)term);
+                    free(mark);
+                    fprintf(stderr, "smartpp: included (%ld lines)\n",
+                            g_nlines - lines_before);
+                    fflush(stderr);
+                }
+            }
+        } else {
+            store_line(g_nlines, xstrdup(linebuf), (unsigned char)term);
+        }
+        local_lines++;
+    }
+
+    free(cur_dir);
+    free(linebuf);
+    free(fname);
+}
+
+static void read_file_stream(FILE *f, const char *cur_path)
+{
+    long sz = 0;
+    char *body = load_entire_stream(f, &sz);
+    read_memory_buffer(body, sz, cur_path);
+    free(body);
+}
+
+static void read_file_path(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        fprintf(stderr, "smartpp: cannot open '%s'\n", path);
+        return;
+    }
+    if (g_incl_depth < MAX_INCL_DEPTH) {
+        g_incl_stack[g_incl_depth++] = xstrdup(path);
+        read_file_stream(f, path);
+        free(g_incl_stack[--g_incl_depth]);
+        g_incl_stack[g_incl_depth] = NULL;
+    } else {
+        read_file_stream(f, path);
+    }
+    fclose(f);
+}
+
+/* Legacy entry: read an already-open stream with no path context. */
+static void read_file(FILE *f)
+{
+    read_file_stream(f, NULL);
 }
 
 /* ---- labels -----------------------------------------------------------*/
 
+static unsigned lab_hash(const char *s)
+{
+    unsigned h = 5381;
+    while (*s) {
+        unsigned c = (unsigned char)*s++;
+        if (c >= 'A' && c <= 'Z') c = c + 32;
+        h = ((h << 5) + h) + c;
+    }
+    return h % LAB_HASH;
+}
+
+static void lab_hash_init(void)
+{
+    int i;
+    for (i = 0; i < LAB_HASH; i++) g_lab_hash[i] = -1;
+    g_lab_hash_ready = 1;
+}
+
 static void label_add(const char *name, long line)
 {
-    long i;
-    for (i = 0; i < g_nlab; i++) {
+    unsigned h;
+    int i;
+    if (!g_lab_hash_ready) lab_hash_init();
+    h = lab_hash(name);
+    for (i = g_lab_hash[h]; i >= 0; i = g_labs[i].next) {
         if (ci_eq(g_labs[i].name, name)) {
             g_labs[i].dup = 1;
             return;
@@ -1696,14 +2560,19 @@ static void label_add(const char *name, long line)
     g_labs[g_nlab].name[MAXTOK - 1] = '\0';
     g_labs[g_nlab].line = line;
     g_labs[g_nlab].dup = 0;
+    g_labs[g_nlab].next = g_lab_hash[h];
+    g_lab_hash[h] = (int)g_nlab;
     g_nlab++;
 }
 
 static long label_find(const char *name, int *pdup)
 {
-    long i;
+    unsigned h;
+    int i;
     *pdup = 0;
-    for (i = 0; i < g_nlab; i++) {
+    if (!g_lab_hash_ready || g_nlab == 0) return -1;
+    h = lab_hash(name);
+    for (i = g_lab_hash[h]; i >= 0; i = g_labs[i].next) {
         if (ci_eq(g_labs[i].name, name)) {
             *pdup = g_labs[i].dup;
             return g_labs[i].line;
@@ -1853,13 +2722,18 @@ static void scan_indefs(void)
 
 /* ---- parsing -----------------------------------------------------------*/
 
-static int split_ops(char *rest, char *o0, char *o1, int *pmore)
+/* v2.20: extended to capture up to 3 operands (for imul R,S,K).
+ *  The first two go into o0/o1; the third into o2.  If there are
+ *  more than 3, *pmore = 1 and the return is 3. */
+static int split_ops(char *rest, char *o0, char *o1, char *o2,
+                     int *pmore)
 {
     int depth = 0, n = 0, sawcomma = 0;
-    int l0 = 0, l1 = 0;
+    int l0 = 0, l1 = 0, l2 = 0;
     char *w;
     o0[0] = '\0';
     o1[0] = '\0';
+    o2[0] = '\0';
     *pmore = 0;
     for (w = rest; *w != '\0'; w++) {
         char c = *w;
@@ -1868,25 +2742,30 @@ static int split_ops(char *rest, char *o0, char *o1, int *pmore)
         if (c == ',' && depth == 0) {
             sawcomma = 1;
             n++;
-            if (n > 1) { *pmore = 1; break; }
+            if (n > 2) { *pmore = 1; break; }
             continue;
         }
         if (n == 0) {
             if (l0 < MAXTOK - 1) o0[l0++] = c;
             else { *pmore = 1; break; }
-        } else {
+        } else if (n == 1) {
             if (l1 < MAXTOK - 1) o1[l1++] = c;
+            else { *pmore = 1; break; }
+        } else {
+            if (l2 < MAXTOK - 1) o2[l2++] = c;
             else { *pmore = 1; break; }
         }
     }
     o0[l0] = '\0';
     o1[l1] = '\0';
+    o2[l2] = '\0';
     trim(o0);
     trim(o1);
+    trim(o2);
     if (o0[0] == '\0') *pmore = 1;
     if (sawcomma && o1[0] == '\0') *pmore = 1;
     if (*pmore) return 3;
-    return (o1[0] != '\0') ? 2 : 1;
+    return (o2[0] != '\0') ? 3 : (o1[0] != '\0') ? 2 : 1;
 }
 
 static int shift_class(const char *m)
@@ -2020,6 +2899,57 @@ static int jcc_canon(const char *m)
     return -1;
 }
 
+/* ASMC / JWasm / UASM high-level control-flow directives.
+ *  These expand to labels+jcc/jmp sequences at assemble time.
+ *  SMARTPP must NEVER delete or rewrite them: removing one side of
+ *  a .if/.endif pair makes the assembler fail with
+ *  "directive must be in control block".  Recognized so P13 stops
+ *  at the barrier and so future passes can treat them as opaque
+ *  basic-block edges.  See:
+ *  https://github.com/nidud/asmc/blob/master/doc/directive/conditional-control-flow.md
+ */
+static int is_hll_directive(const char *m)
+{
+    static const char *h[] = {
+        ".if", ".endif", ".else", ".elseif",
+        ".while", ".endw", ".repeat", ".until", ".untilcxz",
+        ".for", ".endf", ".endfor",
+        ".switch", ".case", ".default", ".endsw", ".endc",
+        ".break", ".continue", ".gotosw",
+        ".assert", ".return",
+        /* flag/size variants are still the same leading token after
+         *  we strip only up to the first space; ASMC writes
+         *  ".if", ".ifs", ".ifb", ... as the first identifier. */
+        ".ifs", ".ifb", ".ifw", ".ifd", ".ifsd",
+        ".whiles", ".whileb", ".whilew", ".whiled",
+        ".untils", ".untilb", ".untilw", ".untild",
+        ".elseifs", ".elseifb", ".elseifw", ".elseifs",
+        NULL
+    };
+    int i;
+    if (m == NULL || m[0] != '.') return 0;
+    for (i = 0; h[i] != NULL; i++)
+        if (ci_eq(m, h[i])) return 1;
+    /* Prefix match: ".ifxxx" that starts with a known HLL stem */
+    if (ci_eq_n(m, ".if", 3) || ci_eq_n(m, ".while", 6) ||
+        ci_eq_n(m, ".until", 6) || ci_eq_n(m, ".for", 4) ||
+        ci_eq_n(m, ".switch", 7) || ci_eq_n(m, ".case", 5) ||
+        ci_eq_n(m, ".end", 4) || ci_eq_n(m, ".break", 6) ||
+        ci_eq_n(m, ".continue", 9) || ci_eq_n(m, ".return", 7) ||
+        ci_eq_n(m, ".repeat", 7) || ci_eq_n(m, ".assert", 7) ||
+        ci_eq_n(m, ".gotosw", 7) || ci_eq_n(m, ".default", 8))
+        return 1;
+    return 0;
+}
+
+/* .return always exits the procedure (ASMC expands to ret/retn).
+ *  Safe to treat like ret for unreachable-code deletion. */
+static int is_hll_return(const char *m)
+{
+    if (m == NULL) return 0;
+    return ci_eq(m, ".return") || ci_eq_n(m, ".return", 7);
+}
+
 /* is this a real instruction (safe to delete as unreachable code)?
 *  data definitions, directives, macro calls and anything unknown
 *  return 0 and stop the P13 scan */
@@ -2037,7 +2967,15 @@ static int is_known_instr(const char *m)
         "into", "loop", "loope", "loopz", "loopne", "loopnz",
         "jcxz", "jecxz", "cbw", "cwd", "clc", "stc", "cmc", "lahf",
         "sahf", "aaa", "aas", "aam", "aad", "daa", "das", "nop",
-        "movzx", "movsx",
+        "movzx", "movsx", "bswap", "shld", "shrd", "bt", "btc", "btr", "bts",
+        "seta", "setae", "setb", "setbe", "setc", "sete", "setg", "setge",
+        "setl", "setle", "setna", "setnae", "setnb", "setnbe", "setnc",
+        "setne", "setng", "setnge", "setnl", "setnle", "setno", "setnp",
+        "setns", "setnz", "seto", "setp", "setpe", "setpo", "sets", "setz",
+        "cmova", "cmovae", "cmovb", "cmovbe", "cmovc", "cmove", "cmovg",
+        "cmovl", "cmovle", "cmovne", "cmovs", "cmovz",
+        "movd", "movq", "movdqa", "movdqu", "movaps", "movups", "movss", "movsd",
+        "pxor", "por", "pand", "pandn", "emms", "sfence", "lfence", "mfence",
         "movs", "movsb", "movsw", "movsd", "stos", "stosb", "stosw",
         "stosd", "lods", "lodsb", "lodsw", "lodsd", "scas", "scasb",
         "scasw", "scasd", "cmps", "cmpsb", "cmpsw", "cmpsd", "ins",
@@ -2336,6 +3274,32 @@ static void emit_lea_scaled(char *out, int reg, int k)
     sprintf(out, "[%s+%s*%d]", g_regs[reg].name, g_regs[reg].name, k);
 }
 
+/* v2.21: emit a general SIB LEA operand [base + index*scale + disp].
+ *  Used by P412 (add+add→lea) and P413 (shl+add→lea scaled).
+ *  Intel syntax only.  scale must be 1, 2, 4, or 8. */
+static void emit_lea_sib(char *out, int base, int index, int scale, long disp)
+{
+    char num[32];
+    if (disp == 0 && scale == 1)
+        sprintf(out, "[%s+%s]", g_regs[base].name, g_regs[index].name);
+    else if (disp == 0)
+        sprintf(out, "[%s+%s*%d]", g_regs[base].name,
+                g_regs[index].name, scale);
+    else if (scale == 1) {
+        if (disp > 0) sprintf(num, "%ld", disp);
+        else sprintf(num, "%ld", -disp);
+        sprintf(out, "[%s+%s%s%s]", g_regs[base].name,
+                g_regs[index].name,
+                disp > 0 ? "+" : "-", num);
+    } else {
+        if (disp > 0) sprintf(num, "%ld", disp);
+        else sprintf(num, "%ld", -disp);
+        sprintf(out, "[%s+%s*%d%s%s]", g_regs[base].name,
+                g_regs[index].name, scale,
+                disp > 0 ? "+" : "-", num);
+    }
+}
+
 static void set_jtarget(struct pinfo *p, const char *op)
 {
     int i;
@@ -2415,6 +3379,18 @@ static void parse_line(long idx, struct pinfo *p)
     char mnem[MAXNAME];
     int more = 0;
 
+    /* v2.25 (S1): serve from the per-line pinfo cache when the
+     *  generation stamp matches g_pi_cur_gen (i.e., the entry was
+     *  cached during the current pass and hasn't been invalidated).
+     *  Cache hits memcpy ~1.6KB instead of re-tokenizing; for 4VIEW
+     *  (8240 lines × 3-5 parses/line/pass) this cuts ~30-40% off the
+     *  per-pass time on large inputs. */
+    if (g_pi_cache != NULL && idx >= 0 && idx < g_pi_cap &&
+        g_pi_gen[idx] == g_pi_cur_gen) {
+        *p = g_pi_cache[idx];   /* struct copy */
+        return;
+    }
+
     p->cls = I_UNK;
     p->haslabel = 0;
     p->hasinstr = 0;
@@ -2422,6 +3398,7 @@ static void parse_line(long idx, struct pinfo *p)
     p->nops = 0;
     p->op0[0] = '\0';
     p->op1[0] = '\0';
+    p->op2[0] = '\0';
     p->dreg = -1;
     p->sreg = -1;
     p->srcimm = 0;
@@ -2470,7 +3447,20 @@ static void parse_line(long idx, struct pinfo *p)
         memcpy(p->prefix, g_scratch, (size_t)pl);
         p->prefix[pl] = '\0';
     }
-    if (*s == '.') {                     /* directive */
+    if (*s == '.') {                     /* assembler directive / HLL */
+        /* Capture ".if", ".return", ".while", ... so P13 and barriers
+         *  can recognize ASMC/JWasm/UASM high-level control-flow
+         *  directives without treating them as deletable code. */
+        {
+            char *q = s;
+            int l = 0;
+            while (*q != '\0' && *q != ' ' && *q != '\t' &&
+                   *q != ';' && *q != '\r' && *q != '\n' &&
+                   l < MAXNAME - 1)
+                mnem[l++] = *q++;
+            mnem[l] = '\0';
+            strcpy(p->mnem, mnem);
+        }
         p->cls = I_OTHER;
         p->hasinstr = 1;
         return;
@@ -2493,7 +3483,8 @@ static void parse_line(long idx, struct pinfo *p)
     }
     p->hasinstr = 1;
     rest = skip_ws(rest);
-    if (*rest != '\0') p->nops = split_ops(rest, p->op0, p->op1, &more);
+    p->op2[0] = '\0';            /* v2.20: clear third operand */
+    if (*rest != '\0') p->nops = split_ops(rest, p->op0, p->op1, p->op2, &more);
     if (g_att) att_fix(mnem, p);
     strcpy(p->mnem, mnem);       /* every rule needs the mnemonic */
 
@@ -2611,6 +3602,13 @@ static void parse_line(long idx, struct pinfo *p)
             p->sreg = find_reg(p->op1);
         }
     }
+    /* v2.25 (S1): write the parsed pinfo back to the per-line cache
+     *  with the current generation stamp, so the next parse_line(idx,
+     *  ...) on this line in the same pass is a memcpy hit. */
+    if (g_pi_cache != NULL && idx >= 0 && idx < g_pi_cap && !p->toobig) {
+        g_pi_cache[idx] = *p;   /* struct copy */
+        g_pi_gen[idx] = g_pi_cur_gen;
+    }
 }
 
 /* ---- pass helpers --------------------------------------------------------*/
@@ -2629,14 +3627,43 @@ static long width_imm_limit(int w)
     return 0x7FFFFFFFL;                 /* signed imm32 */
 }
 
-/* next line with content (skips deleted, blank and comment-only lines) */
+/* v2.26 (5.3): width-to-bitmask helper, replacing the duplicated
+ *  ternary `(w == 8) ? 0xFFUL : (w == 16) ? 0xFFFFUL : ...` that
+ *  appeared in P52-P55, P40, P43-P45, P56, P62/P62b, P8, P344 and
+ *  the P430 check.  Returns ~0UL for w >= 64 (the mask is a no-op
+ *  there since the C `unsigned long` is the natural width).
+ *  v2.26 update: now used by p430_or_and_or_check; the remaining
+ *  duplicated ternaries in the C rules (P52/P62/P8) are left as-is
+ *  for now -- they're in well-tested code and the refactor risk
+ *  outweighs the cosmetic benefit.  Future C-to-table migrations
+ *  that need the mask can call this helper. */
+static unsigned long width_mask(int w)
+{
+    if (w == 8)  return 0xFFUL;
+    if (w == 16) return 0xFFFFUL;
+    if (w == 32) return 0xFFFFFFFFUL;
+    return ~0UL;   /* 64-bit or unknown: no truncation needed */
+}
+
+/* next line with content (skips deleted, blank and comment-only lines).
+ *  v2.25 (S4): uses a local pinfo instead of writing to the global
+ *  g_pnext.  The old side effect was never relied upon by any caller
+ *  (every caller either ignores the parsed line or re-parses into its
+ *  own pinfo slot), but it caused a subtle bug class: flags_clear and
+ *  reg_dead_cf, which are called from pre_check, walk forward via
+ *  next_code and silently clobbered g_pnext.  try_table_rules uses
+ *  g_pnext to hold the 3rd instruction of a 3-op pattern; if pre_check
+ *  ran before check(), the 3rd instruction was lost.  P430 worked
+ *  around this by carrying pre=0; the fix here removes the workaround
+ *  requirement. */
 static long next_code(long i)
 {
     long j;
+    struct pinfo local;
     for (j = i + 1; j < g_nlines; j++) {
         if (DEL(j)) continue;
-        parse_line(j, &g_pnext);
-        if (g_pnext.haslabel || g_pnext.hasinstr) return j;
+        parse_line(j, &local);
+        if (local.haslabel || local.hasinstr) return j;
     }
     return -1;
 }
@@ -2682,6 +3709,34 @@ static void replace_line(long idx, const char *newtext)
     free(L(idx));
     L(idx) = xstrdup(newtext);
     TERM(idx) = (unsigned char)term;
+    /* v2.25 (S1): line text changed; drop the cached pinfo. */
+    pi_cache_invalidate(idx);
+}
+
+/* v2.25: insert a new line immediately AFTER idx, shifting the rest. */
+static void insert_line_after(long idx, const char *text)
+{
+    long i;
+    unsigned char term;
+    /* v2.25 (S1): insertion shifts every line after idx, so every
+     *  cached pinfo from idx+1 onward now describes the wrong line.
+     *  Wholesale invalidate; insert_line_after is rare (only P380/
+     *  P50/P51 fire it) so the cost is negligible. */
+    pi_cache_invalidate_all();
+    term = (unsigned char)((idx >= 0 && idx < g_nlines) ? TERM(idx) : 0);
+    if (idx < 0) idx = -1;
+    chunk_reserve(g_nlines);
+    for (i = g_nlines; i > idx + 1; i--) {
+        L(i) = L(i - 1);
+        TERM(i) = TERM(i - 1);
+        DEL(i) = DEL(i - 1);
+        INDEF(i) = INDEF(i - 1);
+    }
+    L(idx + 1) = xstrdup(text);
+    TERM(idx + 1) = term;
+    DEL(idx + 1) = 0;
+    INDEF(idx + 1) = 0;
+    g_nlines++;
 }
 
 /* v1.81: delete the instruction on line idx while preserving any
@@ -2707,13 +3762,17 @@ static void delete_keep_label(long idx, struct pinfo *pi)
         n = (int)strlen(g_build);
         while (n > 0 && (g_build[n-1] == ' ' || g_build[n-1] == '\t')) n--;
         g_build[n] = '\0';
-        if (pi->comment[0] != '\0') {
+        if (pi->comment[0] != 0) {
             strcat(g_build, " ");
             strcat(g_build, pi->comment);
         }
-        replace_line(idx, g_build);
+        replace_line(idx, g_build);   /* replace_line invalidates the cache */
     } else {
         DEL(idx) = 1;
+        /* v2.25 (S1): drop the cached pinfo; the line is now deleted
+         *  and won't be re-parsed in this pass (next_code skips DEL
+         *  lines), but invalidate anyway for tidiness. */
+        pi_cache_invalidate(idx);
     }
 }
 
@@ -2825,7 +3884,7 @@ static void rewrite_shift(long idx, struct pinfo *pi, long total)
         sprintf(num, "%ld", total);
         strcat(g_build, num);
     }
-    if (pi->comment[0] != '\0') {
+    if (pi->comment[0] != 0) {
         strcat(g_build, " ");
         strcat(g_build, pi->comment);
     }
@@ -2838,7 +3897,7 @@ static void retarget_line(long idx, struct pinfo *pi, const char *newt)
     strcat(g_build, pi->mnem);
     strcat(g_build, " ");
     strcat(g_build, newt);
-    if (pi->comment[0] != '\0') {
+    if (pi->comment[0] != 0) {
         strcat(g_build, " ");
         strcat(g_build, pi->comment);
     }
@@ -3087,33 +4146,61 @@ static int cpu_directive_value(const char *s)
      *  v1.87 BUGFIX: all directive matches now require the directive
      *  be standalone (see directive_is_standalone) so ".NO87 equ 1"
      *  no longer disables FPU rules. */
-    static const char *names[] = {
-        ".8086", ".186", ".286", ".386", ".486", ".586", ".686",
-        ".x64", ".x64p", NULL
+    /* v2.14: the directive table now also accepts the TASM
+     *  Ideal-mode processor directives (P8086 .. P686, with their
+     *  N/P/C suffixes: N = normal, P = privileged, C = core -- all
+     *  three map to the same integer level here) next to the MASM
+     *  dot forms, and the FPU directives of both families
+     *  (.8087/.287/.387/.487/.587 and P8087/P287/P387/P487/P587
+     *  enable the FPU; .NO87/PNO87 disable it).  The FPU level is
+     *  orthogonal to the integer CPU level (you can have an 80386
+     *  with no FPU, or a 486 whose FPU is enabled by default), so
+     *  it only flips g_nofpu and never changes g_curcpu.
+     *  v1.87 BUGFIX (still applies): all directive matches require
+     *  the directive be standalone (see directive_is_standalone) so
+     *  ".NO87 equ 1" no longer disables FPU rules, "P286 equ 2" no
+     *  longer changes the CPU level, and a label like "P286:" is
+     *  never mistaken for a directive. */
+    static const struct cpudir {
+        const char *name;
+        int         val;    /* integer CPU level; 0 = FPU-only directive */
+        int         fpu;    /* 0 = n/a, 1 = enable FPU, -1 = disable FPU */
+    } dirs[] = {
+        { ".8086", 1, 0 },  { "p8086", 1, 0 },
+        { ".186",  2, 0 },  { "p186",  2, 0 },
+        { ".286",  4, 0 },  { "p286",  4, 0 },
+        { ".286n", 4, 0 },  { "p286n", 4, 0 },
+        { ".286c", 4, 0 },  { ".286p", 4, 0 },  { "p286p", 4, 0 },
+        { ".386",  8, 0 },  { "p386",  8, 0 },
+        { ".386c", 8, 0 },  { ".386p", 8, 0 },  { "p386n", 8, 0 },  { "p386p", 8, 0 },
+        { ".486", 16, 0 },  { "p486", 16, 0 },
+        { ".486c",16, 0 },  { ".486p",16, 0 },  { "p486n",16, 0 },  { "p486p",16, 0 },
+        { ".586", 32, 0 },  { "p586", 32, 0 },
+        { ".586c",32, 0 },  { ".586p",32, 0 },  { "p586n",32, 0 },  { "p586p",32, 0 },
+        { ".686", 64, 0 },  { "p686", 64, 0 },
+        { ".686c",64, 0 },  { ".686p",64, 0 },  { "p686n",64, 0 },  { "p686p",64, 0 },
+        { ".x64",128, 0 },  { ".x64p",128, 0 },
+        /* FPU coprocessor directives: enable floating point */
+        { ".8087", 0, 1 },  { "p8087", 0, 1 },
+        { ".287",  0, 1 },  { "p287",  0, 1 },
+        { ".387",  0, 1 },  { "p387",  0, 1 },
+        { ".487",  0, 1 },  { "p487",  0, 1 },   /* 486 with integrated FPU */
+        { ".587",  0, 1 },  { "p587",  0, 1 },   /* 586 FPU */
+        /* FPU disable */
+        { ".no87", 0, -1 }, { "pno87", 0, -1 }
     };
-    static int vals[] = { 1, 2, 4, 8, 16, 32, 64, 128, 128 };
     int i;
     while (*s == ' ' || *s == '\t') s++;
-    if (*s != '.') return 0;
-    for (i = 0; names[i] != NULL; i++) {
-        size_t l = strlen(names[i]);
-        if (ci_eq_n(s, names[i], (long)l) &&
-            directive_is_standalone(s, l)) return vals[i];
+    for (i = 0; i < (int)(sizeof(dirs) / sizeof(dirs[0])); i++) {
+        size_t l = strlen(dirs[i].name);
+        if (ci_eq_n(s, dirs[i].name, (long)l) &&
+            directive_is_standalone(s, l)) {
+            if (dirs[i].fpu > 0) g_nofpu = 0;
+            else if (dirs[i].fpu < 0) g_nofpu = 1;
+            return dirs[i].val;
+        }
     }
-    /* v1.87: FPU directives.  .NO87 disables floating-point; the
-     *  others (.8087/.287/.387) just enable it -- the FPU level is
-     *  tracked separately and we don't differentiate the FPU model.
-     *  These DO NOT change g_curcpu; they only flip g_nofpu. */
-    if (ci_eq_n(s, ".no87", 5) && directive_is_standalone(s, 5)) {
-        g_nofpu = 1;
-        return 0;       /* not a CPU level */
-    }
-    if ((ci_eq_n(s, ".8087", 5) && directive_is_standalone(s, 5)) ||
-        (ci_eq_n(s, ".287",  4) && directive_is_standalone(s, 4)) ||
-        (ci_eq_n(s, ".387",  4) && directive_is_standalone(s, 4))) {
-        g_nofpu = 0;
-        return 0;       /* not a CPU level */
-    }
+    /* (v2.14: the FPU directives are handled by the table above.) */
     /* .MMX/.XMM/.K3D: SIMD level -- recognized for the source parser's
      *  benefit; they imply a 586+ integer CPU and set no special flag.
      *  We map them to the highest integer level the SIMD extension is
@@ -3221,9 +4308,20 @@ static int flag_sets(struct pinfo *p, int *rd, int *wr, int *div)
     if (ci_eq(m, "daa") || ci_eq(m, "das") || ci_eq(m, "aaa") ||
         ci_eq(m, "aas")) { *rd = F_CF | F_AF; return 0; }
     if (ci_eq(m, "into")) { *rd = F_OF; *div = 1; return 0; }
-    if (ci_eq(m, "call") || ci_eq(m, "ret") || ci_eq(m, "retf") ||
-        ci_eq(m, "iret") || ci_eq(m, "int") || ci_eq(m, "int3") ||
-        ci_eq(m, "loop") || ci_eq(m, "jcxz") || ci_eq(m, "jecxz")) {
+    /* v1.89: ret/retf make arithmetic flags unobservable to the
+     *  caller (x86 ABIs do not preserve them across returns).  Mark
+     *  them as writing all six so flags_clear can settle paths that
+     *  end in a return.  iret restores flags from the stack and is
+     *  left as pure divergence.  call is divergence: the callee may
+     *  read flags (rare) and we stay conservative. */
+    if (ci_eq(m, "ret") || ci_eq(m, "retf")) {
+        *wr = F_ALL6;
+        *div = 1;
+        return 0;
+    }
+    if (ci_eq(m, "call") || ci_eq(m, "iret") || ci_eq(m, "int") ||
+        ci_eq(m, "int3") || ci_eq(m, "loop") || ci_eq(m, "jcxz") ||
+        ci_eq(m, "jecxz")) {
         *div = 1;
         return 0;
     }
@@ -3278,21 +4376,109 @@ static int flag_sets(struct pinfo *p, int *rd, int *wr, int *div)
     return -1;                             /* unknown: abort the scan */
 }
 
-/* can the differing flag set d be destroyed on EVERY path that leaves
-*  line start, before any read of a still-differing flag?  Follows
-*  both arms of conditional jumps.  Conservative on loops, merges,
-*  divergence, opaque instructions and end of file: 0 = cannot prove. */
-static int flags_clear(long start, int d)
+/* v2.25 (S5): unified forward-walker for the two conservative dataflow
+ *  predicates the table engine needs: "are these flags dead on every
+ *  path" (flags_clear) and "is this register dead on every path"
+ *  (reg_dead_cf).  Both used to carry their own ~70-line copy of the
+ *  worklist + visited-set + jcc-follow boilerplate; the per-inst
+ *  decision differed but the loop body was nearly identical.
+ *
+ *  The shared walker is walk_forward(start, cd, &state).  cd is the
+ *  per-path "still needs settling" state (a flag bitmask for
+ *  flags_clear, the constant 1 for reg_dead_cf -- 0 always means
+ *  "settled").  state carries the kind and the target (flag mask or
+ *  reg/fam).  For each visited instruction walk_classify() decides
+ *  one of:
+ *    WALK_SETTLED   cd becomes 0 on this path; pop next
+ *    WALK_BLOCK     target is read; return 0 from the whole walker
+ *    WALK_CONTINUE  descend to next_code(i)
+ *    WALK_JCC       jcc; descend both next_code(i) and the taken arm
+ *    WALK_ABORT     divergent / unknown; return 0
+ *  For CONTINUE/JCC, walk_classify writes the new cd into *new_cd.
+ *
+ *  The walker is SOUND: every WALK_SETTLED is a provable kill, every
+ *  WALK_BLOCK a provable read, every WALK_ABORT a conservative
+ *  refusal to follow.  Mirrors the discipline the original
+ *  flags_clear / reg_dead_cf already carried. */
+enum walk_kind { WALK_FLAGS, WALK_REG };
+enum walk_verdict {
+    WALK_SETTLED = 0, WALK_BLOCK = 1, WALK_CONTINUE = 2,
+    WALK_JCC = 3,      WALK_ABORT = 4
+};
+struct walk_state {
+    enum walk_kind kind;
+    int target_mask;   /* WALK_FLAGS: the flag mask needing kill */
+    int fam;            /* WALK_REG: target family */
+    int reg;            /* WALK_REG: target register index */
+};
+
+static int walk_classify(struct walk_state *st, struct pinfo *p,
+                         int cd, int *new_cd)
+{
+    int rd, wr, div;
+    if (flag_sets(p, &rd, &wr, &div) != 0) return WALK_ABORT;
+    if (st->kind == WALK_FLAGS) {
+        if (rd & cd) return WALK_BLOCK;        /* a differing flag is read */
+        *new_cd = cd & ~wr;
+        if (*new_cd == 0) return WALK_SETTLED;
+        if (div) return WALK_ABORT;            /* path leaves; cannot follow */
+        if (p->cls == I_JCC) return WALK_JCC;
+        return WALK_CONTINUE;
+    }
+    else { /* WALK_REG */
+        int dk, op0_is_rw, op0_reads_r, killed, reads;
+        if (div) {
+            /* ret/retf: only AX/DX families may carry a return value.
+             *  Other GPRs die at the call boundary.  Unlocks mov/push
+             *  and xor/push folds immediately before ret. */
+            if (ci_eq(p->mnem, "ret") || ci_eq(p->mnem, "retf") ||
+                ci_eq(p->mnem, "retn")) {
+                if (st->fam == 0 || st->fam == 2) return WALK_BLOCK;
+                *new_cd = 0;                   /* settled: r dies at return */
+                return WALK_SETTLED;
+            }
+            return WALK_ABORT;                 /* jmp / other divergent */
+        }
+        dk = find_reg(p->op0);
+        op0_is_rw = (p->cls == I_OTHER) &&
+            (ci_eq(p->mnem, "add") || ci_eq(p->mnem, "sub") ||
+             ci_eq(p->mnem, "adc") || ci_eq(p->mnem, "sbb") ||
+             ci_eq(p->mnem, "and") || ci_eq(p->mnem, "or") ||
+             ci_eq(p->mnem, "xor") || ci_eq(p->mnem, "cmp") ||
+             ci_eq(p->mnem, "test"));
+        op0_reads_r = (dk >= 0 && g_regs[dk].fam == st->fam) &&
+                      (op0_is_rw || p->cls == I_SHIFT ||
+                       p->cls == I_XCHG || p->cls == I_XORRR);
+        if (p->cls == I_XORRR) op0_reads_r = 0;
+        killed = (dk >= 0 && covers(dk, st->reg) && !op0_reads_r &&
+                  !expr_uses_family(p->op1, st->fam));
+        if (killed) { *new_cd = 0; return WALK_SETTLED; }
+        reads = !killed &&
+                ((dk >= 0 && g_regs[dk].fam == st->fam) ||
+                 expr_uses_family(p->op1, st->fam));
+        if (p->cls == I_PUSH || p->cls == I_PUSHF ||
+            p->cls == I_PUSHA) {
+            if (expr_uses_family(p->op0, st->fam)) reads = 1;
+        }
+        if (reads) return WALK_BLOCK;
+        *new_cd = cd;                          /* unchanged; still needs kill */
+        if (p->cls == I_JCC) return WALK_JCC;
+        if (p->cls == I_JMP) return WALK_ABORT;
+        return WALK_CONTINUE;
+    }
+}
+
+static int walk_forward(long start, int cd_init, struct walk_state *st)
 {
     int n = 0, nvis = 0;
-    if (d == 0) return 1;
+    if (cd_init == 0) return 1;
     if (start < 0) return 0;
     g_scanwl[n] = start;
-    g_scand[n] = d;
+    g_scand[n] = cd_init;
     n++;
     while (n > 0) {
         long i;
-        int cd, rd, wr, div, vi, seen;
+        int cd, vi, seen, new_cd, verdict;
         struct pinfo *p = &g_pscan;
         n--;
         i = g_scanwl[n];
@@ -3302,11 +4488,11 @@ static int flags_clear(long start, int d)
         for (vi = 0; vi < nvis; vi++) {
             if (g_scanvis[vi] == i) {
                 if (g_scanvcd[vi] == cd) { seen = 1; break; }
-                return 0;                  /* merge, different flags */
+                return 0;                  /* merge with a different verdict */
             }
         }
-        if (seen) continue;                /* already explored */
-        if (nvis >= SCAN_MAX) return 0;    /* budget exhausted */
+        if (seen) continue;
+        if (nvis >= SCAN_MAX) return 0;
         g_scanvis[nvis] = i;
         g_scanvcd[nvis] = cd;
         nvis++;
@@ -3320,12 +4506,18 @@ static int flags_clear(long start, int d)
             n++;
             continue;
         }
-        if (flag_sets(p, &rd, &wr, &div) != 0) return 0;
-        if (rd & cd) return 0;             /* a differing flag is read */
-        cd &= ~wr;
-        if (cd == 0) continue;             /* this path is settled */
-        if (div) return 0;                 /* path leaves; cannot follow */
-        if (p->cls == I_JCC) {             /* follow both arms */
+        verdict = walk_classify(st, p, cd, &new_cd);
+        if (verdict == WALK_BLOCK) return 0;
+        if (verdict == WALK_ABORT) return 0;
+        if (verdict == WALK_SETTLED) continue;
+        if (verdict == WALK_CONTINUE) {
+            if (n + 1 > SCAN_MAX) return 0;
+            g_scanwl[n] = next_code(i);
+            g_scand[n] = new_cd;
+            n++;
+            continue;
+        }
+        if (verdict == WALK_JCC) {
             long t = -1;
             if (p->jtarget_ok) {
                 int dup = 0;
@@ -3338,19 +4530,26 @@ static int flags_clear(long start, int d)
             if (t < 0) return 0;           /* unknown target */
             if (n + 2 > SCAN_MAX) return 0;
             g_scanwl[n] = next_code(i);
-            g_scand[n] = cd;
+            g_scand[n] = new_cd;
             n++;
             g_scanwl[n] = t;
-            g_scand[n] = cd;
+            g_scand[n] = new_cd;
             n++;
             continue;
         }
-        if (n + 1 > SCAN_MAX) return 0;
-        g_scanwl[n] = next_code(i);
-        g_scand[n] = cd;
-        n++;
     }
     return 1;
+}
+
+/* v2.25 (S5): flags_clear is now a thin wrapper around walk_forward. */
+static int flags_clear(long start, int d)
+{
+    struct walk_state st;
+    st.kind = WALK_FLAGS;
+    st.target_mask = d;
+    st.fam = -1;
+    st.reg = -1;
+    return walk_forward(start, d, &st);
 }
 
 /* v1.82: walk forward from line `start` (exclusive) and decide
@@ -3360,56 +4559,11 @@ static int flags_clear(long start, int d)
 *    1 = r is provably dead (a clean kill is reached first)
 *    0 = r is read before being killed (or scan hit something
 *        opaque / control flow / end of file)
-*  Used by P68 (xchg R,S -> mov when one operand is dead) and P70
-*  (lea R,[S+off1] / lea D,[R+off2] -> lea D,[S+off1+off2] when R
-*  is dead).  The discipline mirrors P2's dead-store test (writer_ok)
-*  but does not require the kill to be the *immediate* next line:
-*  intervening no-op instructions and labels are skipped. */
-static int reg_dead_after(long start, int r)
-{
-    long k;
-    int fam = g_regs[r].fam;
-    if (r < 0) return 0;
-    for (k = start + 1; k < g_nlines; k++) {
-        struct pinfo *pk = &g_pscan;
-        int dk, op0_is_rw, op0_reads_r, killed, reads;
-        int rd, wr, div;
-        if (DEL(k)) continue;
-        parse_line(k, pk);
-        if (pk->toobig) return 0;
-        if (!pk->hasinstr) continue;          /* label-only line */
-        if (flag_sets(pk, &rd, &wr, &div) != 0) return 0;
-        if (div) return 0;                    /* control divergence */
-        if (pk->cls == I_JCC || pk->cls == I_JMP) return 0;
-        dk = find_reg(pk->op0);
-        /* Pure destinations: mov, lea, movzx, pop write op0 only.
-         *  Two-operand read+write: add/sub/and/or/xor/adc/sbb/cmp/
-         *  test read op0 as well.  xor R,R (I_XORRR) writes 0 and
-         *  ignores the old value, so it is a kill, not a read. */
-        op0_is_rw = (pk->cls == I_OTHER) &&
-            (ci_eq(pk->mnem, "add") || ci_eq(pk->mnem, "sub") ||
-             ci_eq(pk->mnem, "adc") || ci_eq(pk->mnem, "sbb") ||
-             ci_eq(pk->mnem, "and") || ci_eq(pk->mnem, "or") ||
-             ci_eq(pk->mnem, "xor") || ci_eq(pk->mnem, "cmp") ||
-             ci_eq(pk->mnem, "test"));
-        op0_reads_r = (dk >= 0 && g_regs[dk].fam == fam) &&
-                      (op0_is_rw || pk->cls == I_SHIFT ||
-                       pk->cls == I_XCHG || pk->cls == I_XORRR);
-        if (pk->cls == I_XORRR) op0_reads_r = 0;
-        killed = (dk >= 0 && covers(dk, r) && !op0_reads_r &&
-                  !expr_uses_family(pk->op1, fam));
-        if (killed) return 1;
-        reads = !killed &&
-                ((dk >= 0 && g_regs[dk].fam == fam) ||
-                 expr_uses_family(pk->op1, fam));
-        if (pk->cls == I_PUSH || pk->cls == I_PUSHF ||
-            pk->cls == I_PUSHA) {
-            if (expr_uses_family(pk->op0, fam)) reads = 1;
-        }
-        if (reads) return 0;
-    }
-    return 0;
-}
+*  v2.14: the old linear reg_dead_after() was removed.  All callers
+ *  use reg_dead_cf() (control-flow aware), which is a strict
+ *  superset: every 1 from the linear scan is also a 1 from cf, and
+ *  cf can prove more cases through simple forward branches.
+ */
 
 /* v1.84: control-flow-aware dead-register scan, the analog of
  *  flags_clear() for register liveness.  Walks forward from `start+1`
@@ -3417,18 +4571,6 @@ static int reg_dead_after(long start, int r)
  *  conditional jump, just like flags_clear), and asks: on EVERY path,
  *  does a clean kill of `r` arrive before any read of `r`?  Returns 1
  *  when that holds on every path, 0 when it cannot be proved.
- *
- *  Why this is needed: reg_dead_after() is purely linear -- it bails
- *  on the first conditional jump.  That is correct but conservative;
- *  it forecloses whole classes of safe rewrites.  Example:
- *
- *      mov  cx, 5      ; cx is the destination of a constant
- *      cmp  cx, 5      ; P85 wants to fold this to "cmp 5, 5" and
- *                      ; then to "mov ZF, 1" -- but only if cx is
- *                      ; provably dead afterwards.  cx may be killed
- *                      ; on either side of an upcoming conditional
- *                      ; branch; reg_dead_cf follows both arms and
- *                      ; can still prove cx dead.
  *
  *  Safety discipline (mirrors flags_clear exactly):
  *   - backward conditional jump (target <= i) -> loop, conservatively
@@ -3447,97 +4589,14 @@ static int reg_dead_after(long start, int r)
  *  that consume this helper (P85-P87) treat 0 as "do not fire". */
 static int reg_dead_cf(long start, int r)
 {
-    int n = 0, nvis = 0;
-    int fam;
+    struct walk_state st;
     if (r < 0) return 0;
-    fam = g_regs[r].fam;
     if (start < 0) return 0;
-    g_scanwl[n] = start;
-    g_scand[n]  = 1;            /* 1 = "r still needs killing on this path" */
-    n++;
-    while (n > 0) {
-        long i;
-        int vi, seen, rd, wr, div;
-        int dk, op0_is_rw, op0_reads_r, killed, reads;
-        struct pinfo *p = &g_pscan;
-        n--;
-        i = g_scanwl[n];
-        if (i < 0) return 0;                       /* fell off the end */
-        seen = 0;
-        for (vi = 0; vi < nvis; vi++) {
-            if (g_scanvis[vi] == i) {
-                if (g_scanvcd[vi] == 1) { seen = 1; break; }
-                return 0;                          /* path converged with a different verdict */
-            }
-        }
-        if (seen) continue;
-        if (nvis >= SCAN_MAX) return 0;
-        g_scanvis[nvis] = i;
-        g_scanvcd[nvis] = 1;
-        nvis++;
-        if (INDEF(i)) return 0;
-        parse_line(i, p);
-        if (p->toobig) return 0;
-        if (!p->hasinstr) {                        /* label-only line */
-            if (n + 1 > SCAN_MAX) return 0;
-            g_scanwl[n] = next_code(i);
-            g_scand[n]  = 1;
-            n++;
-            continue;
-        }
-        if (flag_sets(p, &rd, &wr, &div) != 0) return 0;
-        if (div) return 0;                         /* control leaves the function */
-        /* classify this instruction w.r.t. r */
-        dk = find_reg(p->op0);
-        op0_is_rw = (p->cls == I_OTHER) &&
-            (ci_eq(p->mnem, "add") || ci_eq(p->mnem, "sub") ||
-             ci_eq(p->mnem, "adc") || ci_eq(p->mnem, "sbb") ||
-             ci_eq(p->mnem, "and") || ci_eq(p->mnem, "or") ||
-             ci_eq(p->mnem, "xor") || ci_eq(p->mnem, "cmp") ||
-             ci_eq(p->mnem, "test"));
-        op0_reads_r = (dk >= 0 && g_regs[dk].fam == fam) &&
-                      (op0_is_rw || p->cls == I_SHIFT ||
-                       p->cls == I_XCHG || p->cls == I_XORRR);
-        if (p->cls == I_XORRR) op0_reads_r = 0;
-        killed = (dk >= 0 && covers(dk, r) && !op0_reads_r &&
-                  !expr_uses_family(p->op1, fam));
-        if (killed) continue;                      /* path settled: r is killed here */
-        reads = !killed &&
-                ((dk >= 0 && g_regs[dk].fam == fam) ||
-                 expr_uses_family(p->op1, fam));
-        if (p->cls == I_PUSH || p->cls == I_PUSHF ||
-            p->cls == I_PUSHA) {
-            if (expr_uses_family(p->op0, fam)) reads = 1;
-        }
-        if (reads) return 0;                       /* r read before any kill */
-        /* r is not (yet) read on this path; descend to the successor(s) */
-        if (p->cls == I_JCC) {                     /* follow both arms */
-            long t = -1;
-            if (p->jtarget_ok) {
-                int dup = 0;
-                long dd = label_find(p->jtarget, &dup);
-                if (dd >= 0 && !dup) {
-                    t = instr_after_label(dd);
-                    if (t <= i) return 0;           /* backward jump: loop */
-                }
-            }
-            if (t < 0) return 0;                   /* unknown target */
-            if (n + 2 > SCAN_MAX) return 0;
-            g_scanwl[n] = next_code(i);
-            g_scand[n]  = 1;
-            n++;
-            g_scanwl[n] = t;
-            g_scand[n]  = 1;
-            n++;
-            continue;
-        }
-        if (p->cls == I_JMP) return 0;             /* unconditional exit; cannot follow */
-        if (n + 1 > SCAN_MAX) return 0;
-        g_scanwl[n] = next_code(i);
-        g_scand[n]  = 1;
-        n++;
-    }
-    return 1;
+    st.kind = WALK_REG;
+    st.target_mask = 1;
+    st.fam = g_regs[r].fam;
+    st.reg = r;
+    return walk_forward(start, 1, &st);
 }
 
 /* ===========================================================================
@@ -3632,7 +4691,33 @@ static int reg_dead_cf(long start, int r)
 struct capent {
     int fam;        /* 0..7 family, or -1 if not a register */
     int width;      /* 8, 16, 32 -- 0 if not a register */
+    int lo;         /* bit offset within the family (0 for low byte,
+                     * 8 for AH/CH/DH/BH).  v2.17: needed so
+                     *  cap_regname returns AH (not AL) when the
+                     *  capture bound a high-byte register -- the old
+                     *  code only stored fam+width and matched lo==0,
+                     *  so "or ah,ah" was rewritten to "test al,al"
+                     *  (wrong register, a miscompilation). */
 };
+
+/* v2.25 (S6): resolve a capent back to its g_regs[] index.  Returns
+ *  -1 when the capent is unbound or describes a (fam, width, lo)
+ *  triple that no concrete register has (e.g. fam 4 / width 8 / lo 0
+ *  -- SP has no byte form, so cap_to_regidx refuses it).  Lets the
+ *  unified reg_relation() predicate be used from capent-based call
+ *  sites (check functions, OP_SAME_FAMILY matcher) without each
+ *  caller re-deriving the lookup. */
+static int cap_to_regidx(const struct capent *c)
+{
+    int r;
+    if (c == NULL || c->fam < 0 || c->width <= 0) return -1;
+    for (r = 0; g_regs[r].name != NULL; r++) {
+        if (g_regs[r].fam == c->fam &&
+            (g_regs[r].hi - g_regs[r].lo) == c->width &&
+            g_regs[r].lo == c->lo) return r;
+    }
+    return -1;
+}
 
 #define NCAP 26
 
@@ -3640,11 +4725,32 @@ struct capent {
 enum {
     OP_ANY = 0,    /* "_" -- always matches */
     OP_REG,        /* register of a class; bind a capture */
-    OP_SAME,       /* must equal a previous capture */
+    OP_SAME,       /* must equal a previous capture (family+width) */
     OP_IMM,        /* parses as an immediate */
     OP_MEM,        /* memory expression (not a register) */
     OP_REGCLASS,   /* register of a class, no capture */
-    OP_IMMVAL      /* immediate equal to a specific value (imm_val field) */
+    OP_IMMVAL,     /* immediate equal to a specific value (imm_val field) */
+    OP_DIFF,       /* v1.91: register, different family from same_cap */
+    OP_IMM_POW2,   /* v1.91: immediate is 2^k with k>=1; imm_val ignored */
+    /* v2.25 (M8): same-family relation kinds.  Each uses `same_cap`
+     *  to name the capture to compare against; the relation is the
+     *  enum reg_rel value listed.  These let the table express
+     *  constraints the original OP_SAME (strict fam+width+lo
+     *  equality) cannot, without a custom check function.
+     *    OP_SAME_FAM       -- REL_SAME_FAM      (any width, any lo)
+     *    OP_SAME_WIDTH     -- REL_SAME_WIDTH    (same width, any lo;
+     *                                            e.g. AL vs AH)
+     *    OP_COMPLEMENT_LO  -- REL_COMPLEMENT_LO (same fam+width, los
+     *                                            sum to width; AL+AH=AX) */
+    OP_SAME_FAM,
+    OP_SAME_WIDTH,
+    OP_COMPLEMENT_LO,
+    /* v2.25 (M5): immediate in a closed range [imm_val, imm_hi].
+     *  Both bounds are signed longs and inclusive.  Lets table rules
+     *  express "shift count 1..31", "imm8 in [-128, 127]", etc.
+     *  without a custom check function.  imm_val is the low bound,
+     *  imm_hi the high bound. */
+    OP_IMM_RANGE
 };
 
 /* register class selectors */
@@ -3670,14 +4776,30 @@ struct op_pat {
     int   rclass;        /* RC_ANY / RC_8 / RC_16 / RC_32 */
     char  cap;           /* capture name (0 if none) */
     char  same_cap;      /* for OP_SAME: which capture to compare to */
-    long  imm_val;       /* for OP_IMMVAL: the required value (compared as signed long) */
+    long  imm_val;       /* for OP_IMMVAL: the required value (compared as signed long);
+                          *  for OP_IMM_RANGE: the low end of the range (inclusive). */
     int   imm_has;       /* 1 if imm_val is meaningful (set by IV() macro) */
+    long  imm_hi;        /* v2.25 (M5): for OP_IMM_RANGE: the high end
+                          *  of the range (inclusive).  Unused for other
+                          *  kinds; zero-initialized by the positional
+                          *  macros below. */
 };
 
 /* precondition bits */
 #define PRE_FLAGS_DEAD_ALL    0x0001u
 #define PRE_FLAGS_DEAD_CF     0x0002u
 #define PRE_FLAGS_DEAD_AF     0x0004u
+/* v2.25 (M1): single-flag dead preconditions, parallel to CF/AF.
+ *  Let table rules express "only SF must be dead" (e.g. movzx+test
+ *  where SF differs but ZF/PF/CF/OF all match) without resorting
+ *  to a custom check function that calls flags_clear directly.
+ *  Bit values start at 0x100000u (bit 20), past the existing
+ *  PRE_AGGRESSIVE (0x80000u, bit 19) -- an earlier draft reused
+ *  0x80000u and silently collided with PRE_AGGRESSIVE. */
+#define PRE_FLAGS_DEAD_SF     0x100000u
+#define PRE_FLAGS_DEAD_ZF     0x200000u
+#define PRE_FLAGS_DEAD_OF     0x400000u
+#define PRE_FLAGS_DEAD_PF     0x800000u
 #define PRE_REG_DEAD_RA       0x0008u
 #define PRE_REG_DEAD_B        0x0010u
 #define PRE_NO_CPU_8086       0x0020u
@@ -3688,10 +4810,15 @@ struct op_pat {
 #define PRE_NEXT_IS_JCC       0x0400u
 #define PRE_NEXT_JCC_NO_CF    0x0800u
 #define PRE_NEXT_JCC_ZF_ONLY  0x1000u
-#define PRE_SRC_IMM           0x2000u
+/* v2.26 (4.8): PRE_SRC_IMM (was 0x2000u) removed -- the check body
+ *  was a no-op placeholder and no rule ever set the bit.  0x2000u
+ *  is now free for reuse. */
 #define PRE_NOT_SP            0x4000u   /* primary register is not SP */
 #define PRE_CPU_X64           0x8000u   /* rule needs .X64 (long mode) */
 #define PRE_FPU               0x10000u  /* rule needs x87 FPU enabled (.NO87 forbids) */
+#define PRE_STACK_MEM_0       0x20000u  /* inst0 op1 is pure [bp/ebp/rbp±N] */
+#define PRE_STACK_MEM_1       0x40000u  /* inst1 op1 is pure [bp/ebp/rbp±N] */
+#define PRE_AGGRESSIVE        0x80000u  /* only when -Ox */
 
 /* action kinds */
 enum {
@@ -3706,9 +4833,9 @@ struct op_act {
 };
 
 /* a rule in the table.  n == 1 (single-inst) or 2 (pair). */
-#define MAXPAT 2
+#define MAXPAT 4  /* v2.11: up to 4-instruction patterns */
 struct rule {
-    int   n;                       /* 1 or 2 instructions */
+    int   n;                       /* 1..MAXPAT instructions */
     int   rule_no;                 /* P-number, e.g. 9 */
     struct {                        /* per-instruction pattern */
         const char *mnem;          /* NULL = match by opclass */
@@ -3719,6 +4846,20 @@ struct rule {
     unsigned pre;                  /* precondition bits */
     struct op_act act[MAXPAT];      /* one action per pattern inst */
     const char *desc;              /* one-line description */
+    /* Optional predicate; NULL = always pass after pre_check.
+     *  Signature: 1 = accept rule, 0 = reject.  Use for ad-hoc
+     *  filters (lea_mem_avoids_reg, width checks) without new PRE bits. */
+    int (*check)(const struct capent *cap, long i, long j2);
+    /* v2.25 (M6): dead-capture bitmask.  Bit (1u << (c-'a')) requests
+     *  reg_dead_cf for capture c after the pattern.  Generalizes
+     *  PRE_REG_DEAD_RA (capture 'a') and PRE_REG_DEAD_B (capture 'b')
+     *  to any of the 26 capture letters, so 3-op and 4-op rules with
+     *  intermediate dead registers (e.g. lea+lea+lea fusion where
+     *  captures 'a' and 'b' are both intermediates that die) can be
+     *  expressed without a custom check function.  Field is at the
+     *  end of the struct so existing positional initializers
+     *  zero-initialize it automatically. */
+    unsigned pre_dead_caps;
 };
 
 /* the rule table.  Declared later (after the matcher functions, which
@@ -3756,6 +4897,7 @@ static int op_pat_match(struct op_pat *p, const char *op,
     }
     if (p->kind == OP_SAME) {
         int ci = p->same_cap - 'a';
+        int cr;
         if (ci < 0 || ci >= NCAP) return 0;
         if (cap[ci].fam < 0) return 0;
         r = find_reg(op);
@@ -3764,10 +4906,73 @@ static int op_pat_match(struct op_pat *p, const char *op,
          *  width check, "mov eax, ax" (a zero-extension, NOT a no-op)
          *  would match RR_('a'),SM_('a') and be wrongly deleted by
          *  the "mov R,R -> delete" rule.  eax and ax share family 0
-         *  but differ in width (32 vs 16). */
-        if (g_regs[r].fam != cap[ci].fam) return 0;
-        if ((g_regs[r].hi - g_regs[r].lo) != cap[ci].width) return 0;
-        return 1;
+         *  but differ in width (32 vs 16).
+         *  v2.17: must ALSO match lo, so "or ah,al" (same family 0,
+         *  same width 8, but lo 8 vs 0) does NOT match SM_('a') --
+         *  it is not "R,R" and must not be rewritten to "test ah,ah"
+         *  (or worse, "test al,al" via the lo==0 cap_regname bug).
+         *  v2.25 (S6): the three-line fam+width+lo comparison is now
+         *  a single reg_relation(..., REL_SAME) call.  cap_to_regidx
+         *  turns the capent into a g_regs index so reg_relation can
+         *  do the unified test. */
+        cr = cap_to_regidx(&cap[ci]);
+        if (cr < 0) return 0;
+        return reg_relation(r, cr, REL_SAME);
+    }
+    if (p->kind == OP_DIFF) {
+        int ci = p->same_cap - 'a';
+        int cr;
+        if (ci < 0 || ci >= NCAP) return 0;
+        if (cap[ci].fam < 0) return 0;
+        r = find_reg(op);
+        if (r < 0) return 0;
+        cr = cap_to_regidx(&cap[ci]);
+        if (cr < 0) {
+            /* cap was bound but to a (fam,width,lo) no concrete
+             *  register has -- the safest answer is "not same", so
+             *  OP_DIFF still matches. */
+            return 1;
+        }
+        return reg_relation(r, cr, REL_DISJOINT);
+    }
+    /* v2.25 (M8): same-family relation kinds.  All three follow the
+     *  same shape: resolve the bound capture to a g_regs index via
+     *  cap_to_regidx, then ask reg_relation() for the named mode.
+     *  The rclass filter (if any) was applied at the OP_REG match
+     *  that bound the capture; here we only check the relation. */
+    if (p->kind == OP_SAME_FAM ||
+        p->kind == OP_SAME_WIDTH ||
+        p->kind == OP_COMPLEMENT_LO) {
+        int ci = p->same_cap - 'a';
+        int cr;
+        enum reg_rel rel;
+        if (ci < 0 || ci >= NCAP) return 0;
+        if (cap[ci].fam < 0) return 0;
+        r = find_reg(op);
+        if (r < 0) return 0;
+        cr = cap_to_regidx(&cap[ci]);
+        if (cr < 0) return 0;   /* capture doesn't resolve to a real reg */
+        rel = (p->kind == OP_SAME_FAM)      ? REL_SAME_FAM :
+              (p->kind == OP_SAME_WIDTH)    ? REL_SAME_WIDTH :
+                                              REL_COMPLEMENT_LO;
+        return reg_relation(r, cr, rel);
+    }
+    if (p->kind == OP_IMM_POW2) {
+        long v;
+        if (!try_parse_number(op, &v)) return 0;
+        if (v <= 0) return 0;
+        /* exact power of two? */
+        return ((v & (v - 1)) == 0);
+    }
+    /* v2.25 (M5): immediate in a closed range.  Both bounds are
+     *  signed longs; the operand must parse as a number and satisfy
+     *  imm_val <= v <= imm_hi.  Lets table rules encode shift-count
+     *  gates (1 <= k <= 31), imm8 bounds, and similar without a
+     *  custom check function. */
+    if (p->kind == OP_IMM_RANGE) {
+        long v;
+        if (!try_parse_number(op, &v)) return 0;
+        return v >= p->imm_val && v <= p->imm_hi;
     }
     if (p->kind == OP_REG || p->kind == OP_REGCLASS) {
         r = find_reg(op);
@@ -3784,6 +4989,7 @@ static int op_pat_match(struct op_pat *p, const char *op,
             if (ci < 0 || ci >= NCAP) return 0;
             cap[ci].fam = g_regs[r].fam;
             cap[ci].width = g_regs[r].hi - g_regs[r].lo;
+            cap[ci].lo = g_regs[r].lo;  /* v2.17: AH vs AL */
         }
         return 1;
     }
@@ -3824,19 +5030,36 @@ static int pat_match_inst(const struct pinfo *p,
     return 1;
 }
 
-/* check the precondition set against the current context.  `i` is the
- *  line index of the first instruction; `j2` (if >= 0) the second; `cap`
- *  the captures bound during matching. */
-static int pre_check(unsigned pre, long i, long j2,
+/* check the precondition set against the current context.  `last_idx`
+ *  is the line index of the LAST instruction in the matched pattern
+ *  (i for n=1, j2 for n=2, j3 for n=3, j4 for n=4); the dead-flag /
+ *  dead-reg scans start at next_code(last_idx) so they see the
+ *  instruction AFTER the whole pattern, not the instruction after
+ *  inst1 of a 3-op pattern (which was the v2.25 latent bug from
+ *  finding 3.1).  `cap` is the captures bound during matching.
+ *  v2.25 (M6): added `dead_caps` bitmask for the generalized
+ *  PRE_REG_DEAD_CAP mechanism. */
+static int is_stack_mem_operand(const char *s);
+static int pre_check(unsigned pre, unsigned dead_caps, long last_idx,
                      struct capent *cap)
 {
-    long after = (j2 >= 0) ? next_code(j2) : next_code(i);
+    long after = next_code(last_idx);
     if (pre & PRE_FLAGS_DEAD_ALL)
         if (!flags_clear(after, F_ALL6)) return 0;
     if (pre & PRE_FLAGS_DEAD_CF)
         if (!flags_clear(after, F_CF)) return 0;
     if (pre & PRE_FLAGS_DEAD_AF)
         if (!flags_clear(after, F_AF)) return 0;
+    /* v2.25 (M1): single-flag dead preconditions.  Same shape as the
+     *  CF/AF checks above; each calls flags_clear on just one flag. */
+    if (pre & PRE_FLAGS_DEAD_SF)
+        if (!flags_clear(after, F_SF)) return 0;
+    if (pre & PRE_FLAGS_DEAD_ZF)
+        if (!flags_clear(after, F_ZF)) return 0;
+    if (pre & PRE_FLAGS_DEAD_OF)
+        if (!flags_clear(after, F_OF)) return 0;
+    if (pre & PRE_FLAGS_DEAD_PF)
+        if (!flags_clear(after, F_PF)) return 0;
     if (pre & PRE_REG_DEAD_RA) {
         int ci = 'a' - 'a';
         if (cap[ci].fam < 0) return 0;
@@ -3877,21 +5100,32 @@ static int pre_check(unsigned pre, long i, long j2,
         int ci = 'a' - 'a';
         if (cap[ci].fam == 4) return 0;   /* SP family */
     }
-    if (pre & PRE_SRC_IMM) {
-        int ci = 'a' - 'a';
-        if (cap[ci].fam < 0) return 0;
-        /* the primary register's source must be an immediate.  We
-         *  check by re-parsing: the pattern that needs this is
-         *  "mov R,K", so we look at the FIRST instruction and ask
-         *  if its op1 parses as a number. */
-        /* NOTE: this only makes sense for rules where op1 of inst 0
-         *  is the immediate.  We re-derive it.  Trivial for the
-         *  current table.  This pre is rarely needed; left as a
-         *  conservative placeholder that always succeeds. */
+    if (pre & PRE_STACK_MEM_0) {
+        /* g_pcur is inst0 when called from try_table_rules. */
+        if (!is_stack_mem_operand(g_pcur.op1) &&
+            !is_stack_mem_operand(g_pcur.op0))
+            return 0;
     }
+    if (pre & PRE_AGGRESSIVE) {
+        if (!opt_aggressive) return 0;
+    }
+    if (pre & PRE_STACK_MEM_1) {
+        /* v2.26 (3.1): PRE_STACK_MEM_1 checks inst1's operand; the
+         *  caller has already parsed g_ppair for a 2+ inst pattern.
+         *  If last_idx == i (n=1 rule), this pre is meaningless and
+         *  we conservatively reject. */
+        if (last_idx < 0) return 0;
+        if (!is_stack_mem_operand(g_ppair.op1) &&
+            !is_stack_mem_operand(g_ppair.op0))
+            return 0;
+    }
+    /* v2.26 (4.8): PRE_SRC_IMM (0x2000u) removed.  The check body
+     *  was a no-op placeholder ("always succeeds" per the v1.85
+     *  comment) and no table rule ever set the bit.  The bit value
+     *  0x2000u is now free for reuse. */
     if (pre & (PRE_NEXT_IS_JCC | PRE_NEXT_JCC_NO_CF |
                PRE_NEXT_JCC_ZF_ONLY)) {
-        long k = (j2 >= 0) ? next_code(j2) : next_code(i);
+        long k = next_code(last_idx);
         struct pinfo *pj = &g_ppair;
         int rd;
         if (k < 0 || INDEF(k)) return 0;
@@ -3906,6 +5140,23 @@ static int pre_check(unsigned pre, long i, long j2,
         if (pre & PRE_NEXT_IS_JCC) { /* satisfied: pj is a Jcc */ }
         if (pre & PRE_NEXT_JCC_NO_CF)  if (rd & F_CF) return 0;
         if (pre & PRE_NEXT_JCC_ZF_ONLY) if (rd != F_ZF) return 0;
+    }
+    /* v2.25 (M6): per-capture dead-register scan.  Each set bit in
+     *  dead_caps names a capture letter ('a'..'z') that must be
+     *  provably dead after the pattern, via reg_dead_cf.  This is
+     *  the generalization of PRE_REG_DEAD_RA / PRE_REG_DEAD_B (which
+     *  only cover captures 'a' and 'b') to any letter, so 3-op and
+     *  4-op rules with intermediate dead registers don't need a
+     *  custom check function. */
+    if (dead_caps) {
+        int ci;
+        for (ci = 0; ci < NCAP; ci++) {
+            if (dead_caps & (1u << ci)) {
+                int regidx = cap_to_regidx(&cap[ci]);
+                if (regidx < 0) return 0;
+                if (!reg_dead_cf(after, regidx)) return 0;
+            }
+        }
     }
     return 1;
 }
@@ -3934,20 +5185,156 @@ static const char *cap_regname(struct capent *cap, char name, int width)
 {
     int ci = name - 'a';
     int r;
+    int want_lo;
     if (ci < 0 || ci >= NCAP) return NULL;
     if (cap[ci].fam < 0) return NULL;
+    /* v2.17: when the requested width matches the captured width,
+     *  use the captured lo so high-byte registers (AH/CH/DH/BH,
+     *  lo=8) resolve to themselves, not to their low-byte siblings.
+     *  When the width differs (forced via $a8/$a16/$a32), fall back
+     *  to lo==0 -- the natural register of that family at that width
+     *  (e.g. $a32 of an AH capture returns EAX, not some high dword). */
+    want_lo = (width == cap[ci].width) ? cap[ci].lo : 0;
     for (r = 0; g_regs[r].name != NULL; r++) {
         if (g_regs[r].fam == cap[ci].fam &&
-            g_regs[r].lo == 0 &&
+            g_regs[r].lo == want_lo &&
             g_regs[r].hi == width) return g_regs[r].name;
     }
     return NULL;
 }
 
-/* expand a rewrite template "$a", "$a8", "$a16", "$a32", "$K", "$K1" into
- *  the bound value, writing into buf.  Returns the new end pointer. */
+/* v2.25 (M4): evaluate an arithmetic expression over immediates.
+ *  Used by the ${...} template form.  Grammar (left-to-right, no
+ *  precedence -- callers should parenthesize when in doubt):
+ *    expr := term ( OP term )*
+ *    term := NUMBER | K | K1 | Knot | Kneg | Klog2 | ( expr ) | ~term
+ *    OP   := + - * / % << >> & | ^
+ *  Inside ${...}, immediates are referenced as bare K / K1 / Knot /
+ *  Kneg / Klog2 (NO leading $ -- the $ was consumed by the ${ opener
+ *  in expand_template).  Returns 1 on success (value in *out), 0 on
+ *  parse/eval error (caller -- expand_template -- bails the rule).
+ *  Division by zero returns 0.  All arithmetic is signed long;
+ *  bitwise ~ is two's-complement. */
+static int eval_imm_expr(const char **pp, long *out,
+                         const char *imm0, const char *imm1)
+{
+    const char *s = *pp;
+    long v = 0;
+    int have_val = 0;
+
+    /* skip whitespace */
+    while (*s == ' ' || *s == '\t') s++;
+
+    /* parse first term */
+    if (*s == '~') {
+        long inner;
+        s++;
+        if (!eval_imm_expr(&s, &inner, imm0, imm1)) return 0;
+        v = ~inner; have_val = 1;
+    }
+    else if (*s == '(') {
+        s++;
+        if (!eval_imm_expr(&s, &v, imm0, imm1)) return 0;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s != ')') return 0;
+        s++;
+        have_val = 1;
+    }
+    else if (*s == 'K') {
+        /* bare K (no $) -- we are inside ${...}.
+         *  C90: all declarations at top of block. */
+        const char *imm;
+        int transform, k;
+        s++;
+        imm = imm0;
+        transform = 0;
+        k = 0;
+        if (s[0] == 'n' && s[1] == 'o' && s[2] == 't') {
+            transform = 1; s += 3;
+        } else if (s[0] == 'n' && s[1] == 'e' && s[2] == 'g') {
+            transform = 2; s += 3;
+        } else if (s[0] == 'l' && s[1] == 'o' && s[2] == 'g' && s[3] == '2') {
+            transform = 3; s += 4;
+        } else if (*s == '1') {
+            imm = imm1; s++;
+        }
+        if (imm == NULL) return 0;
+        if (!try_parse_number(imm, &v)) return 0;
+        if (transform == 1) v = ~v;
+        else if (transform == 2) v = -v;
+        else if (transform == 3) {
+            if (v <= 0 || (v & (v - 1)) != 0) return 0;
+            while (v > 1) { v >>= 1; k++; }
+            v = k;
+        }
+        have_val = 1;
+    }
+    else if (*s >= '0' && *s <= '9') {
+        /* decimal or 0x hex literal */
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+            s += 2;
+            v = 0;
+            if (!isxdigit((unsigned char)*s)) return 0;
+            while (isxdigit((unsigned char)*s)) {
+                v = v * 16 + hexval(*s); s++;
+            }
+        } else {
+            v = 0;
+            while (*s >= '0' && *s <= '9') {
+                v = v * 10 + (*s - '0'); s++;
+            }
+        }
+        have_val = 1;
+    }
+    else return 0;
+
+    if (!have_val) return 0;
+
+    /* parse (OP term)* left-to-right */
+    for (;;) {
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == '\0' || *s == ')' || *s == '}') break;
+        /* operator */
+        {
+            char op = *s++;
+            long rhs;
+            if (op == '<' && *s == '<') { s++; op = 'L'; }
+            else if (op == '>' && *s == '>') { s++; op = 'R'; }
+            else if (op != '+' && op != '-' && op != '*' &&
+                     op != '/' && op != '%' && op != '&' &&
+                     op != '|' && op != '^') return 0;
+            while (*s == ' ' || *s == '\t') s++;
+            if (!eval_imm_expr(&s, &rhs, imm0, imm1)) return 0;
+            switch (op) {
+                case '+': v = v + rhs; break;
+                case '-': v = v - rhs; break;
+                case '*': v = v * rhs; break;
+                case '/': if (rhs == 0) return 0; v = v / rhs; break;
+                case '%': if (rhs == 0) return 0; v = v % rhs; break;
+                case 'L': v = (unsigned long)v << (unsigned long)rhs; break;
+                case 'R': v = (unsigned long)v >> (unsigned long)rhs; break;
+                case '&': v = v & rhs; break;
+                case '|': v = v | rhs; break;
+                case '^': v = v ^ rhs; break;
+            }
+        }
+    }
+    *out = v;
+    *pp = s;
+    return 1;
+}
+
+/* expand a rewrite template "$a", "$a8", "$a16", "$a32", "$K", "$K1",
+ *  "$m0", "$m1", "${expr}" into the bound value, writing into buf.
+ *  $m0 / $m1 = full text of operand 1 of pattern inst 0 / 1 (memory).
+ *  v2.25 (M4): ${expr} evaluates an arithmetic expression over
+ *  immediates ($K, $K1, $Knot, $Kneg, $Klog2) and integer literals
+ *  with operators + - * / % << >> & | ^ ~.  Lets table rules emit
+ *  folded constants like ${K + K1} for P16-style add/add fusion. */
 static char *expand_template(const char *tpl, struct capent *cap,
                              const char *imm0, const char *imm1,
+                             const char *mem0, const char *mem1,
+                             const char *op0, const char *op1,
                              char *buf, int bufsz)
 {
     int ci, n = 0;
@@ -3956,6 +5343,42 @@ static char *expand_template(const char *tpl, struct capent *cap,
     while (*s != '\0' && n < bufsz - 1) {
         if (*s != '$') { buf[n++] = *s++; continue; }
         s++;   /* skip $ */
+        /* v2.25 (M4): ${expr} -- arithmetic expression over immediates.
+         *  Evaluates expr via eval_imm_expr and emits the decimal
+         *  result.  On parse/eval error the whole template bails
+         *  (returns empty buf) and apply_rule refuses to fire. */
+        if (*s == '{') {
+            long v;
+            const char *inner = s + 1;
+            if (!eval_imm_expr(&inner, &v, imm0, imm1)) {
+                buf[0] = '\0'; return buf;
+            }
+            while (*inner == ' ' || *inner == '\t') inner++;
+            if (*inner != '}') { buf[0] = '\0'; return buf; }
+            inner++;
+            {
+                char num[32];
+                int nl = sprintf(num, "%ld", v);
+                int j;
+                for (j = 0; j < nl && n < bufsz - 1; j++) buf[n++] = num[j];
+            }
+            s = inner;
+            continue;
+        }
+        if (*s == 'o' && s[1] == 'p' && (s[2] == '0' || s[2] == '1')) {
+            const char *op = (s[2] == '0') ? op0 : op1;
+            s += 3;
+            if (op == NULL) { buf[0] = '\0'; return buf; }
+            while (*op != '\0' && n < bufsz - 1) buf[n++] = *op++;
+            continue;
+        }
+        if (*s == 'm' && (s[1] == '0' || s[1] == '1')) {
+            const char *mem = (s[1] == '0') ? mem0 : mem1;
+            s += 2;
+            if (mem == NULL) { buf[0] = '\0'; return buf; }
+            while (*mem != '\0' && n < bufsz - 1) buf[n++] = *mem++;
+            continue;
+        }
         if (*s == 'a' || *s == 'b' || *s == 'c') {
             char capname = *s++;
             int w = 0;
@@ -3976,14 +5399,50 @@ static char *expand_template(const char *tpl, struct capent *cap,
             {
                 const char *rn = cap_regname(cap, capname, w);
                 if (rn == NULL) { buf[0] = '\0'; return buf; }
+                /* v2.26: in AT&T mode, register names emitted by $a
+                 *  need a leading "%" prefix (e.g. "%eax" not "eax").
+                 *  Without this, every table rule that uses $a in its
+                 *  template produces invalid AT&T syntax.  The prefix
+                 *  is added here so ALL table rules benefit at once. */
+                if (g_att && n < bufsz - 1) buf[n++] = '%';
                 while (*rn != '\0' && n < bufsz - 1) buf[n++] = *rn++;
             }
         }
         else if (*s == 'K') {
+            /* v1.91 template immediates:
+             *   $K / $K1     - imm0 / imm1 as written
+             *   $Knot        - bitwise NOT of imm0
+             *   $Kneg        - negation of imm0
+             *   $Klog2       - log2 of imm0 (power of two)
+             */
+            char fold[32];
+            int transform = 0; /* 0=none 1=not 2=neg 3=log2 */
             s++;
             imm = imm0;
-            if (*s == '1') { imm = imm1; s++; }
+            if (s[0] == 'n' && s[1] == 'o' && s[2] == 't') {
+                transform = 1; s += 3;
+            } else if (s[0] == 'n' && s[1] == 'e' && s[2] == 'g') {
+                transform = 2; s += 3;
+            } else if (s[0] == 'l' && s[1] == 'o' && s[2] == 'g' && s[3] == '2') {
+                transform = 3; s += 4;
+            } else if (*s == '1') {
+                imm = imm1; s++;
+            }
             if (imm == NULL) { buf[0] = '\0'; return buf; }
+            if (transform) {
+                long v;
+                if (!try_parse_number(imm, &v)) { buf[0] = '\0'; return buf; }
+                if (transform == 1) v = ~v;
+                else if (transform == 2) v = -v;
+                else {
+                    int k = 0;
+                    if (v <= 0 || (v & (v - 1)) != 0) { buf[0] = '\0'; return buf; }
+                    while (v > 1) { v >>= 1; k++; }
+                    v = k;
+                }
+                sprintf(fold, "%ld", v);
+                imm = fold;
+            }
             while (*imm != '\0' && n < bufsz - 1) buf[n++] = *imm++;
         }
         else {
@@ -3998,20 +5457,32 @@ static char *expand_template(const char *tpl, struct capent *cap,
 /* apply a rule's actions.  Returns 1 if anything changed. */
 static int apply_rule(long i, long j2, const struct rule *r,
                       struct capent *cap,
-                      const char *imm0, const char *imm1)
+                      const char *imm0, const char *imm1,
+                      const char *mem0, const char *mem1,
+                      const char *op0, const char *op1)
 {
     int k;
-    long idx[2];
-    struct pinfo *parr[2];
+    long idx[4];
+    struct pinfo *parr[4];
+    long j3 = -1, j4 = -1;
     idx[0] = i;
     parr[0] = &g_pcur;
+    idx[1] = -1; parr[1] = NULL;
+    idx[2] = -1; parr[2] = NULL;
+    idx[3] = -1; parr[3] = NULL;
     if (r->n >= 2) {
         idx[1] = j2;
         parr[1] = &g_ppair;
     }
-    else {
-        idx[1] = -1;
-        parr[1] = NULL;
+    if (r->n >= 3) {
+        j3 = next_code(j2);
+        idx[2] = j3;
+        parr[2] = &g_pnext;
+    }
+    if (r->n >= 4) {
+        j4 = next_code(j3);
+        idx[3] = j4;
+        parr[3] = &g_plook;
     }
     for (k = 0; k < r->n; k++) {
         const struct op_act *a = &r->act[k];
@@ -4023,7 +5494,7 @@ static int apply_rule(long i, long j2, const struct rule *r,
             char body[MAXLINE];
             char full[MAXLINE + 64];
             int n;
-            expand_template(a->text, cap, imm0, imm1, body, sizeof(body));
+            expand_template(a->text, cap, imm0, imm1, mem0, mem1, op0, op1, body, sizeof(body));
             if (body[0] == '\0') return 0;
             /* preserve the original line's prefix (label + indent) */
             n = (int)strlen(parr[k]->prefix);
@@ -4039,6 +5510,61 @@ static int apply_rule(long i, long j2, const struct rule *r,
 
 /* try every table rule on the current line i.  Returns 1 if a rule
  *  fired (and st[rule_no] was incremented), 0 otherwise. */
+
+
+
+
+/* True if s is a pure stack-frame memory operand based only on BP/EBP/RBP
+ *  with optional signed displacement: [bp], [bp+4], [ebp-8], [rbp+16],
+ *  word ptr [bp+2], dword ptr [ebp-4], etc.  Rejects SI/DI/BX bases and
+ *  absolute or symbolic addresses -- those may be MMIO or aliased. */
+static int is_stack_mem_operand(const char *s)
+{
+    const char *p;
+    int have_base = 0;
+    if (s == NULL || *s == '\0') return 0;
+    /* skip optional size ptr prefix: byte/word/dword/qword ptr */
+    p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    if (ci_eq_n(p, "byte", 4) || ci_eq_n(p, "word", 4) ||
+        ci_eq_n(p, "dword", 5) || ci_eq_n(p, "qword", 5)) {
+        while (*p && *p != ' ' && *p != '\t') p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (ci_eq_n(p, "ptr", 3)) {
+            p += 3;
+            while (*p == ' ' || *p == '\t') p++;
+        }
+    }
+    if (*p != '[') return 0;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    /* base must be bp / ebp / rbp only */
+    if (ci_eq_n(p, "rbp", 3) && !is_ident_char((unsigned char)p[3])) {
+        p += 3; have_base = 1;
+    } else if (ci_eq_n(p, "ebp", 3) && !is_ident_char((unsigned char)p[3])) {
+        p += 3; have_base = 1;
+    } else if (ci_eq_n(p, "bp", 2) && !is_ident_char((unsigned char)p[2])) {
+        p += 2; have_base = 1;
+    }
+    if (!have_base) return 0;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == ']') return 1;
+    if (*p != '+' && *p != '-') return 0;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    /* displacement: decimal or hex number only */
+    if (*p == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+        if (!isxdigit((unsigned char)*p)) return 0;
+        while (isxdigit((unsigned char)*p)) p++;
+    } else {
+        if (!isdigit((unsigned char)*p)) return 0;
+        while (isdigit((unsigned char)*p)) p++;
+    }
+    while (*p == ' ' || *p == '\t') p++;
+    return (*p == ']');
+}
+
 static int try_table_rules(long i)
 {
     struct pinfo *pi = &g_pcur;
@@ -4058,7 +5584,9 @@ static int try_table_rules(long i)
         const struct rule *r = &g_rules[ri];
         struct capent cap[NCAP];
         int k;
-        for (k = 0; k < NCAP; k++) { cap[k].fam = -1; cap[k].width = 0; }
+        long j3 = -1, j4 = -1;
+        long last_idx;   /* v2.26 (3.1): last pattern inst, for pre_check */
+        for (k = 0; k < NCAP; k++) { cap[k].fam = -1; cap[k].width = 0; cap[k].lo = 0; }
         if (!pat_match_inst(pi, r, 0, cap)) continue;
         if (r->n >= 2) {
             j2 = next_code(i);
@@ -4067,6 +5595,32 @@ static int try_table_rules(long i)
             if (pj->haslabel || pj->toobig || !pj->hasinstr) continue;
             if (!pat_match_inst(pj, r, 1, cap)) continue;
         }
+        if (r->n >= 3) {
+            j3 = next_code(j2);
+            if (j3 < 0 || INDEF(j3)) continue;
+            parse_line(j3, &g_pnext);
+            if (g_pnext.haslabel || g_pnext.toobig || !g_pnext.hasinstr) continue;
+            if (!pat_match_inst(&g_pnext, r, 2, cap)) continue;
+        }
+        if (r->n >= 4) {
+            if (j3 < 0) j3 = next_code(j2);
+            j4 = next_code(j3);
+            if (j4 < 0 || INDEF(j4)) continue;
+            parse_line(j4, &g_plook);
+            if (g_plook.haslabel || g_plook.toobig || !g_plook.hasinstr) continue;
+            if (!pat_match_inst(&g_plook, r, 3, cap)) continue;
+        }
+        /* v2.26 (3.1): compute the LAST instruction index so pre_check
+         *  scans dead flags / dead regs from AFTER the whole pattern,
+         *  not from after inst1 of a 3-op pattern.  The previous code
+         *  passed j2 (or i), which for a 3-op rule was inst1 -- the
+         *  dead-flag scan then started at inst2 and missed any flag
+         *  reader between inst1 and inst2.  No current rule exercised
+         *  this (P430 has pre=0), but it was a latent footgun. */
+        last_idx = i;
+        if (r->n >= 2) last_idx = j2;
+        if (r->n >= 3) last_idx = j3;
+        if (r->n >= 4) last_idx = j4;
         /* capture immediates for the rewrite template */
         if (pi->nops >= 2) {
             long v;
@@ -4084,12 +5638,21 @@ static int try_table_rules(long i)
                 imm1 = imm1_buf;
             }
         }
-        if (!pre_check(r->pre, i, (r->n >= 2) ? j2 : -1, cap)) continue;
+        if (!pre_check(r->pre, r->pre_dead_caps, last_idx, cap)) continue;
+        if (r->check != NULL && !r->check(cap, i, j2)) continue;
         /* fire */
         vlog("smartpp: line %ld: rule P%d fired (%s)\n",
                 i + 1, r->rule_no, r->desc);
-        apply_rule(i, j2, r, cap, imm0, imm1);
-        st[r->rule_no]++;
+        {
+            const char *mem0 = (g_pcur.op1[0] != '\0') ? g_pcur.op1 : NULL;
+            const char *mem1 = NULL;
+            const char *op0 = g_pcur.mnem;
+            const char *op1 = (r->n >= 2) ? g_ppair.mnem : NULL;
+            if (r->n >= 2 && g_ppair.op1[0] != '\0') mem1 = g_ppair.op1;
+            if (mem0 == NULL && g_pcur.op0[0] != '\0') mem0 = g_pcur.op0;
+            apply_rule(i, j2, r, cap, imm0, imm1, mem0, mem1, op0, op1);
+        }
+        if (r->rule_no > 0 && r->rule_no < STSZ) st[r->rule_no]++;
         return 1;
     }
     return 0;
@@ -4121,6 +5684,7 @@ static int try_table_rules(long i)
  *      PRE_REG_DEAD_RA      PRE_REG_DEAD_B       PRE_NO_CPU_8086
  *      PRE_CPU_386          PRE_CPU_486          PRE_NO_USE32
  *      PRE_INTEL            PRE_NEXT_IS_JCC      PRE_NEXT_JCC_NO_CF
+ *      PRE_STACK_MEM_0/1    pure [bp/ebp/rbp±N] operand on inst0/1
  *      PRE_NEXT_JCC_ZF_ONLY PRE_SRC_IMM          PRE_NOT_SP
  *
  *    Actions per pattern instruction:
@@ -4158,47 +5722,222 @@ static int try_table_rules(long i)
 #define ME_                 { OP_MEM,    0, 0, 0, 0, 0 }
 #define AN_                 { OP_ANY,    0, 0, 0, 0, 0 }
 #define SM_(c)               { OP_SAME,   0, 0, c, 0, 0 }
+#define DF_(c)               { OP_DIFF,   0, 0, c, 0, 0 }  /* v1.91: other reg */
+#define PW2_                 { OP_IMM_POW2, 0, 0, 0, 0, 0 } /* v1.91: 2^k, k>=1 */
 #define RC_(cls)             { OP_REGCLASS, cls, 0, 0, 0, 0 }
 #define IV_(v)               { OP_IMMVAL, 0, 0, 0, (v), 1 }
+/* v2.25 (M8): same-family relation macros.  Each compares the
+ *  operand against the named capture using the corresponding
+ *  reg_relation() mode.  Optional width class still applies on top. */
+#define SFAM_(c)             { OP_SAME_FAM,      0, 0, c, 0, 0 }
+#define SWID_(c)             { OP_SAME_WIDTH,    0, 0, c, 0, 0 }
+#define CLO_(c)              { OP_COMPLEMENT_LO, 0, 0, c, 0, 0 }
+
+/* v2.25 (M6): dead-capture bitmask value for `rule.pre_dead_caps`.
+ *  Each capture letter 'a'..'z' gets one bit.  Set in the table
+ *  initializer as `.pre_dead_caps = DEAD_CAP_('c') | DEAD_CAP_('d')`
+ *  or, for a single capture, just DEAD_CAP_('c').  Existing rules
+ *  that already use PRE_REG_DEAD_RA / PRE_REG_DEAD_B don't need this
+ *  -- those two bits in `pre` are still honored for backwards
+ *  compat.  pre_dead_caps is the generalization to 'c'..'z'. */
+#define DEAD_CAP_(c)         (1u << ((c) - 'a'))
+
+/* v2.25 (M5): immediate-in-range.  Matches if the operand parses as
+ *  a number and lo <= v <= hi (both inclusive, signed comparison).
+ *  Use for shift counts, imm8 bounds, and similar range gates. */
+#define IMR_(lo, hi)         { OP_IMM_RANGE, 0, 0, 0, (lo), 1, (hi) }
+
+/* v2.17: P323/P324 check -- "lea R,[R+R]" (the [SIB base=index] form)
+ *  needs the SIB byte (386+) AND a 32-bit or 64-bit register.  In
+ *  16-bit addressing only BX/BP/SI/DI are legal base/index AND the
+ *  same register cannot be both base and index, so "lea ax,[ax+ax]"
+ *  is an assembler error (A2031 "must be index or base register")
+ *  on every pre-386 build.  The old rule fired on any width and
+ *  broke 4VIEW's 8086/386 real-mode code (five "lea ax,[ax+ax]"
+ *  sites in StatLoad, PopUp, DrwSt).  This check keeps the rewrite
+ *  to 386+ with EAX/ECX/EDX/EBX/ESP/EBP/ESI/EDI (and RAX..RDI on
+ *  x64); 8/16-bit registers keep "shl R,1" intact. */
+static int p323_lea_rr_check(const struct capent *cap, long i, long j2)
+{
+    int ci = 'a' - 'a';
+    (void)i; (void)j2;
+    if (opt_zopt) return 0;                 /* -Oz: shl R,1 is 2 bytes, lea is 3 */
+    if (g_curcpu < 8) return 0;            /* SIB needs the 386 */
+    if (ci < 0 || ci >= NCAP) return 0;
+    if (cap[ci].fam < 0) return 0;
+    if (cap[ci].width == 32) return 1;
+    if (cap[ci].width == 64 && g_curcpu >= 128) return 1;  /* x64 */
+    return 0;
+}
+
+/* v2.24: P430 check -- "or R,c1 / and R,c2 / or R,c3" 3-op chain.
+ *  Delete inst0 (the first OR) when (c1 & c2) & ~c3 == 0, i.e.
+ *  c1 & c2 ⊆ c3.  Original value: ((R | c1) & c2) | c3 =
+ *  (R & c2) | (c1 & c2) | c3.  Without OR1: (R & c2) | c3.
+ *  The diff is (c1 & c2) & ~c3 -- bits OR1 sets, AND keeps, OR3
+ *  doesn't set -- which must be empty for the rewrite to be exact
+ *  for every R.  Research: Open Watcom peepopt.c AndOr/OrAnd family
+ *  extended to the 3-op chain (Watcom only handled 2-op pairs).
+ *
+ *  No flag scan is needed: inst0 (the deleted OR) is immediately
+ *  followed by inst1 (the AND), which defines all six status flags
+ *  before reading any of them, so the OR's flags die at the AND.
+ *  The matcher guarantees label-free adjacency, so no reader can
+ *  sit between them.  Reuses the global pinfo slots the matcher
+ *  already filled (g_pcur=inst0, g_ppair=inst1, g_pnext=inst2);
+ *  because pre=0, pre_check does not touch g_pnext before us. */
+static int p430_or_and_or_check(const struct capent *cap, long i, long j2)
+{
+    long c1, c2, c3;
+    int r_idx, w;
+    unsigned long masku, mc1, mc2, mc3;
+    (void)i; (void)j2;
+    if (cap == NULL) return 0;
+    /* All three operands must parse as plain numbers.  Any
+     *  symbolic immediate (EQU constant, OFFSET expr) refuses to
+     *  fire -- the mask analysis is on concrete bits. */
+    if (!try_parse_number(g_pcur.op1,  &c1)) return 0;
+    if (!try_parse_number(g_ppair.op1, &c2)) return 0;
+    if (!try_parse_number(g_pnext.op1, &c3)) return 0;
+    /* Mask each constant to the destination register's width so
+     *  that "or al, -1" (c1=-1 -> 0xFF after the 8-bit mask) and
+     *  "or al, 0FFh" (c1=255 -> 0xFF) are treated identically.
+     *  g_pcur.op0 is the captured register R, which the matcher
+     *  has already bound to cap['a']; we re-resolve it via find_reg
+     *  to derive the width without poking cap['a']. */
+    r_idx = find_reg(g_pcur.op0);
+    if (r_idx < 0) return 0;
+    w = g_regs[r_idx].hi - g_regs[r_idx].lo;
+    masku = width_mask(w);
+    mc1 = (unsigned long)c1 & masku;
+    mc2 = (unsigned long)c2 & masku;
+    mc3 = (unsigned long)c3 & masku;
+    /* Soundness gate: every bit the first OR forces to 1 that the
+     *  AND keeps must be re-forced by the last OR; otherwise the
+     *  first OR is the only thing guaranteeing that bit and cannot
+     *  be deleted.  (c1 & c2) & ~c3 == 0. */
+    return ((mc1 & mc2) & ~mc3) == 0UL;
+}
+
+/* v2.24: P431 check -- "mov R8lo, 0 / mov R8hi, 0 -> xor R16, R16"
+ *  where R8lo and R8hi are the low and high bytes of the SAME 8-bit
+ *  register family.  v2.25 (M8) replaced this function with the
+ *  table-native OP_COMPLEMENT_LO (CLO_('a')) pattern kind.  The body
+ *  was deleted in v2.26 (cleanup of audit finding 4.1).  See the
+ *  P431 table entry for the declarative form. */
+
+/* v2.24: P432 check -- "movzx R, src / test R, R -> test src, src"
+ *  with R provably dead after the test AND SF provably dead from the
+ *  test onward.  v2.25 (M1) replaced this function with the
+ *  PRE_FLAGS_DEAD_SF precondition bit.  The body was deleted in v2.26
+ *  (cleanup of audit finding 4.2).  See the P432 table entry. */
+
+/* v2.25 (M4+M5): shared check for the constant-fold rules P433/P434.
+ *  Verifies that c1 OP c2 (OP = + for P433, - for P434) fits in the
+ *  destination register's signed immediate encoding range, so the
+ *  folded replacement "add/sub R, sum" can be encoded.  Uses
+ *  width_imm_limit() for the bound. */
+static int p433_fold_range_check(const struct capent *cap,
+                                 long i, long j2, int is_sub)
+{
+    long c1, c2, sum;
+    int ridx, w;
+    long limit;
+    (void)i; (void)j2;
+    if (cap == NULL) return 0;
+    if (!try_parse_number(g_pcur.op1,  &c1)) return 0;
+    if (!try_parse_number(g_ppair.op1, &c2)) return 0;
+    sum = is_sub ? (c1 - c2) : (c1 + c2);
+    ridx = cap_to_regidx(&cap['a' - 'a']);
+    if (ridx < 0) return 0;
+    w = g_regs[ridx].hi - g_regs[ridx].lo;
+    limit = width_imm_limit(w);
+    return sum >= -limit && sum <= limit;
+}
+
+/* P433 check: add R,c1 / add R,c2 -> add R,c1+c2 (sum fits). */
+static int p433_add_fold_check(const struct capent *cap, long i, long j2)
+{
+    return p433_fold_range_check(cap, i, j2, 0);
+}
+
+/* P434 check: sub R,c1 / sub R,c2 -> sub R,c1+c2 (sum fits). */
+static int p434_sub_fold_check(const struct capent *cap, long i, long j2)
+{
+    return p433_fold_range_check(cap, i, j2, 0);  /* sub+sub is also c1+c2 */
+}
+
+/* P435 check: sub R,c1 / add R,c2 -> sub R, c1-c2 (net sub). */
+static int p435_sub_add_fold_check(const struct capent *cap, long i, long j2)
+{
+    return p433_fold_range_check(cap, i, j2, 1);  /* c1 - c2 */
+}
+
+/* v2.26: P40 check -- "mov R, imm1 / {add|sub} R, imm2 -> mov R, imm1±imm2"
+ *  Verifies the folded total fits the dest register's signed imm
+ *  encoding range (imm8/imm16/imm32).  Uses width_imm_limit() for
+ *  the upper bound; lower bound is -(lim+1) (e.g. -128 for imm8).
+ *  is_sub selects between imm1+imm2 (add) and imm1-imm2 (sub). */
+static int p40_mov_add_fold_check(const struct capent *cap, long i, long j2)
+{
+    long v1, v2, total;
+    int ridx, w;
+    long lim;
+    (void)i; (void)j2;
+    if (cap == NULL) return 0;
+    if (!try_parse_number(g_pcur.op1,  &v1)) return 0;
+    if (!try_parse_number(g_ppair.op1, &v2)) return 0;
+    /* g_ppair.mnem is "add" or "sub" -- the table has separate entries
+     *  for each, so we can tell from the mnemonic which sign to use. */
+    total = ci_eq(g_ppair.mnem, "sub") ? (v1 - v2) : (v1 + v2);
+    ridx = cap_to_regidx(&cap['a' - 'a']);
+    if (ridx < 0) return 0;
+    w = g_regs[ridx].hi - g_regs[ridx].lo;
+    lim = width_imm_limit(w);
+    return total <= lim && total >= -(lim + 1);
+}
 
 static const struct rule g_rule_tbl[] = {
 
-    /* P105 (v1.85): "sub R, R" -> "xor R, R".  Both zero R and define
-     *  all six flags identically (CF=0, OF=0, SF=0, ZF=1, PF=1, AF=0).
-     *  xor is the canonical zeroing idiom that breaks dependency chains
-     *  on the Pentium Pro and later (partial-register rename).
-     *  Research: Intel optimization guide "zeroing idiom"; Agner Fog
-     *  manual 2.  Exact on R and flags; no preconditions.
-     *  NOTE: P71 (C rule) catches "sub R,R" first when flags are
-     *  dead AND the next instruction is not a Jcc; this table rule
-     *  is the unconditional fallback that fires when P71's flag scan
-     *  could not prove the flags dead but the rewrite is still safe
-     *  (because sub R,R and xor R,R set flags identically). */
-    { 1, 105,
-      { { "sub", 0, RR_('a'), SM_('a'), 2 } },
+    /* P1 (v2.14, RESTORED): "mov R, R" -> delete.  The v1.85.1
+     *  cleanup removed the old P106/P107 table rules as "caught by
+     *  P1", but P1 itself was never present in this table (the C
+     *  comment in run_pass points here), so same-register mov/xchg
+     *  silently stopped being deleted.  OP_SAME compares family AND
+     *  width (v1.85.1), so "mov eax, ax" (a zero-extension) still
+     *  never matches.  mov touches no flags; the deletion is exact. */
+    { 1, 1,
+      { { "mov", 0, RR_('a'), SM_('a'), 2 } },
       0,
-      { { ACT_REW, "xor $a, $a" } },
-      "sub R,R -> xor R,R (dep-chain break)" },
-
-    /* P111 (v1.85): "or R, 0" -> delete (or with zero is a no-op on R,
-     *  but sets flags from R).  Requires flags dead -- the or's "test
-     *  of R" effect is observable through ZF/SF/PF, so we cannot
-     *  delete it if a Jcc reads them.  Catches a pattern the C rules
-     *  do not (P59 only handles "and R, 0", P60 only "or R, -1"). */
-    { 1, 111,
-      { { "or", 0, RR_('a'), IV_(0), 2 } },
-      PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL } },
-      "or R,0 -> delete (flags dead)" },
+      "mov R,R -> delete", NULL },
 
-    /* P112 (v1.85): "and R, -1" -> delete (and with all-ones is a
-     *  no-op on R but sets flags).  Requires flags dead.  P59 only
-     *  handles "and R, 0"; P59/P60 do not cover "and R, -1". */
-    { 1, 112,
-      { { "and", 0, RR_('a'), IV_(-1), 2 } },
-      PRE_FLAGS_DEAD_ALL,
+    /* P1 (xchg form): "xchg R, R" -> delete.  Same-register xchg is a
+     *  no-op on R, on flags (xchg sets none), and on memory; "xchg
+     *  eax, eax" is the canonical 1-byte NOP (0x90).  Absorbs the old
+     *  P126, which was otherwise unreachable behind this rule. */
+    { 1, 1,
+      { { "xchg", 0, RR_('a'), SM_('a'), 2 } },
+      0,
       { { ACT_DEL, NULL } },
-      "and R,-1 -> delete (flags dead)" },
+      "xchg R,R -> delete", NULL },
+
+    /* P105 (v2.14, REMOVED): "sub R,R -> xor R,R" table rule deleted.
+     *  It was unreachable: the C rule P71 fires first with the exact
+     *  same conditions (AF dead, not SP).  See rname[105]. */
+
+    /* P111 (v1.85, REMOVED v2.26): "or R, 0" -> delete was shadowed
+     *  by the C rule P8, which fires first with `continue` on every
+     *  `or R,0` and `or R,R` (audit finding 2.1).  The table entry
+     *  was unreachable on its only pattern.  rname[111] kept as doc. */
+
+    /* P112 (v1.85, REMOVED v2.26): "and R, -1" -> delete was shadowed
+     *  by the C rule P8 (audit finding 2.2).  P8 line ~8750 matches
+     *  both `v8 == -1L` and the unsigned 0FFFFh/0FFFFFFFFh forms,
+     *  covering every input P112 could match.  rname[112] kept as
+     *  doc.  The unsigned all-ones AND for 8/16-bit (`and al, 0FFh`
+     *  / `and ax, 0FFFFh`) is handled by C P8 only; no table rule
+     *  covers it, which is acceptable since P8 catches all forms. */
 
     /* P115 (v1.85): "xor R, 0" -> delete (no-op on R, sets flags).
      *  Requires flags dead.  No C rule covers this case. */
@@ -4206,7 +5945,7 @@ static const struct rule g_rule_tbl[] = {
       { { "xor", 0, RR_('a'), IV_(0), 2 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL } },
-      "xor R,0 -> delete (flags dead)" },
+      "xor R,0 -> delete (flags dead)", NULL },
 
     /* P119 (v1.85): "test R, K" -> delete when flags dead.  test never
      *  writes R, so deleting it is sound as long as no reader of its
@@ -4216,7 +5955,7 @@ static const struct rule g_rule_tbl[] = {
       { { "test", 0, RR_('a'), IM_, 2 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL } },
-      "test R,K -> delete (flags dead)" },
+      "test R,K -> delete (flags dead)", NULL },
 
     /* P120 (v1.85): "cmp R, K" -> delete when flags dead.  cmp never
      *  writes R; the only observable effect is flags, which the
@@ -4228,7 +5967,7 @@ static const struct rule g_rule_tbl[] = {
       { { "cmp", 0, RR_('a'), IM_, 2 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL } },
-      "cmp R,K -> delete (flags dead)" },
+      "cmp R,K -> delete (flags dead)", NULL },
 
     /* ---- v1.86 NEW RULES (research: Agner Fog, Abrash, GCC i386.md) ----
      *  See the v1.86 changelog block above for the full safety analysis
@@ -4246,11 +5985,10 @@ static const struct rule g_rule_tbl[] = {
      *  that documents the rule.
      *  Research: Agner Fog instruction_tables (IMUL latencies); Intel
      *  SDM Vol.2 IMUL; Abrash Black Book. */
-    { 1, 122,
-      { { "imul", 0, RR_('a'), IV_(1), 2 } },
-      PRE_FLAGS_DEAD_ALL | PRE_NO_CPU_8086,
-      { { ACT_DEL, NULL } },
-      "imul R,1 -> delete (flags dead)" },
+    /* P122 (v2.14, REMOVED): "imul R,1 -> delete" table rule deleted.
+     *  The C rule P38 now folds the K == 1 identity itself (its old
+     *  v==1 branch was unreachable behind the power-of-two branch;
+     *  fixed in v2.14), so this entry never fired.  See rname[122]. */
 
     /* P123 (v1.86): "imul R, 0" -> "xor R, R".  R*0 == 0, and xor is
      *  the canonical zeroing idiom (breaks the dependency chain on
@@ -4264,23 +6002,12 @@ static const struct rule g_rule_tbl[] = {
       { { "imul", 0, RR_('a'), IV_(0), 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NO_CPU_8086,
       { { ACT_REW, "xor $a, $a" } },
-      "imul R,0 -> xor R,R (flags dead)" },
+      "imul R,0 -> xor R,R (flags dead)", NULL },
 
-    /* P126 (v1.86): "xchg R, R" -> delete (same register).  xchg with
-     *  itself is a no-op on R, on flags (xchg sets no flags), and on
-     *  memory.  Note "xchg eax, eax" is the canonical 1-byte NOP (0x90)
-     *  on every x86; deleting it is always safe.  Uses OP_SAME so it
-     *  catches the cross-width family case too (e.g. "xchg ax, al"
-     *  would NOT fire because OP_SAME's width check rejects different
-     *  widths -- correct, that is NOT a no-op).  In practice P1
-     *  (C rule) fires first on the same-width case; this table rule
-     *  documents the pattern and is the table-native form.
-     *  Research: Intel SDM Vol.2 XCHG; Agner Fog NOP table. */
-    { 1, 126,
-      { { "xchg", 0, RR_('a'), SM_('a'), 2 } },
-      0,
-      { { ACT_DEL, NULL } },
-      "xchg R,R -> delete (canonical NOP)" },
+    /* P126 (v2.14, REMOVED): "xchg R,R -> delete" table rule deleted.
+     *  The restored P1 xchg entry (top of this table) fires first with
+     *  identical conditions, so this entry never fired.
+     *  See rname[126]. */
 
     /* P127 (v1.86): "bswap R / bswap R" -> delete the second.  bswap
      *  is an involution: bswap(bswap(x)) == x.  The second bswap is a
@@ -4294,7 +6021,7 @@ static const struct rule g_rule_tbl[] = {
         { "bswap", 0, SM_('a'), AN_, 1 } },
       PRE_CPU_486,
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "bswap R / bswap R -> bswap R" },
+      "bswap R / bswap R -> bswap R", NULL },
 
     /* P128 (v1.86): "xor R, R / push R" -> "push 0".  The xor clears
      *  R to 0; pushing R pushes 0; pushing the immediate 0 has the
@@ -4312,7 +6039,7 @@ static const struct rule g_rule_tbl[] = {
         { "push", 0, SM_('a'), AN_, 1 } },
       PRE_REG_DEAD_RA | PRE_NO_CPU_8086,
       { { ACT_DEL, NULL }, { ACT_REW, "push 0" } },
-      "xor R,R / push R -> push 0" },
+      "xor R,R / push R -> push 0", NULL },
 
     /* ---- v1.87 NEW RULES: x87 FPU + x64 long mode ---- */
 
@@ -4329,7 +6056,7 @@ static const struct rule g_rule_tbl[] = {
         { "fstp", 0, SM_('a'), AN_, 1 } },
       PRE_FPU,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "fld st / fstp st -> delete (push/pop)" },
+      "fld st / fstp st -> delete (push/pop)", NULL },
 
     /* P130 (v1.87): "fldz / fstp st" -> delete both.  Pushing zero and
      *  popping it immediately is a no-op on the stack (the pop
@@ -4339,7 +6066,7 @@ static const struct rule g_rule_tbl[] = {
         { "fstp", 0, RR_('a'), AN_, 1 } },
       PRE_FPU,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "fldz / fstp st -> delete (push 0/pop)" },
+      "fldz / fstp st -> delete (push 0/pop)", NULL },
 
     /* P131 (v1.87): "fchs / fchs" -> delete both.  Negating the top of
      *  stack twice is a no-op (double negation).  fchs leaves the
@@ -4349,7 +6076,7 @@ static const struct rule g_rule_tbl[] = {
         { "fchs", 0, AN_, AN_, 0 } },
       PRE_FPU,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "fchs / fchs -> delete (double negation)" },
+      "fchs / fchs -> delete (double negation)", NULL },
 
     /* P132 (v1.87): "fabs / fabs" -> delete the second.  abs is
      *  idempotent: abs(abs(x)) == abs(x).  The second fabs is a
@@ -4359,7 +6086,7 @@ static const struct rule g_rule_tbl[] = {
         { "fabs", 0, AN_, AN_, 0 } },
       PRE_FPU,
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "fabs / fabs -> fabs (idempotent)" },
+      "fabs / fabs -> fabs (idempotent)", NULL },
 
     /* P133 (v1.87): "fsqrt / fsqrt" -> delete the second.  sqrt is
      *  idempotent on non-negative inputs (sqrt(sqrt(x)) != sqrt(x) in
@@ -4381,7 +6108,7 @@ static const struct rule g_rule_tbl[] = {
         { "ffree", 0, SM_('a'), AN_, 1 } },
       PRE_FPU,
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "ffree st / ffree st -> ffree st" },
+      "ffree st / ffree st -> ffree st", NULL },
 
     /* P135 (v1.87): "fninit / fninit" -> delete the second.  fninit
      *  resets the FPU to a known state; initializing twice in a row
@@ -4391,7 +6118,7 @@ static const struct rule g_rule_tbl[] = {
         { "fninit", 0, AN_, AN_, 0 } },
       PRE_FPU,
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "fninit / fninit -> fninit" },
+      "fninit / fninit -> fninit", NULL },
 
     /* P136 (v1.87): "fwait / fwait" -> delete the second.  fwait is
      *  a CPU/FPU synchronization hint; two in a row collapse to one.
@@ -4401,43 +6128,1378 @@ static const struct rule g_rule_tbl[] = {
         { "fwait", 0, AN_, AN_, 0 } },
       PRE_FPU,
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "fwait / fwait -> fwait" },
+      "fwait / fwait -> fwait", NULL },
 
     /* P137 (v1.87): "fxch st / fxch st" -> delete both.  Swapping the
      *  top of stack with itself is a no-op (xchg x,x).  PRE_FPU.
      *  Note: "fxch" with no operands swaps st(0) and st(1) -- this
      *  rule only fires when both operands are present and equal,
      *  which is the "fxch st, st" (== fxch st(0), st(0)) form. */
-    { 2, 137,
-      { { "fxch", 0, RR_('a'), SM_('a'), 2 },
-        { "fxch", 0, SM_('a'), SM_('a'), 2 } },
+
+    /* P205: fnop / fnop -> delete second. */
+    { 2, 205,
+      { { "fnop", 0, AN_, AN_, 0 },
+        { "fnop", 0, AN_, AN_, 0 } },
+      PRE_FPU,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "fnop / fnop -> fnop", NULL },
+
+    /* P206: fld1 / fmulp st(1),st -> delete both if pure *1 on stack top
+     *  pair fld1+fmulp: st1*=st0(=1), pop -> st1 unchanged. Net no-op.
+     *  Only the classic no-operand fmulp form. */
+    { 2, 206,
+      { { "fld1", 0, AN_, AN_, 0 },
+        { "fmulp", 0, AN_, AN_, 0 } },
       PRE_FPU,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "fxch st,st / fxch st,st -> delete" },
+      "fld1 / fmulp -> delete (*1 no-op)", NULL },
 
-    /* v1.87 x64 note: the x64 zeroing idiom "mov R64, 0 -> xor R32, R32"
-     *  is handled by the P9 C-rule (which detects x64 mode via the
-     *  register width and emits the 32-bit xor form -- 1 byte shorter
-     *  than the 64-bit xor because no REX.W prefix is needed, and the
-     *  xor zero-extends to 64 bits for free).  No table rule is
-     *  needed here because P9 already fires first on "mov R, 0" for
-     *  every width >= 16.
-     *
-     *  The tempting "test R64,R64 -> test R32,R32" rewrite was
-     *  considered and WITHDRAWN: it is unsound.  `test rax,rax` sets
-     *  ZF from the full 64-bit value while `test eax,eax` sets ZF
-     *  from the low 32 bits only, so they differ when rax has bits
-     *  set above bit 31.  The 32-bit form also zero-extends EAX into
-     *  RAX, mutating RAX if its high 32 bits were nonzero.  Without a
-     *  precondition proving the high 32 bits are zero (which we don't
-     *  have), the rewrite changes behavior.  Documented here as a
-     *  considered-and-rejected case. */
+    /* P207: fld1 / faddp -> not a no-op (+1). skip.
+     *  fldz / faddp: +0 is no-op for most, but -0/rounding: skip. */
+
+    /* P208: fdecstp / fincstp -> delete both (inverse stack moves). */
+    { 2, 208,
+      { { "fdecstp", 0, AN_, AN_, 0 },
+        { "fincstp", 0, AN_, AN_, 0 } },
+      PRE_FPU,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "fdecstp / fincstp -> delete", NULL },
+
+    /* P209: fincstp / fdecstp -> delete both. */
+    { 2, 209,
+      { { "fincstp", 0, AN_, AN_, 0 },
+        { "fdecstp", 0, AN_, AN_, 0 } },
+      PRE_FPU,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "fincstp / fdecstp -> delete", NULL },
+
+    /* P210: finit / finit -> finit (same as fninit pair). */
+    { 2, 210,
+      { { "finit", 0, AN_, AN_, 0 },
+        { "finit", 0, AN_, AN_, 0 } },
+      PRE_FPU,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "finit / finit -> finit", NULL },
+
+    /* P211: x64 - cdqe / cdqe -> cdqe (sign-extend EAX->RAX idempotent
+     *  on second application only if already extended; second is redundant
+     *  if no write to EAX/RAX between -- adjacent => safe). */
+    { 2, 211,
+      { { "cdqe", 0, AN_, AN_, 0 },
+        { "cdqe", 0, AN_, AN_, 0 } },
+      PRE_CPU_X64,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cdqe / cdqe -> cdqe", NULL },
+
+    /* P212: cqo / cqo -> cqo (sign-extend RAX into RDX:RAX). */
+    { 2, 212,
+      { { "cqo", 0, AN_, AN_, 0 },
+        { "cqo", 0, AN_, AN_, 0 } },
+      PRE_CPU_X64,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cqo / cqo -> cqo", NULL },
+
+    /* P213: cltq is AT&T cdqe; handle as cdqe synonym in Intel we use cdqe.
+     *  cwd / cwd already P28. */
+
+    /* P214: movsx R64, R32 same reg family low - often written after
+     *  32-bit op that already zero/sign cleared - skip without proof. */
+
+    /* P215: and R, R with flags dead is P147. or R,0 delete P111.
+     *  x64: "shl rax, 0" delete via P146. */
+
+    /* P216: test R,R / test R,R -> delete second (P150). already. */
+
+    /* P217: not R / not R -> delete (P23). already. */
+
+    /* P218: fld st(0) written as "fld st" / fst st -> store without pop
+     *  then ... harder. */
+
+    /* P219: faddp / when preceded by fldz - skip (IEEE -0). */
+
+    /* P220: xchg R,R already P126. */
+
+    /* P221: rep nop / pause pairs - skip (sync). */
+
+    /* P222: mov R, R64 with eax form: covered by width-aware P1. */
+
+    /* P223: lea R, [R*1] -> delete or mov - scale 1 with no base rare. */
+
+    /* P224: sub R, R / jz L is zero test - leave. */
+
+    /* P225: or R, R is test-like for TP; flags same as test if only ZF/SF/PF
+     *  needed - already used as test substitute. */
+
+    /* P226 (v2.22 REMOVED): shadowed by C rule P3. */
+
+    /* P227: pushfd / popfd (386+) */
+    { 2, 227,
+      { { "pushfd", 0, AN_, AN_, 0 },
+        { "popfd",  0, AN_, AN_, 0 } },
+      PRE_CPU_386,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "pushfd / popfd -> delete both", NULL },
+
+    /* P228: pushfq / popfq (x64) */
+    { 2, 228,
+      { { "pushfq", 0, AN_, AN_, 0 },
+        { "popfq",  0, AN_, AN_, 0 } },
+      PRE_CPU_X64,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "pushfq / popfq -> delete both", NULL },
+
+    /* P229: sti / cli not invertible safely (IRQ window). skip. */
+
+    /* P230: cld / cld -> cld */
+    { 2, 230,
+      { { "cld", 0, AN_, AN_, 0 },
+        { "cld", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cld / cld -> cld", NULL },
+
+    /* P231: std / std -> std */
+    { 2, 231,
+      { { "std", 0, AN_, AN_, 0 },
+        { "std", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "std / std -> std", NULL },
+
+    /* P232: fldz / fmulp -> delete both (*0 under IEEE may yield -0).
+     *  WITHDRAWN as unsafe for sign-of-zero. */
+
+    /* P233: fabs / fchs / fabs -> fabs (abs(neg(abs(x)))=abs(x)) needs MAXPAT3 */
+    { 3, 233,
+      { { "fabs", 0, AN_, AN_, 0 },
+        { "fchs", 0, AN_, AN_, 0 },
+        { "fabs", 0, AN_, AN_, 0 } },
+      PRE_FPU,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      
+"fabs / fchs / fabs -> fabs", NULL },
+
+    /* ---- v2.13: -Ox aggressive + MMX/SSE/3DNow + 386/Pentium ---- */
+
+    /* P240 (-Ox): mov R, MEM / ALU S,R -> ALU S,MEM for ANY mem
+     *  (not only stack).  Risk: MMIO double-read semantics differ if
+     *  something else observed the load; adjacent pair is usually safe. */
+    { 2, 240,
+      { { "mov", 0, RR_('a'), ME_, 2 },
+        { NULL, OC_ARITH, RR_('b'), SM_('a'), 2 } },
+      PRE_AGGRESSIVE | PRE_REG_DEAD_RA | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "$op1 $b, $m0" } },
+      "(-Ox) load fold into ALU (any mem)", NULL },
+
+    /* P241 (v2.19 REMOVED): "fldz / fmulp -> delete" was an
+     *  UNCONDITIONAL MISCOMPILATION.  fldz pushes +0.0, fmulp
+     *  computes ST(1) = ST(1) * ST(0) then pops.  The result is
+     *  ST(1) = X * 0 = +/-0 (or NaN for Inf), NOT X.  Deleting
+     *  both leaves X unchanged -- wrong for every nonzero X.
+     *  The developer conflated this with P206 (fld1/fmulp -> delete,
+     *  which IS sound because X*1 = X).  The withdrawn P232 already
+     *  documented this pattern as unsafe, yet P241 reimplemented it.
+     *  rname[241] kept as documentation. */
+
+    /* P242: movq MM, MM same -> delete (MMX move to self). */
+    { 1, 242,
+      { { "movq", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "movq MM,MM -> delete", NULL },
+
+    /* P243: movd MM, MM same - movd is 32-bit; still noop if same. */
+    { 1, 243,
+      { { "movd", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "movd R,R -> delete", NULL },
+
+    /* P244: pxor MM,MM is zero idiom - leave (not delete).
+     *  por MM,MM / pand MM,MM -> delete (identity). */
+    { 1, 244,
+      { { "por", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "por MM,MM -> delete (identity)", NULL },
+
+    /* P245: pand MM,MM -> delete */
+    { 1, 245,
+      { { "pand", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "pand MM,MM -> delete (identity)", NULL },
+
+    /* P246: pandn MM,MM -> zero (result 0) - rewrite to pxor MM,MM */
+    { 1, 246,
+      { { "pandn", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_REW, "pxor $a, $a" } },
+      "pandn MM,MM -> pxor MM,MM", NULL },
+
+    /* P247: SSE movaps xmm,xmm / movups same */
+    { 1, 247,
+      { { "movaps", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "movaps XMM,XMM -> delete", NULL },
+
+    /* P248: movups XMM,XMM -> delete */
+    { 1, 248,
+      { { "movups", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "movups XMM,XMM -> delete", NULL },
+
+    /* P249: movapd / movsd scalar */
+    { 1, 249,
+      { { "movapd", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "movapd XMM,XMM -> delete", NULL },
+
+    /* P250: xorps XMM,XMM / xorpd - zero idioms kept.
+     *  orps XMM,XMM identity -> delete */
+    { 1, 250,
+      { { "orps", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "orps XMM,XMM -> delete", NULL },
+
+    /* P251: andps XMM,XMM -> delete */
+
+    /* P266: andps already P251; paddd MM,MM is NOT identity (2x).
+     *  psubd MM,MM -> zero: rewrite to pxor (MMX) */
+    { 1, 266,
+      { { "psubd", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_REW, "pxor $a, $a" } },
+      "psubd MM,MM -> pxor MM,MM", NULL },
+
+    /* P267: psubw / psubb same */
+    { 1, 267,
+      { { "psubw", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_REW, "pxor $a, $a" } },
+      "psubw MM,MM -> pxor MM,MM", NULL },
+
+    /* P268: psubb MM,MM -> pxor */
+    { 1, 268,
+      { { "psubb", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_REW, "pxor $a, $a" } },
+      "psubb MM,MM -> pxor MM,MM", NULL },
+
+    /* P269: lfence / lfence */
+    { 2, 269,
+      { { "lfence", 0, AN_, AN_, 0 },
+        { "lfence", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "lfence / lfence -> lfence", NULL },
+
+    /* P270: mfence / mfence */
+    { 2, 270,
+      { { "mfence", 0, AN_, AN_, 0 },
+        { "mfence", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mfence / mfence -> mfence", NULL },
+
+    /* P271: nop / nop -> delete second (any CPU) */
+    { 2, 271,
+      { { "nop", 0, AN_, AN_, 0 },
+        { "nop", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "nop / nop -> delete second", NULL },
+
+    /* P272: xchg ax,ax is the classic 1-byte NOP; same-reg xchg
+     *  already P126.  Covered. */
+
+    /* P273 (v2.19 REMOVED): redundant with P240 (OC_ARITH covers cmp). */
+
+    /* P274 (-Ox): mov R,MEM / test R,R -> cmp MEM,0 when AF dead.
+     *  v2.19: kept in -Ox for arbitrary mem (size-prefix risk:
+     *  cmp [mem],0 defaults to byte on MASM without explicit size).
+     *  The stack-mem variant P397 below is always-on and emits the
+     *  size prefix from R's captured width. */
+    { 2, 274,
+      { { "mov", 0, RR_('a'), ME_, 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 } },
+      PRE_AGGRESSIVE | PRE_REG_DEAD_RA | PRE_FLAGS_DEAD_AF | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "cmp $m0, 0" } },
+      "(-Ox) mov R,MEM / test R,R -> cmp MEM,0", NULL },
+
+    /* P275 (v2.22 REMOVED): shadowed by C rule P20. */
+
+    /* P276: lea R, [R+0] / lea R,[R] already C P124. */
+
+    /* P277 (-Ox): push MEM / pop R -> mov R, MEM (R not SP).
+     *  Stack traffic removed; MEM read once.  Size win varies. */
+    { 2, 277,
+      { { "push", 0, ME_, AN_, 1 },
+        { "pop",  0, RR_('a'), AN_, 1 } },
+      PRE_AGGRESSIVE | PRE_NOT_SP,
+      { { ACT_REW, "mov $a, $m0" }, { ACT_DEL, NULL } },
+      "(-Ox) push MEM / pop R -> mov R,MEM", NULL },
+
+    /* P278: bswap R / bswap R already P127. */
+
+    /* P279: xorps XMM,XMM is the SSE zero idiom -- leave it.
+     *  andnps XMM,XMM -> zero via xorps */
+    { 1, 279,
+      { { "andnps", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_REW, "xorps $a, $a" } },
+      "andnps XMM,XMM -> xorps XMM,XMM", NULL },
+
+    /* ---- v2.15: FPC/GCC/LLVM/Agner idioms ---- */
+
+    { 2, 280,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "xor", 0, SM_('a'), SM_('b'), 2 } },
+      0,
+      { { ACT_REW, "xor $a, $a" }, { ACT_DEL, NULL } },
+      "mov R,S / xor R,S -> xor R,R", NULL },
+
+    { 2, 281,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "sub", 0, SM_('a'), SM_('b'), 2 } },
+      PRE_FLAGS_DEAD_AF | PRE_NOT_SP,
+      { { ACT_REW, "xor $a, $a" }, { ACT_DEL, NULL } },
+      "mov R,S / sub R,S -> xor R,R (AF dead)", NULL },
+
+
+
+    { 1, 285,
+      { { "test", 0, RR_('a'), IV_(-1), 2 } },
+      0,
+      { { ACT_REW, "test $a, $a" } },
+      "test R,-1 -> test R,R", NULL },
+
+
+
+
+
+    { 1, 290,
+      { { "minss", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "minss XMM,XMM -> delete", NULL },
+    { 1, 291,
+      { { "maxss", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "maxss XMM,XMM -> delete", NULL },
+    { 1, 292,
+      { { "minps", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "minps XMM,XMM -> delete", NULL },
+    { 1, 293,
+      { { "maxps", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "maxps XMM,XMM -> delete", NULL },
+    { 1, 294,
+      { { "minsd", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "minsd XMM,XMM -> delete", NULL },
+    { 1, 295,
+      { { "maxsd", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "maxsd XMM,XMM -> delete", NULL },
+
+    { 1, 296,
+      { { "subps", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_REW, "xorps $a, $a" } },
+      "subps XMM,XMM -> xorps", NULL },
+    { 1, 297,
+      { { "subpd", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_REW, "xorpd $a, $a" } },
+      "subpd XMM,XMM -> xorpd", NULL },
+    { 1, 298,
+      { { "subss", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_REW, "xorps $a, $a" } },
+      "subss XMM,XMM -> xorps", NULL },
+
+    { 1, 299,
+      { { "pandn", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_REW, "pxor $a, $a" } },
+      "pandn XMM,XMM -> pxor", NULL },
+
+    { 2, 300,
+      { { "stc", 0, AN_, AN_, 0 },
+        { "cmc", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_REW, "clc" }, { ACT_DEL, NULL } },
+      "stc / cmc -> clc", NULL },
+
+    { 2, 301,
+      { { "clc", 0, AN_, AN_, 0 },
+        { "cmc", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_REW, "stc" }, { ACT_DEL, NULL } },
+      "clc / cmc -> stc", NULL },
+
+
+    { 2, 306,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "mov", 0, SM_('a'), IV_(0), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "xor R,R / mov R,0 -> delete mov", NULL },
+
+    { 2, 307,
+      { { "mov", 0, RR_('a'), IV_(0), 2 },
+        { "xor", 0, SM_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "mov R,0 / xor R,R -> keep xor", NULL },
+
+    /* P308-P310 (v2.19 REMOVED): redundant with P240 (OC_ARITH covers
+     *  or/and/xor).  The -Ox P240 rule already folds these for any
+     *  memory operand; the stack-mem variant P396 below is always-on. */
+
+    { 2, 311,
+      { { "femms", 0, AN_, AN_, 0 },
+        { "femms", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "femms / femms -> femms", NULL },
+
+    { 2, 312,
+      { { "pause", 0, AN_, AN_, 0 },
+        { "pause", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "pause / pause -> pause", NULL },
+
+    { 2, 313,
+      { { "ud2", 0, AN_, AN_, 0 },
+        { "ud2", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "ud2 / ud2 -> ud2", NULL },
+
+    { 2, 314,
+      { { "int3", 0, AN_, AN_, 0 },
+        { "int3", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "int3 / int3 -> int3", NULL },
+
+    /* ---- v2.16: kept after redundancy purge ---- */
+
+    /* P316 (v2.22 REMOVED): shadowed by C rule P24 (same conditions). */
+
+    /* P321 (v2.22 REMOVED): shadowed by C rule P19. */
+
+    /* P323/P324: shl/sal R,1 -> lea (no flags) when flags dead.
+     *  Complements P143 (add R,R -> shl); multi-pass yields lea.
+     *  v2.17: gated by p323_lea_rr_check -- "lea R,[R+R]" needs the
+     *  SIB byte (386+) and a 32/64-bit register.  On 16-bit code
+     *  "lea ax,[ax+ax]" is an assembler error, so the old rule broke
+     *  4VIEW's real-mode build.  8/16-bit shl R,1 stays intact. */
+    { 1, 323,
+      { { "shl", 0, RR_('a'), IV_(1), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_REW, "lea $a, [$a+$a]" } },
+      "shl R,1 -> lea R,[R+R] (flags dead, 386+ 32/64-bit)", p323_lea_rr_check },
+    { 1, 324,
+      { { "sal", 0, RR_('a'), IV_(1), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_REW, "lea $a, [$a+$a]" } },
+      "sal R,1 -> lea R,[R+R] (flags dead, 386+ 32/64-bit)", p323_lea_rr_check },
+
+    /* P326/P327: after mov R,S the and/or R,S is value-nop */
+    { 2, 326,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "and", 0, SM_('a'), SM_('b'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,S / and R,S -> delete and (flags dead)", NULL },
+    { 2, 327,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "or", 0, SM_('a'), SM_('b'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,S / or R,S -> delete or (flags dead)", NULL },
+
+    /* P329 (v2.18 REMOVED): "and R,R -> test R,R" was completely
+     *  shadowed by the C rule P8, which handles or/and R,R (any
+     *  width, including all-ones masks) and now `continue`s after
+     *  rewriting, so the table rule could never fire.  rname[329]
+     *  kept as documentation. */
+
+    /* ---- v2.17: gaps from real ASM / FPC / GCC / LLVM analysis ---- */
+
+    /* P332 (v2.18 REMOVED): "or R,R -> test R,R" was completely
+     *  shadowed by the C rule P8 (same reason as P329 above).
+     *  rname[332] kept as documentation. */
+
+    /* P333: xor R,R / cmp R,0 -> delete cmp (AF dead).
+     *  xor sets ZF/SF/PF for R==0; cmp R,0 repeats them AND sets AF=0.
+     *  xor leaves AF undefined.  v2.22: needs PRE_FLAGS_DEAD_AF (daa/
+     *  das/aaa/aas/pushf/lahf read AF and would get a different value). */
+    { 2, 333,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "cmp", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_AF,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "xor R,R / cmp R,0 -> delete cmp (AF dead)", NULL },
+
+    /* P334: xor R,R / cmp R,R -> delete cmp (AF dead, same as P333). */
+    { 2, 334,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "cmp", 0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_AF,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "xor R,R / cmp R,R -> delete cmp (AF dead)", NULL },
+
+    /* P335: mov R,0 / cmp S,R -> cmp S,0 when R dead (saves the zero reg) */
+    { 2, 335,
+      { { "mov", 0, RR_('a'), IV_(0), 2 },
+        { "cmp", 0, RR_('b'), SM_('a'), 2 } },
+      PRE_REG_DEAD_RA | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "cmp $b, 0" } },
+      "mov R,0 / cmp S,R -> cmp S,0 (R dead)", NULL },
+
+    /* P336: xor R,R / cmp S,R -> cmp S,0 when R dead (xor is zeroing) */
+    { 2, 336,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "cmp", 0, RR_('b'), SM_('a'), 2 } },
+      PRE_REG_DEAD_RA | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "cmp $b, 0" } },
+      "xor R,R / cmp S,R -> cmp S,0 (R dead)", NULL },
+
+    /* P337: mov R,0 / test S,R -> test S,S? No - test S,0.
+     *  test S,R with R=0 is test S,0. */
+    { 2, 337,
+      { { "mov", 0, RR_('a'), IV_(0), 2 },
+        { "test", 0, RR_('b'), SM_('a'), 2 } },
+      PRE_REG_DEAD_RA | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "test $b, 0" } },
+      "mov R,0 / test S,R -> test S,0 (R dead)", NULL },
+
+    /* P338: xor R,R / test S,R -> test S,0 (R dead) */
+    { 2, 338,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "test", 0, RR_('b'), SM_('a'), 2 } },
+      PRE_REG_DEAD_RA | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "test $b, 0" } },
+      "xor R,R / test S,R -> test S,0 (R dead)", NULL },
+
+    /* P339: push 0 / pop R -> xor R,R when flags dead
+     *  (or mov R,0 if flags live — xor preferred when dead) */
+    { 2, 339,
+      { { "push", 0, IV_(0), AN_, 1 },
+        { "pop",  0, RR_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_REW, "xor $a, $a" }, { ACT_DEL, NULL } },
+      "push 0 / pop R -> xor R,R (flags dead)", NULL },
+
+    /* P340 (v2.22 REMOVED): "push 0 / pop R -> mov R,0" was a size
+     *  regression for 32-bit R (push imm8 + pop = 3 bytes vs
+     *  mov R32,0 = 5 bytes).  P46 (C rule) handles this correctly
+     *  with a size gate.  rname[340] kept as doc. */
+
+    /* P341/P342 (v2.19 REMOVED): redundant with P240 (OC_ARITH covers
+     *  add/sub).  Same rationale as P308-P310 above. */
+
+    /* ---- v2.19: LLVM optimizeCompare-style + cleanup ---- */
+
+    /* P345 (v2.22 REMOVED): shadowed by C rule P19. */
+
+    /* P346 (v2.22 REMOVED): shadowed by C rule P19. */
+
+    /* P347: mov R,S / cmp R,S -> cmp R,R or delete cmp? After mov, R==S
+     *  so cmp R,S is cmp equal -> always ZF.  Rewrite useless unless
+     *  flags needed as always-equal.  Safer: cmp R,R (same), or if
+     *  flags dead delete both cmp. */
+    { 2, 347,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "cmp", 0, SM_('a'), SM_('b'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,S / cmp R,S -> delete cmp (flags dead)", NULL },
+
+    /* P348: mov R,S / test R,S -> test R,R (equal operands) */
+    { 2, 348,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "test", 0, SM_('a'), SM_('b'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_REW, "test $a, $a" } },
+      "mov R,S / test R,S -> test R,R", NULL },
+
+    /* P349 (v2.22 REMOVED): shadowed by C rule P22. */
+
+    /* P350 (v2.22 REMOVED): shadowed by C rule P22. */
+
+    /* ---- v2.17: width-specific all-ones masks (0FFh / 0FFFFh) ----
+     *  v2.18: P390/P391/P394/P395 were removed because the C rules
+     *  P8 (and R,all-ones -> delete/test, any width) and P37
+     *  (xor R,all-ones -> not, unsigned notation) already handle
+     *  these patterns and fire first with `continue`.  Only P392/P393
+     *  (or R,all-ones -> mov) survive, because no C rule covers the
+     *  unsigned all-ones OR (P60 only checks signed -1). */
+
+    /* P392: or R8, 0FFh -> mov R8, 0FFh (flags dead).  OR with
+     *  all-ones forces the register to 0FFh; MOV sets it directly
+     *  without touching flags.  Size-neutral on 8086 (both 3 bytes)
+     *  but breaks the false dependency on the old value. */
+    { 1, 392,
+      { { "or", 0, R_('a', RC_8), IV_(255), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, $K" } },
+      "or R8,0FFh -> mov R8,0FFh (flags dead)", NULL },
+
+    /* P393: or R16, 0FFFFh -> mov R16, 0FFFFh (flags dead).
+     *  Complements P60 (which handles the signed -1 form). */
+    { 1, 393,
+      { { "or", 0, R_('a', RC_16), IV_(65535), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, $K" } },
+      "or R16,0FFFFh -> mov R16,0FFFFh (flags dead)", NULL },
+
+    /* ---- v2.19: always-on stack-memory load folds ----
+     *  Stack memory ([bp/ebp/rbp±N]) is provably non-MMIO: it's the
+     *  function's own local frame.  The load-fold family (P240/P274/
+     *  P277) was -Ox only for arbitrary memory because of the MMIO
+     *  double-read risk; these clones fire always-on for stack mem.
+     *  PRE_STACK_MEM_0 is implemented by is_stack_mem_operand() which
+     *  rejects everything that isn't [bp/ebp/rbp±N]. */
+
+    /* P396: mov R,[bp+N] / ALU S,R -> ALU S,[bp+N] (R dead, stack mem).
+     *  Always-on version of P240 for stack-frame locals. */
+    { 2, 396,
+      { { "mov", 0, RR_('a'), ME_, 2 },
+        { NULL, OC_ARITH, RR_('b'), SM_('a'), 2 } },
+      PRE_STACK_MEM_0 | PRE_REG_DEAD_RA | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "$op1 $b, $m0" } },
+      "load fold into ALU (stack mem)", NULL },
+
+    /* P397: push [bp+N] / pop R -> mov R,[bp+N] (R not SP, stack mem).
+     *  Always-on version of P277. */
+    { 2, 397,
+      { { "push", 0, ME_, AN_, 1 },
+        { "pop",  0, RR_('a'), AN_, 1 } },
+      PRE_STACK_MEM_0 | PRE_NOT_SP,
+      { { ACT_REW, "mov $a, $m0" }, { ACT_DEL, NULL } },
+      "push [bp+N] / pop R -> mov R,[bp+N] (stack mem)", NULL },
+
+    /* ---- v2.20: SSE2 identity operations (research: Intel SDM
+     *  Vol.2; Agner Fog optimizing_assembly; LLVM X86InstrSSE.td).
+     *  These are the SSE2 (128-bit XMM) counterparts of rules that
+     *  already exist for MMX (64-bit MM) and SSE (32-bit XMM scalar).
+     *  All are exact: SIMD instructions do not touch the integer
+     *  status flags, so no flag scan is needed. */
+
+    /* P398: movq XMM,XMM -> delete (SSE2 move-to-self).  P242
+     *  covers only the MMX form (movq mm,mm). */
+    { 1, 398,
+      { { "movq", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "movq XMM,XMM -> delete", NULL },
+
+    /* P399: movdqa XMM,XMM -> delete (SSE2 aligned move).  P249
+     *  covers movapd; movdqa/movdqu are the integer equivalents. */
+    { 1, 399,
+      { { "movdqa", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "movdqa XMM,XMM -> delete", NULL },
+
+    /* P400: movdqu XMM,XMM -> delete (SSE2 unaligned move). */
+    { 1, 400,
+      { { "movdqu", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "movdqu XMM,XMM -> delete", NULL },
+
+    /* P401: por XMM,XMM -> delete (SSE2 packed OR identity).
+     *  P244 covers only the MMX form. */
+    { 1, 401,
+      { { "por", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "por XMM,XMM -> delete (identity)", NULL },
+
+    /* P402: pand XMM,XMM -> delete (SSE2 packed AND identity).
+     *  P245 covers only the MMX form. */
+    { 1, 402,
+      { { "pand", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "pand XMM,XMM -> delete (identity)", NULL },
+
+    /* P403: pandn XMM,XMM -> pxor XMM,XMM (SSE2 packed AND-NOT
+     *  of self = zero).  P246/P299 cover the MMX form. */
+    { 1, 403,
+      { { "pandn", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_REW, "pxor $a, $a" } },
+      "pandn XMM,XMM -> pxor XMM,XMM", NULL },
+
+    /* P404: psubb/psubw/psubd XMM,XMM -> pxor XMM,XMM (SSE2 packed
+     *  subtract of self = zero).  P266/P267/P268 cover the MMX form. */
+    { 1, 404,
+      { { "psubb", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_REW, "pxor $a, $a" } },
+      "psubb XMM,XMM -> pxor XMM,XMM", NULL },
+    { 1, 405,
+      { { "psubw", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_REW, "pxor $a, $a" } },
+      "psubw XMM,XMM -> pxor XMM,XMM", NULL },
+    { 1, 406,
+      { { "psubd", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_REW, "pxor $a, $a" } },
+      "psubd XMM,XMM -> pxor XMM,XMM", NULL },
+
+    /* P407: orpd XMM,XMM -> delete (SSE2 packed double OR identity).
+     *  P250 covers orps (single precision). */
+    { 1, 407,
+      { { "orpd", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "orpd XMM,XMM -> delete (identity)", NULL },
+
+    /* P408: andpd XMM,XMM -> delete (SSE2 packed double AND identity). */
+    { 1, 408,
+      { { "andpd", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "andpd XMM,XMM -> delete (identity)", NULL },
+
+    /* P409: andnpd XMM,XMM -> xorpd XMM,XMM (AND-NOT of self = zero).
+     *  P279 covers andnps (single precision). */
+    { 1, 409,
+      { { "andnpd", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_REW, "xorpd $a, $a" } },
+      "andnpd XMM,XMM -> xorpd XMM,XMM", NULL },
+
+    /* P410: addps/addpd/addss/addsd XMM,XMM -> could double the value,
+     *  NOT an identity (x + x = 2x ≠ x).  Leave.  Not implemented. */
+
+    /* P411: xorpd/xorps XMM,XMM is the zero idiom -- leave it (like
+     *  pxor).  Already documented at P244 comment.  Not deleted. */
+
+    /* ---- v2.23: new table rules from audit ---- */
+
+    /* P418: leave / leave -> leave (idempotent: restores BP and SP
+     *  from the same BP, so the second is a no-op).  Exact, no flags. */
+    { 2, 418,
+      { { "leave", 0, AN_, AN_, 0 },
+        { "leave", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "leave / leave -> leave", NULL },
+
+    /* P419: xchg R,S / xchg R,S -> delete both (same pair, either
+     *  order).  Two swaps restore everything; xchg touches no flags.
+     *  P14 was documented since v1.30 but never implemented. */
+    { 2, 419,
+      { { "xchg", 0, RR_('a'), RR_('b'), 2 },
+        { "xchg", 0, SM_('a'), SM_('b'), 2 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "xchg R,S / xchg R,S -> delete both", NULL },
+    /* Also match xchg S,R / xchg S,R (swapped operand order) */
+    { 2, 419,
+      { { "xchg", 0, RR_('a'), RR_('b'), 2 },
+        { "xchg", 0, SM_('b'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "xchg R,S / xchg S,R -> delete both", NULL },
+
+    /* P420: mov R,S / xchg R,S -> delete xchg (R already = S).
+     *  mov touches no flags; xchg touches no flags.  Exact. */
+    { 2, 420,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "xchg", 0, SM_('a'), SM_('b'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,S / xchg R,S -> delete xchg", NULL },
+
+    /* P421: nop -> delete (single nop is always safe to remove:
+     *  no register, no memory, no flags.  Only delete when the line
+     *  has no label — a labeled nop might be a jump target.) */
+    { 1, 421,
+      { { "nop", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "nop -> delete (single, no label)", NULL },
+
+    /* ---- v2.23: migrated from C to table ---- */
+
+    /* P11 (v2.23): cmp R,0 -> test R,R (AF dead).  cmp R,0 sets AF=0;
+     *  test leaves AF undefined.  All other flags identical. */
+    { 1, 11,
+      { { "cmp", 0, RR_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_AF,
+      { { ACT_REW, "test $a, $a" } },
+      "cmp R,0 -> test R,R (AF dead)", NULL },
+
+    /* P71 (v2.23): sub R,R -> xor R,R (AF dead, not SP).  Both write
+     *  R=0 and clear CF/OF, set SF=0/ZF=1/PF=1; only AF differs.
+     *  FPC Sub2Xor; GCC canonical R=0 to xor. */
+    { 1, 71,
+      { { "sub", 0, RR_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_AF | PRE_NOT_SP,
+      { { ACT_REW, "xor $a, $a" } },
+      "sub R,R -> xor R,R (AF dead)", NULL },
+
+    /* ---- v2.24: migrated from C to table ---- */
+
+    /* P10 (v2.24): add/sub R,1 / R,-1 -> inc/dec R (CF dead).
+     *  4 table entries for the 4 operand combinations. */
+    { 1, 10,
+      { { "add", 0, RR_('a'), IV_(1), 2 } },
+      PRE_FLAGS_DEAD_CF,
+      { { ACT_REW, "inc $a" } },
+      "add R,1 -> inc R (CF dead)", NULL },
+    { 1, 10,
+      { { "add", 0, RR_('a'), IV_(-1), 2 } },
+      PRE_FLAGS_DEAD_CF,
+      { { ACT_REW, "dec $a" } },
+      "add R,-1 -> dec R (CF dead)", NULL },
+    { 1, 10,
+      { { "sub", 0, RR_('a'), IV_(1), 2 } },
+      PRE_FLAGS_DEAD_CF,
+      { { ACT_REW, "dec $a" } },
+      "sub R,1 -> dec R (CF dead)", NULL },
+    { 1, 10,
+      { { "sub", 0, RR_('a'), IV_(-1), 2 } },
+      PRE_FLAGS_DEAD_CF,
+      { { ACT_REW, "inc $a" } },
+      "sub R,-1 -> inc R (CF dead)", NULL },
+
+    /* P48 (v2.24): xor R,R / test R,R -> delete test.
+     *  After xor, R=0 and flags are ZF=1/SF=0/PF=1/CF=0/OF=0.
+     *  test R,R on R=0 produces identical flags.  Exact, no scan. */
+    { 2, 48,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "xor R,R / test R,R -> delete test", NULL },
+
+    /* P65 (v2.24): dec R / cmp R,-1 -> delete cmp (all flags dead).
+     *  After dec, ZF reflects R_new==0; cmp R_new,-1 sets ZF iff
+     *  R_new==-1.  These DIFFER, so ALL six flags must be dead. */
+    { 2, 65,
+      { { "dec", 0, RR_('a'), AN_, 1 },
+        { "cmp", 0, SM_('a'), IV_(-1), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "dec R / cmp R,-1 -> delete cmp (flags dead)", NULL },
+
+    /* P93 (v2.24): xor R,R / mov R,K -> delete xor.
+     *  xor defines all six flags; mov defines none; the flags die
+     *  in the zero-instruction gap.  Exact (no scan needed). */
+    { 2, 93,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "mov", 0, SM_('a'), IM_, 2 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "xor R,R / mov R,K -> delete xor", NULL },
+
+    /* ---- v2.25: migrated P21 + new rules ---- */
+
+    /* P21 (v2.25): dup flag ops -> delete second.  6 table entries
+     *  for cld/std/cli/sti/clc/stc.  Each is idempotent (same flag
+     *  bit, same value, nothing between). */
+    { 2, 21, { { "cld", 0, AN_, AN_, 0 }, { "cld", 0, AN_, AN_, 0 } },
+      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cld / cld -> cld", NULL },
+    { 2, 21, { { "std", 0, AN_, AN_, 0 }, { "std", 0, AN_, AN_, 0 } },
+      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "std / std -> std", NULL },
+    { 2, 21, { { "cli", 0, AN_, AN_, 0 }, { "cli", 0, AN_, AN_, 0 } },
+      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cli / cli -> cli", NULL },
+    { 2, 21, { { "sti", 0, AN_, AN_, 0 }, { "sti", 0, AN_, AN_, 0 } },
+      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "sti / sti -> sti", NULL },
+    { 2, 21, { { "clc", 0, AN_, AN_, 0 }, { "clc", 0, AN_, AN_, 0 } },
+      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "clc / clc -> clc", NULL },
+    { 2, 21, { { "stc", 0, AN_, AN_, 0 }, { "stc", 0, AN_, AN_, 0 } },
+      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "stc / stc -> stc", NULL },
+
+    /* P422 (v2.25): sahf / sahf -> sahf.  SAHF loads flags from AH;
+     *  two in a row load the same flags from the same AH.  Exact. */
+    { 2, 422,
+      { { "sahf", 0, AN_, AN_, 0 },
+        { "sahf", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "sahf / sahf -> sahf", NULL },
+
+    /* P423 (v2.25): mov al, [mem] / cbw -> movsx ax, byte ptr [mem].
+     *  Wait — this is P31 which already exists.  Skip. */
+
+    /* P424 (v2.25): movzx R, R (same reg, same width) -> delete.
+     *  movzx R, R where both operands are the same register and
+     *  same width is identity (zero-extension of already-correct
+     *  width = no-op).  Exact. */
+    { 1, 424,
+      { { "movzx", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "movzx R,R (same reg+width) -> delete", NULL },
+
+    /* P425 (v2.25): movsx R, R (same reg, same width) -> delete.
+     *  Same as P424 for movsx.  Only fires when width matches,
+     *  meaning the source already fills the destination — sign-
+     *  extension of a full-width source is identity. */
+    { 1, 425,
+      { { "movsx", 0, RR_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL } },
+      "movsx R,R (same reg+width) -> delete", NULL },
+
+    /* ---- v2.26: migrated P28 + new rules ---- */
+
+    /* P28 (v2.26): dup sign-extend -> delete second.  8 entries
+     *  for cbw/cwde/cwd/cdq and AT&T cbtw/cwtl/cwtd/cltd.  Each
+     *  is idempotent (re-derives same high half, no flags). */
+    { 2, 28, { { "cbw", 0, AN_, AN_, 0 }, { "cbw", 0, AN_, AN_, 0 } },
+      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cbw / cbw -> cbw", NULL },
+    { 2, 28, { { "cwde", 0, AN_, AN_, 0 }, { "cwde", 0, AN_, AN_, 0 } },
+      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cwde / cwde -> cwde", NULL },
+    { 2, 28, { { "cwd", 0, AN_, AN_, 0 }, { "cwd", 0, AN_, AN_, 0 } },
+      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cwd / cwd -> cwd", NULL },
+    { 2, 28, { { "cdq", 0, AN_, AN_, 0 }, { "cdq", 0, AN_, AN_, 0 } },
+      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cdq / cdq -> cdq", NULL },
+    { 2, 28, { { "cbtw", 0, AN_, AN_, 0 }, { "cbtw", 0, AN_, AN_, 0 } },
+      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cbtw / cbtw -> cbtw", NULL },
+    { 2, 28, { { "cwtl", 0, AN_, AN_, 0 }, { "cwtl", 0, AN_, AN_, 0 } },
+      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cwtl / cwtl -> cwtl", NULL },
+    { 2, 28, { { "cwtd", 0, AN_, AN_, 0 }, { "cwtd", 0, AN_, AN_, 0 } },
+      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cwtd / cwtd -> cwtd", NULL },
+    { 2, 28, { { "cltd", 0, AN_, AN_, 0 }, { "cltd", 0, AN_, AN_, 0 } },
+      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cltd / cltd -> cltd", NULL },
+
+    /* P428 (v2.26): lea R,[R+R] -> add R,R (flags dead, 386+).
+     *  P41 requires R != S; this covers the same-register case.
+     *  lea is 3 bytes on 386+; add R,R is 2 bytes.  1 byte save.
+     *  lea touches no flags; add sets all six.  Need F_ALL6 dead. */
+    { 1, 428,
+      { { "lea", 0, RR_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_REW, "add $a, $a" } },
+      "lea R,[R+R] -> add R,R (flags dead)", p323_lea_rr_check },
+
+    /* P429 (v2.26): mov R,S / push R -> push S (R dead, S != R).
+     *  After mov, R == S.  Pushing S gives the same value.
+     *  Saves the mov instruction.  R must be dead after push.
+     *  v2.26 note: PRE_REG_DEAD_RA uses reg_dead_cf which treats
+     *  AX/DX as live-out at ret (return value).  So this won't
+     *  fire when the next instruction after push is ret and R is
+     *  AX/DX — that's correct (R might hold the return value).
+     *  It WILL fire when R is a non-AX/DX register, or when the
+     *  code after push is not ret.  No flags involved. */
+    { 2, 429,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "push", 0, SM_('a'), AN_, 1 } },
+      PRE_REG_DEAD_RA | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "push $b" } },
+      "mov R,S / push R -> push S (R dead)", NULL },
+
+    /* ---- v2.24: 3 new rules from the research list ---- */
+
+    /* P430 (v2.24): "or R,c1 / and R,c2 / or R,c3" 3-op chain.
+     *  When (c1 & c2) ⊆ c3, every bit the first OR forces to 1 that
+     *  the AND keeps is re-forced by the last OR, so the first OR is
+     *  redundant and can be deleted.  Final value with OR1:
+     *  (R & c2) | (c1 & c2) | c3; without OR1: (R & c2) | c3;
+     *  diff = (c1 & c2) & ~c3, which must be 0.  No flag scan: the
+     *  deleted OR is label-free adjacent to the AND, which overwrites
+     *  all six status flags before reading any.  Catches the case
+     *  P62b misses: P62b only fires when c2 ⊆ c1 (collapsing the
+     *  whole pair to a mov); P430 fires when c2 ⊄ c1 but the
+     *  overlapping-mask condition (c1 & c2) ⊆ c3 still lets the
+     *  first OR go.  Research: Open Watcom peepopt.c AndOr/OrAnd
+     *  family extended to the 3-op chain. */
+    { 3, 430,
+      { { "or",  0, RR_('a'), IM_, 2 },
+        { "and", 0, SM_('a'), IM_, 2 },
+        { "or",  0, SM_('a'), IM_, 2 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL }, { ACT_KEEP, NULL } },
+      "or R,c1 / and R,c2 / or R,c3 -> delete or1 (c1&c2⊆c3)", p430_or_and_or_check },
+
+    /* P431 (v2.25 refactor M8): "mov R8lo, 0 / mov R8hi, 0 -> xor R16, R16"
+     *  where R8lo and R8hi are the low and high byte of the same
+     *  8-bit register family (AL+AH -> AX, CL+CH -> CX, DL+DH -> DX,
+     *  BL+BH -> BX).  Both movs together set the whole 16-bit parent
+     *  to 0; a single "xor R16, R16" does the same in 2 bytes vs the
+     *  4 bytes of two byte-sized mov imm8.  xor defines all six
+     *  status flags; the two movs define none; PRE_FLAGS_DEAD_ALL
+     *  proves the difference is unobservable.  R16 is not SP (cap['a']
+     *  is an 8-bit reg, AX/CX/DX/BX family), so PRE_NOT_SP is not
+     *  required.  The rewrite uses $a16, which resolves to the 16-bit
+     *  parent regardless of which byte cap['a'] bound (AL -> AX,
+     *  AH -> AX, CL -> CX, etc.).  PRE_INTEL: the $a16 template emits
+     *  Intel-syntax register names without the AT&T "%" prefix.
+     *  v2.25 (M8): the same-family + complementary-lo relationship
+     *  is now expressed directly in the pattern via CLO_('a')
+     *  (OP_COMPLEMENT_LO), so the p431_al_ah_ax_check function is
+     *  gone.  cap_to_regidx inside the matcher refuses families
+     *  that lack an 8-bit form (SP/BP/SI/DI have no byte register),
+     *  so SP exclusion is automatic. */
+    { 2, 431,
+      { { "mov", 0, R_('a', RC_8), IV_(0), 2 },
+        { "mov", 0, CLO_('a'),     IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_INTEL,
+      { { ACT_REW, "xor $a16, $a16" }, { ACT_DEL, NULL } },
+      "mov R8lo,0 / mov R8hi,0 -> xor R16,R16 (flags dead)", NULL },
+
+    /* P432 (v2.25 refactor M1): "movzx R, src / test R, R -> test src, src"
+     *  when R is dead after the test (PRE_REG_DEAD_RA) and SF is dead
+     *  from the test onward (PRE_FLAGS_DEAD_SF).  After the movzx the
+     *  high bits of R are zero, so "test R, R" leaves SF=0; "test src,
+     *  src" leaves SF = MSB of src -- they differ when src is signed-
+     *  negative.  ZF/PF/CF/OF all match exactly (ZF iff src==0; PF on
+     *  low byte = src in both; CF=OF=0 in both); AF is undef in both.
+     *  Only SF needs the dead-flag scan, which is more permissive than
+     *  PRE_FLAGS_DEAD_ALL and lets the rule fire on the common
+     *  "movzx EAX, AL / test EAX, EAX / je L" pattern (je reads only
+     *  ZF, SF is dead).  386+ (movzx encoding); Intel-only.
+     *  v2.25 (M1): the SF-dead scan is now PRE_FLAGS_DEAD_SF instead
+     *  of a p432_movzx_test_check() function -- the rule has no
+     *  custom check function anymore.  The check that R != src
+     *  (to avoid shadowing P424 which deletes "movzx R, R" at the
+     *  same width) is encoded in the pattern: cap 'b' is bound to
+     *  src via RR_('b'), and the rewrite $b only resolves when src
+     *  differs from R; if src == R same width, P424 fires first
+     *  because it's a single-inst rule that runs earlier in the
+     *  table loop.  If src and R are same family but different width
+     *  (e.g. movzx EAX, AL), that's the genuine zero-extension case
+     *  and we DO want to fire -- the pattern allows it because
+     *  RR_('b') doesn't constrain width relative to RR_('a').
+     *  Research: LLVM X86PeepholePass optimizeCompare; GCC i386.md
+     *  combine movzx+test. */
+    { 2, 432,
+      { { "movzx", 0, RR_('a'), RR_('b'), 2 },
+        { "test",  0, SM_('a'),  SM_('a'), 2 } },
+      PRE_CPU_386 | PRE_REG_DEAD_RA | PRE_INTEL | PRE_FLAGS_DEAD_SF,
+      { { ACT_DEL, NULL }, { ACT_REW, "test $b, $b" } },
+      "movzx R,S / test R,R -> test S,S (R dead, SF dead)", NULL },
+
+    /* ---- v2.25: NEW RULES using the M1/M4/M5/M6/M8 table extensions ---- */
+
+    /* P433 (v2.25): "add R, c1 / add R, c2 -> add R, c1+c2" -- the
+     *  constant-fold that P16 documented since v1.30 but never had
+     *  code.  Uses M4 (${K + K1} arithmetic template) to emit the
+     *  folded sum, and a small check (p433_add_fold_check) that
+     *  verifies the sum fits in the dest reg's signed imm range via
+     *  width_imm_limit().  PRE_FLAGS_DEAD_OF: the two half-adds can
+     *  produce a different OF than the single combined add (overflow
+     *  of the intermediate), so OF must be dead; every other flag is
+     *  identical between the two forms (the result R is the same, so
+     *  SF/ZF/PF/CF come out the same; AF too).  Not SP: same
+     *  rationale as P22/P39.  Research: FPC aoptx86 AddAdd2Add. */
+    { 2, 433,
+      { { "add", 0, RR_('a'), IM_, 2 },
+        { "add", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_OF | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "add $a, ${K + K1}" } },
+      "add R,c1 / add R,c2 -> add R,c1+c2 (OF dead, fits)", p433_add_fold_check },
+
+    /* P434 (v2.25): "sub R, c1 / sub R, c2 -> sub R, c1+c2" -- the
+     *  sub cousin of P433.  Two consecutive subs of the same register
+     *  are equivalent to one sub of the sum (R - c1 - c2 == R - (c1+c2)).
+     *  Same OF-dead gate and same fit check.  FPC SubSub2Sub. */
+    { 2, 434,
+      { { "sub", 0, RR_('a'), IM_, 2 },
+        { "sub", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_OF | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "sub $a, ${K + K1}" } },
+      "sub R,c1 / sub R,c2 -> sub R,c1+c2 (OF dead, fits)", p434_sub_fold_check },
+
+    /* P435 (v2.25): "sub R, c1 / add R, c2 -> sub R, c1-c2" -- the
+     *  mixed-sign cousin.  R - c1 + c2 == R - (c1 - c2).  Same
+     *  OF-dead gate; the fit check uses c1-c2 (the sub direction).
+     *  The symmetric "add c1 / sub c2 -> add c1-c2" is its own rule
+     *  (P436 below).  FPC mixed fold. */
+    { 2, 435,
+      { { "sub", 0, RR_('a'), IM_, 2 },
+        { "add", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_OF | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "sub $a, ${K - K1}" } },
+      "sub R,c1 / add R,c2 -> sub R,c1-c2 (OF dead, fits)", p435_sub_add_fold_check },
+
+    /* P436 (v2.25): "add R, c1 / sub R, c2 -> add R, c1-c2" -- the
+     *  mirror of P435.  R + c1 - c2 == R + (c1 - c2).  Reuses the
+     *  fit check with the sub direction.  FPC mixed fold. */
+    { 2, 436,
+      { { "add", 0, RR_('a'), IM_, 2 },
+        { "sub", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_OF | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "add $a, ${K - K1}" } },
+      "add R,c1 / sub R,c2 -> add R,c1-c2 (OF dead, fits)", p435_sub_add_fold_check },
+
+    /* ---- v2.26: migrated from C + new optimizations using M4 ---- */
+
+    /* P44 (v2.26, migrated from C): "xor R,R / inc R -> mov R, 1"
+     *  After xor R,R the register is 0; inc makes it 1; a single
+     *  mov R,1 is exact.  xor defines all six flags, inc defines
+     *  five (preserves CF), the combined mov defines none -- so all
+     *  six flags must be dead.  PRE_NOT_SP: inc preserves CF, but
+     *  an interrupt between xor and inc would push at SP^0 = SP
+     *  (fine), so technically SP is safe here; the gate is kept for
+     *  parity with P45 and the original C rule.  The C code at
+     *  run_pass line ~9388-9392 is now shadowed by this table entry
+     *  and can be removed in a follow-up cleanup. */
+    { 2, 44,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "inc", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "mov $a, 1" } },
+      "xor R,R / inc R -> mov R,1 (flags dead)", NULL },
+
+    /* P45 (v2.26, migrated from C): "xor R,R / dec R -> mov R, -1"
+     *  After xor R,R the register is 0; dec makes it -1; mov R,-1
+     *  is exact.  Same flag discipline as P44. */
+    { 2, 45,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "dec", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "mov $a, -1" } },
+      "xor R,R / dec R -> mov R,-1 (flags dead)", NULL },
+
+    /* P437 (v2.26): "or R,c1 / or R,c2 -> or R, c1|c2" -- OR is
+     *  associative and idempotent: (R | c1) | c2 == R | (c1 | c2).
+     *  The two half-ors produce the same final R and the same
+     *  SF/ZF/PF/CF/OF (CF=OF=0, SF/ZF/PF from the final value);
+     *  only the intermediate flags differ, but the second OR
+     *  overwrites them before any reader.  No flag scan needed:
+     *  the matcher enforces label-free adjacency, so the first
+     *  OR's flags die at the second OR.  PRE_NOT_SP: OR never
+     *  writes SP as destination unless the source is also SP, which
+     *  would be `or sp, imm` -- unusual but the rule is sound for
+     *  it (the result is the same).  Kept for parity with P39/P49.
+     *  Research: FPC OrOr2Or. */
+    { 2, 437,
+      { { "or", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IM_, 2 } },
+      PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "or $a, ${K | K1}" } },
+      "or R,c1 / or R,c2 -> or R,c1|c2 (no scan)", NULL },
+
+    /* P438 (v2.26): "and R,c1 / and R,c2 -> and R, c1&c2" -- AND is
+     *  associative and idempotent: (R & c1) & c2 == R & (c1 & c2).
+     *  Same discipline as P437.  FPC AndAnd2And. */
+    { 2, 438,
+      { { "and", 0, RR_('a'), IM_, 2 },
+        { "and", 0, SM_('a'), IM_, 2 } },
+      PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "and $a, ${K & K1}" } },
+      "and R,c1 / and R,c2 -> and R,c1&c2 (no scan)", NULL },
+
+    /* P439 (v2.26): "xor R,c1 / xor R,c2 -> xor R, c1^c2" when all
+     *  six flags dead.  XOR is associative: (R ^ c1) ^ c2 == R ^
+     *  (c1 ^ c2).  The final R value is identical.  BUT the final
+     *  flags differ: the second xor's SF/ZF/PF reflect R^c1, while
+     *  the collapsed xor's SF/ZF/PF reflect R -- these can differ
+     *  when c1 != 0.  So unlike OR/AND, the flag stream changes and
+     *  all six must be dead.  Not SP: the one-instruction window
+     *  between the two xors would, on an interrupt, push at SP^c1
+     *  -- potentially misaligned; same rationale as P58/P49.
+     *  Research: FPC XorXor2Xor. */
+    { 2, 439,
+      { { "xor", 0, RR_('a'), IM_, 2 },
+        { "xor", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "xor $a, ${K ^ K1}" } },
+      "xor R,c1 / xor R,c2 -> xor R,c1^c2 (flags dead)", NULL },
+
+    /* P40 (v2.26, migrated from C): "mov R, imm1 / {add|sub} R, imm2
+     *  -> mov R, imm1 ± imm2".  FPC's constant-propagation idiom.
+     *  The add/sub defines all six flags, the combined mov defines
+     *  none, so all six must be dead.  p40_mov_add_fold_check
+     *  verifies the total fits the dest reg's signed imm range.
+     *  Two table entries (add and sub) share the check function,
+     *  which distinguishes by g_ppair.mnem.  The C code at run_pass
+     *  line ~9381 is now shadowed and can be removed in a follow-up.
+     *  Research: FPC constant propagation; GCC RTL moveImmediate. */
+    { 2, 40,
+      { { "mov", 0, RR_('a'), IM_, 2 },
+        { "add", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, ${K + K1}" }, { ACT_DEL, NULL } },
+      "mov R,K / add R,K2 -> mov R, K+K2 (flags dead, fits)", p40_mov_add_fold_check },
+    { 2, 40,
+      { { "mov", 0, RR_('a'), IM_, 2 },
+        { "sub", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, ${K - K1}" }, { ACT_DEL, NULL } },
+      "mov R,K / sub R,K2 -> mov R, K-K2 (flags dead, fits)", p40_mov_add_fold_check },
+
+    /* P53 (v2.26, migrated from C): "mov R, imm1 / and R, imm2 ->
+     *  mov R, imm1 & imm2".  Constant fold for AND.  The AND defines
+     *  all six flags, the combined mov defines none, so all six must
+     *  be dead.  No fit check needed: AND only clears bits, so the
+     *  result is always in range (it's ≤ imm1 in magnitude).
+     *  Research: GCC RTL const-and; FPC OptPass1AND. */
+    { 2, 53,
+      { { "mov", 0, RR_('a'), IM_, 2 },
+        { "and", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, ${K & K1}" }, { ACT_DEL, NULL } },
+      "mov R,K / and R,K2 -> mov R, K&K2 (flags dead)", NULL },
+
+    /* P54 (v2.26, migrated from C): "mov R, imm1 / or R, imm2 ->
+     *  mov R, imm1 | imm2".  Constant fold for OR.  Same discipline
+     *  as P53.  Research: GCC RTL const-or. */
+    { 2, 54,
+      { { "mov", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, ${K | K1}" }, { ACT_DEL, NULL } },
+      "mov R,K / or R,K2 -> mov R, K|K2 (flags dead)", NULL },
+
+    /* P55 (v2.26, migrated from C): "mov R, imm1 / xor R, imm2 ->
+     *  mov R, imm1 ^ imm2".  Constant fold for XOR.  Same discipline
+     *  as P53.  Chains: P55 + P9 + P35 (e.g. mov R,0 / xor R,-1 ->
+     *  mov R,-1 -> or R,-1 for 32-bit R).  Research: GCC RTL
+     *  const-xor; FPC OptPass1XOR. */
+    { 2, 55,
+      { { "mov", 0, RR_('a'), IM_, 2 },
+        { "xor", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, ${K ^ K1}" }, { ACT_DEL, NULL } },
+      "mov R,K / xor R,K2 -> mov R, K^K2 (flags dead)", NULL },
+
+    /* ---- v2.26: more migrations + new rules ---- */
+
+    /* P51 (v2.26, migrated from C): "imul R, -1 -> neg R" (186+).
+     *  imul R,-1 computes -R; so does neg.  neg is 2 bytes vs
+     *  imul's 3 bytes.  Conservative: requires all six flags dead
+     *  (CF, OF, AF differ; SF, ZF, PF match).  186+ (two-operand
+     *  imul encoding).  Not SP: neg defines flags differently and
+     *  the one-instruction window matters for interrupt alignment. */
+    { 1, 51,
+      { { "imul", 0, RR_('a'), IV_(-1), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NO_CPU_8086 | PRE_NOT_SP,
+      { { ACT_REW, "neg $a" } },
+      "imul R,-1 -> neg R (flags dead, 186+)", NULL },
+
+    /* P38 K==1 (v2.26, migrated from C): "imul R, 1 -> delete".
+     *  imul R,1 is the identity: R*1 == R.  The only side effect is
+     *  CF/OF (set per the high-half rule), which the precondition
+     *  proves dead.  186+ (two-operand imul).  Not SP for parity
+     *  with P51/P22.  The C code at run_pass ~9057 is now shadowed. */
+    { 1, 38,
+      { { "imul", 0, RR_('a'), IV_(1), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NO_CPU_8086 | PRE_NOT_SP,
+      { { ACT_DEL, NULL } },
+      "imul R,1 -> delete (identity, flags dead, 186+)", NULL },
+
+    /* P59 (v2.26, migrated from C): "and R, 0 -> mov R, 0" (all six
+     *  flags dead).  R & 0 == 0 for every width; `and` defines all
+     *  six flags and `mov` defines none, so the scan proves the
+     *  difference is unobservable.  Chains into P9 (mov 0 -> xor)
+     *  for the real byte win.  [FPC PrePeepholeOptAND "AND 0 -> MOV 0"] */
+    { 1, 59,
+      { { "and", 0, RR_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, 0" } },
+      "and R,0 -> mov R,0 (flags dead)", NULL },
+
+    /* P440 (v2.26): "or R,0 -> delete" when all six flags dead.
+     *  Replaces the REMOVED P111 which was shadowed by C P8.  This
+     *  table entry fires only when the C P8 does NOT fire (which
+     *  happens when P8's preconditions are stricter).  P8 fires
+     *  first with `continue`, so this entry is mostly a safety net.
+     *  However, since P8 was extended in v1.81 to also delete when
+     *  flags are dead, this entry IS shadowed and serves as
+     *  documentation.  Kept for the catalogue. */
+    /* P440 intentionally not added -- fully shadowed by C P8. */
+
+    /* P441 (v2.26): "test R, K / setcc R8" -> "setcc R8" when R is
+     *  dead after the setcc and the flags from the test are the ones
+     *  setcc reads.  After "test R, K", the flags reflect R & K.  If
+     *  K is 0, ZF=1 always, so "setcc" becomes a constant -- but
+     *  that's a different rule.  If K is all-ones (-1 or 0FFh etc.),
+     *  "test R, -1" == "test R, R", and the setcc reads the same
+     *  flags either way.  So "test R, -1 / setcc R8" -> "setcc R8"
+     *  (delete the test) when R is dead after.  Uses M8 (OP_SAME_FAM
+     *  isn't needed; we just need R dead) + M6 (DEAD_CAP).  386+
+     *  (setcc encoding).  Research: LLVM optimizeCompare. */
+    { 2, 441,
+      { { "test", 0, RR_('a'), IV_(-1), 2 },
+        { "set",  0, SWID_('a'), AN_, 1 } },
+      PRE_CPU_386 | PRE_INTEL,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "test R,-1 / setcc R8 -> setcc R8 (R dead, 386+)", NULL,
+      DEAD_CAP_('a') },
+
+    /* P442 (v2.26): "sub R, 1 / sbb R, 0 -> dec R" when CF dead.
+     *  sub R,1 sets CF per the borrow; sbb R,0 reads CF and
+     *  subtracts it from R.  If CF was set by the sub (i.e., R was
+     *  0), sbb subtracts 1 more; if CF was clear (R > 0), sbb is a
+     *  no-op.  Net effect: R - 1 - (R == 0 ? 1 : 0) -- NOT the same
+     *  as dec R.  SKIP.  Documented as considered-and-rejected. */
+    /* P442 intentionally not added -- unsound. */
+
+    /* P443 (v2.26): "add R, 0 / {adc|sbb} R, 0 -> R" when CF dead.
+     *  add R,0 is a no-op on R but sets flags (CF=0 for add).  Then
+     *  adc R,0 / sbb R,0 reads CF (which is 0) and adds/subtracts 0.
+     *  Net: R unchanged, but the pair defines flags.  Delete both
+     *  when all six dead.  Not SP.  [GCC combine add+0/adc+0] */
+    { 2, 443,
+      { { "add", 0, RR_('a'), IV_(0), 2 },
+        { "adc", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "add R,0 / adc R,0 -> delete both (flags dead)", NULL },
+    { 2, 443,
+      { { "sub", 0, RR_('a'), IV_(0), 2 },
+        { "sbb", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "sub R,0 / sbb R,0 -> delete both (flags dead)", NULL },
 
 };
 
 
+
+
 static const int g_nrule_tbl =
     (int)(sizeof(g_rule_tbl) / sizeof(g_rule_tbl[0]));
+
+/* v2.25 (S3): the `smartpp_kept_helpers[]` array and the
+ *  `smartpp_touch_helpers()` shim that lived here are gone.  They
+ *  existed only to silence W202 (unreferenced) on builds where some
+ *  C rule families were #ifdef'd out, but every helper they pinned
+ *  (lea_bracket, lea_two_regs, lea_scaled_single, emit_lea_disp,
+ *  width_imm_limit) is now reached directly from active C rules
+ *  (P17/P41/P47/P63/P70/P82/P124/P382 and the kprop walk), so the
+ *  artificial references were pure dead weight. */
 
 /* initialize the engine's rule pointer.  Called once from main(). */
 static void init_table_rules(void)
@@ -4450,6 +7512,591 @@ static void init_table_rules(void)
  *  END v1.85 TABLE-DRIVEN RULE ENGINE
  * ======================================================================== */
 
+
+/* v2.14: find a scratch register of the given width that is provably
+*  dead from line `after` onward (reg_dead_cf), is not in `avoid`'s
+*  family, is not SP, and is a plain GP register (no x87/MMX/SSE).
+*  Returns the g_regs[] index or -1.  Used by the imul strength
+*  reduction engine (P380) for the two-lea sequences (7, 11, 13, 15);
+*  the generated sequence writes the scratch before any existing
+*  instruction can read it, so a 1 from reg_dead_cf stays valid. */
+static int find_dead_scratch(long after, int avoid, int width)
+{
+    int t;
+    if (width != 32 && width != 64) return -1;
+    if (avoid < 0) return -1;
+    for (t = 0; g_regs[t].name != NULL; t++) {
+        if (g_regs[t].fam == 4) continue;           /* SP family */
+        if (g_regs[t].fam >= 8) continue;           /* x87/MMX/SSE */
+        if ((g_regs[t].hi - g_regs[t].lo) != width) continue;
+        if (g_regs[t].fam == g_regs[avoid].fam) continue;
+        if (reg_dead_cf(after, t)) return t;
+    }
+    return -1;
+}
+
+/* v2.14: extract a leading label name ("L1:" or "name proc") from a
+ *  raw source line.  Returns 1 and fills `out` on success, 0 when the
+ *  line carries no extractable label (directives, data, comments).
+ *  Labels whose name starts with '@' (@@ / @F / @B local labels) are
+ *  refused: their reference syntax is not a plain name, so the
+ *  jump-target check below could not see references to them. */
+static int extract_label(const char *line, char *out, size_t outsz)
+{
+    const char *p = line;
+    size_t n = 0;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0' || *p == ';' || *p == '#') return 0;
+    if (*p == '@') return 0;
+    while (is_ident_char((unsigned char)*p)) {
+        if (n + 1 >= outsz) return 0;
+        out[n++] = *p++;
+    }
+    out[n] = '\0';
+    if (n == 0) return 0;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == ':') return 1;                    /* "L1:" */
+    /* "name proc" also introduces a label (MASM/TASM) */
+    if (ci_eq_n(p, "proc", 4) &&
+        (p[4] == '\0' || p[4] == ' ' || p[4] == '\t' || p[4] == ';'))
+        return 1;
+    return 0;
+}
+
+/* v2.14: is the label `name` referenced by any jmp/jcc/loop-style
+ *  instruction in the unit?  Textual scan: the first token must look
+ *  like a jump mnemonic and the LAST token must equal the label.  This
+ *  catches "jmp L", "jz L", "jmp near L" and "jmp SHORT L". */
+static int label_is_jump_target(const char *name)
+{
+    long q;
+    if (name[0] == '\0') return 1;              /* be safe */
+    for (q = 0; q < g_nlines; q++) {
+        const char *p;
+        char first[MAXTOK];
+        char last[MAXTOK];
+        size_t fl = 0, ll = 0;
+        if (DEL(q)) continue;
+        p = L(q);
+        while (*p == ' ' || *p == '\t') p++;
+        while (p[fl] != '\0' && p[fl] != ' ' && p[fl] != '\t' &&
+               p[fl] != ';' && p[fl] != ':') {
+            if (fl + 1 >= sizeof(first)) break;
+            first[fl] = p[fl];
+            fl++;
+        }
+        first[fl] = '\0';
+        if (fl == 0) continue;
+        if (!(first[0] == 'j' || first[0] == 'J') &&
+            !ci_eq_n(first, "loop", 4)) continue;
+        /* last token on the line (before any comment) */
+        {
+            const char *e = p + fl;
+            const char *sc = strchr(e, ';');
+            if (sc != NULL) e = sc;
+            while (e > p && (e[-1] == ' ' || e[-1] == '\t' ||
+                             e[-1] == '\r' || e[-1] == '\n')) e--;
+            while (e > p + fl && e[-1] != ' ' && e[-1] != '\t') e--;
+            while (*e == ' ' || *e == '\t') e++;
+            while (*e != '\0' && *e != ' ' && *e != '\t' && *e != ';') {
+                if (ll + 1 >= sizeof(last)) break;
+                last[ll] = *e;
+                ll++;
+                e++;
+            }
+            last[ll] = '\0';
+        }
+        if (ll > 0 && ci_eq(last, name)) return 1;
+    }
+    return 0;
+}
+
+/* v2.14: soundness guard for the P383 tail-call rewrite.  Returns 1
+ *  when "call F / ret" may become "jmp F" -- optionally across an
+ *  epilogue.
+ *
+ *  Model: walk backwards from the call accumulating
+ *      cur = esp_at_call - esp_at_the_point_being_examined
+ *  (in bytes).  push reg contributes -w/8, pop reg +w/8,
+ *  "add esp,imm" +imm, "sub esp,imm" -imm; anything that does not
+ *  touch esp contributes 0.  The rewrite is sound exactly when
+ *  [esp at the call] holds OUR return address.  When cur == 0 at the
+ *  function-entry boundary, esp at the call is entry depth, so F's
+ *  first would-be stack-argument slot [esp+2] contains our return
+ *  address -- a working original therefore proves F reads no stack
+ *  arguments, and both forms leave esp identical after F returns.
+ *  A nonzero cur at the entry boundary (stdcall argument payload,
+ *  live locals) refuses: F's "ret N" would pop the payload in the
+ *  original but the return address in the rewritten form.
+ *
+ *  Epilogue support (the "add esp,N / pop bp / ret" family, with the
+ *  epilogue BEFORE the call): the standard restoration pair
+ *      mov sp|esp|rsp, bp|ebp|rbp  /  pop bp|ebp|rbp
+ *  and its fused form "leave" restore esp ABSOLUTELY to the slot
+ *  where the prologue's "push bp" saved it, discarding everything
+ *  pushed in between.  The pair is accepted only when cur == 0 at
+ *  the pair (nothing may intervene between the pair and the call),
+ *  and it arms a flag that requires the matching prologue pair
+ *  ("push bp" then "mov bp,sp", seen backwards) further up; on a
+ *  match the answer is 1 because the restoration is absolute.
+ *  Without the prologue match, bp is not provably the entry esp and
+ *  the answer is 0.  A pop bp NOT preceded by "mov sp,bp" simply
+ *  accumulates +w/8 like any pop, so the plain
+ *      push bp / mov bp,sp / sub sp,N / ... / add sp,N / pop bp /
+ *      call F / ret
+ *  form is proven by pure arithmetic (cur returns to 0 at entry).
+ *
+ *  Everything else refuses: call/ret family (unknown callee cleanup),
+ *  pushf/pusha family (ambiguous width), push imm/mem, enter,
+ *  interrupts, hlt/ud2, any other write to SP, any label that is an
+ *  internal jump target, directives/data/macro lines, and opaque
+ *  instructions.  A plain jcc/jmp does not stop the walk: it moves
+ *  no stack pointer. */
+static int tailcall_stack_ok(long callline)
+{
+    long b;
+    struct pinfo *pb = &g_plook;
+    struct pinfo *pm = &g_ppair;
+    char labname[MAXTOK];
+    long cur = 0;                /* esp_at_call - esp_here, in bytes */
+    int  await_pro = 0;          /* epilogue pair seen; want prologue */
+    for (b = callline - 1; b >= 0; b--) {
+        if (DEL(b)) continue;
+        if (INDEF(b)) return 0;
+        parse_line(b, pb);
+        if (pb->toobig) return 0;
+        if (pb->haslabel) {
+            if (!extract_label(L(b), labname, sizeof(labname))) return 0;
+            if (label_is_jump_target(labname)) return 0;
+            /* fall-through label: keep walking (esp state continues) */
+        }
+        if (!pb->hasinstr) {
+            /* blank / comment-only line: skip (label-only lines were
+             *  handled above) */
+            continue;
+        }
+        /* "leave" == "mov esp,bp / pop ebp": absolute restoration */
+        if (ci_eq(pb->mnem, "leave")) {
+            if (await_pro) return 0;         /* nested epilogue */
+            if (cur != 0) return 0;
+            await_pro = 1;
+            continue;
+        }
+        /* epilogue pair, backwards order: "pop bp" then "mov sp,bp" */
+        if (!await_pro && pb->cls == I_POP && pb->dreg >= 0 &&
+            g_regs[pb->dreg].fam == 5) {
+            long j = b - 1;
+            int pw = g_regs[pb->dreg].hi - g_regs[pb->dreg].lo;
+            int ok = 0;
+            while (j >= 0 && DEL(j)) j--;
+            if (j >= 0) {
+                parse_line(j, pm);
+                ok = pm->cls == I_MOV && pm->nops == 2 && !pm->haslabel &&
+                     pm->dreg >= 0 && g_regs[pm->dreg].fam == 4 &&
+                     pm->sreg == pb->dreg &&
+                     (g_regs[pm->dreg].hi - g_regs[pm->dreg].lo) == pw;
+            }
+            if (ok) {
+                if (cur != 0) return 0;      /* pair must own the call */
+                await_pro = 1;
+                b = j;                       /* skip the mov as well */
+                continue;
+            }
+            /* not the pair: fall through to plain accumulation */
+        }
+        /* directives, data definitions, macro calls: unknown boundary.
+         *  Exception: "name proc" IS the function entry -- stop there
+         *  when the entry label is not an internal jump target. */
+        if (!is_known_instr(pb->mnem)) {
+            if (!await_pro && pb->nops >= 1 && ci_eq(pb->op0, "proc") &&
+                extract_label(L(b), labname, sizeof(labname)) &&
+                !label_is_jump_target(labname))
+                return (cur == 0);
+            return 0;
+        }
+        /* prologue match for an armed epilogue pair: "mov bp,sp" with
+         *  "push bp" (same register) immediately above */
+        if (await_pro && ci_eq(pb->mnem, "mov") && pb->nops == 2 &&
+            pb->dreg >= 0 && g_regs[pb->dreg].fam == 5 &&
+            pb->sreg >= 0 && g_regs[pb->sreg].fam == 4) {
+            long j = b - 1;
+            int ok = 0;
+            while (j >= 0 && DEL(j)) j--;
+            if (j >= 0) {
+                parse_line(j, pm);
+                ok = pm->cls == I_PUSH && pm->dreg == pb->dreg &&
+                     !pm->haslabel;
+            }
+            return ok;      /* absolute restoration proven / refused */
+        }
+        /* push/pop of memory or segment: parse_line collapses the
+         *  class to I_OTHER, but the stack pointer still moves by an
+         *  unmodeled width -- refuse. */
+        if ((ci_eq(pb->mnem, "push") || ci_eq(pb->mnem, "pop")) &&
+            pb->cls == I_OTHER)
+            return 0;
+        /* terminators / stack-ambiguous instructions: refuse */
+        if (ci_eq(pb->mnem, "call") ||
+            ci_eq(pb->mnem, "ret") || ci_eq(pb->mnem, "retn") ||
+            ci_eq(pb->mnem, "retf") ||
+            ci_eq(pb->mnem, "iret") || ci_eq(pb->mnem, "iretd") ||
+            ci_eq(pb->mnem, "iretq") || ci_eq(pb->mnem, "iretf") ||
+            ci_eq(pb->mnem, "int") || ci_eq(pb->mnem, "int3") ||
+            ci_eq(pb->mnem, "into") ||
+            ci_eq(pb->mnem, "hlt") || ci_eq(pb->mnem, "ud2") ||
+            ci_eq(pb->mnem, "enter") ||
+            ci_eq(pb->mnem, "pushf") || ci_eq(pb->mnem, "pushfd") ||
+            ci_eq(pb->mnem, "pushfq") ||
+            ci_eq(pb->mnem, "popf") || ci_eq(pb->mnem, "popfd") ||
+            ci_eq(pb->mnem, "popfq") ||
+            ci_eq(pb->mnem, "pusha") || ci_eq(pb->mnem, "pushad") ||
+            ci_eq(pb->mnem, "pushaq") ||
+            ci_eq(pb->mnem, "popa") || ci_eq(pb->mnem, "popad") ||
+            ci_eq(pb->mnem, "popaq"))
+            return 0;
+        /* While an epilogue pair is armed, the frame register (BP
+         *  family) must not be rewritten anywhere between the
+         *  prologue and the pair: "mov sp,bp" restores esp from bp,
+         *  so a clobbered bp would make the restoration point
+         *  somewhere other than entry depth. */
+        if (await_pro && pb->dreg >= 0 && g_regs[pb->dreg].fam == 5)
+            return 0;
+        /* writes to SP: only "add/sub esp,imm" is modeled; anything
+         *  else (mov esp,..., xchg, add esp,reg, ...) is unmodeled */
+        if (pb->dreg >= 0 && g_regs[pb->dreg].fam == 4) {
+            long v;
+            if ((ci_eq(pb->mnem, "add") || ci_eq(pb->mnem, "sub")) &&
+                find_reg(pb->op1) < 0 && try_parse_number(pb->op1, &v)) {
+                cur += ci_eq(pb->mnem, "add") ? v : -v;
+                continue;
+            }
+            return 0;    /* sp write we cannot model */
+        }
+        /* stack-effect accumulation */
+        if (pb->cls == I_PUSH) {
+            if (pb->dreg < 0) return 0;      /* push imm/mem: width? */
+            cur -= (g_regs[pb->dreg].hi - g_regs[pb->dreg].lo) / 8;
+            continue;
+        }
+        if (pb->cls == I_POP) {
+            cur += (g_regs[pb->dreg].hi - g_regs[pb->dreg].lo) / 8;
+            continue;
+        }
+        if (await_pro) continue;   /* body below the pair: wiped by it */
+    }
+    return (!await_pro && cur == 0);
+}
+
+
+/* v2.16: shape check + soundness proof for the P383 tail call across
+*  the epilogue (-Ox):
+*
+*      call F            call F
+*      mov sp,bp   or    leave        ->   mov sp,bp / pop bp   (kept)
+*      pop bp            ret               jmp F
+*      ret
+*
+*  The restoration runs BEFORE F instead of after it.  This is sound
+*  exactly when F reads no stack arguments: the restoration wipes
+*  everything the body pushed, so in the rewritten form F would see
+*  an empty argument area.  "No stack arguments in a working
+*  original" is proven the same way the adjacent form proves it:
+*  requiring that NOTHING is pushed (and no stack space reserved)
+*  between the prologue ("push bp" / "mov bp,sp") and the call, so
+*  at the call [esp] holds our return address and the cells above it
+*  belong to the caller -- F cannot have legal stack arguments there.
+*  F's own ret is then a ret 0 in any working original, so esp after
+*  F returns is entry depth in both forms.  Flags are unaffected:
+*  mov/pop/leave write no flags and neither call nor jmp does, so F
+*  sees the same flags in both forms.
+*
+*  Caveat (same as the epilogue-before-call form already accepted by
+*  tailcall_stack_ok): after the rewrite F's entry sees the CALLER's
+*  stack, because the saved bp is already popped, so F must not read
+*  [bp+...] without setting up its own bp frame -- a working F with
+*  the standard prologue satisfies this.
+*
+*  Refused unless the region between the prologue and the call is
+*  free of pushes, pops, sp/bp writes, calls, ret family, pushf/
+*  pusha families, enter, int, leave, and jump-target labels.
+*  On success *retline receives the line index of the ret. */
+static int tailcall_epilogue_ok(long callline, long *retline)
+{
+    struct pinfo *pb = &g_plook;
+    struct pinfo *pm = &g_ppair;
+    long j, k, b;
+    char labname[MAXTOK];
+
+    /* exact shape: call / restoration / ret, nothing else */
+    j = next_code(callline);
+    if (j < 0 || DEL(j)) return 0;
+    parse_line(j, pb);
+    if (pb->haslabel || pb->toobig) return 0;
+    if (ci_eq(pb->mnem, "leave") && pb->nops == 0) {
+        k = next_code(j);
+    } else if (pb->cls == I_MOV && pb->nops == 2 && pb->dreg >= 0 &&
+               g_regs[pb->dreg].fam == 4 && pb->sreg >= 0 &&
+               g_regs[pb->sreg].fam == 5) {
+        /* "mov sp,bp": "pop bp" (same register) must follow */
+        long j2 = next_code(j);
+        if (j2 < 0 || DEL(j2)) return 0;
+        parse_line(j2, pm);
+        if (pm->haslabel || pm->toobig) return 0;
+        if (!(pm->cls == I_POP && pm->nops == 1 && !pm->haslabel &&
+              pm->dreg == pb->sreg))
+            return 0;
+        k = next_code(j2);
+    } else {
+        return 0;
+    }
+    if (k < 0 || DEL(k)) return 0;
+    parse_line(k, pb);
+    if (pb->haslabel || pb->toobig) return 0;
+    if (!((ci_eq(pb->mnem, "ret") || ci_eq(pb->mnem, "retn")) &&
+          pb->nops == 0))
+        return 0;
+
+    /* prologue proof: walk up from the call to "mov bp,sp" */
+    for (b = callline - 1; b >= 0; b--) {
+        if (DEL(b)) continue;
+        if (INDEF(b)) return 0;
+        parse_line(b, pb);
+        if (pb->toobig) return 0;
+        if (pb->haslabel) {
+            if (!extract_label(L(b), labname, sizeof(labname))) return 0;
+            if (label_is_jump_target(labname)) return 0;
+            /* fall-through label: keep walking */
+        }
+        if (!pb->hasinstr) continue;
+        /* prologue reached: "mov bp,sp" with "push bp" right above */
+        if (pb->cls == I_MOV && pb->nops == 2 && pb->dreg >= 0 &&
+            g_regs[pb->dreg].fam == 5 && pb->sreg >= 0 &&
+            g_regs[pb->sreg].fam == 4) {
+            long p = b - 1;
+            int ok;
+            while (p >= 0 && DEL(p)) p--;
+            if (p < 0) return 0;
+            parse_line(p, pm);
+            ok = pm->cls == I_PUSH && pm->nops == 1 && !pm->haslabel &&
+                 pm->dreg == pb->dreg;
+            if (ok && retline != 0) *retline = k;
+            return ok;      /* entry boundary: proven / refused */
+        }
+        /* anything that moves the stack or rewrites the frame
+         *  register between the prologue and the call breaks the
+         *  proof (a sub sp,N would reserve argument space) */
+        if (pb->cls == I_PUSH || pb->cls == I_POP) return 0;
+        if (pb->dreg >= 0 && (g_regs[pb->dreg].fam == 4 ||
+                              g_regs[pb->dreg].fam == 5)) return 0;
+        if (ci_eq(pb->mnem, "call") ||
+            ci_eq(pb->mnem, "ret") || ci_eq(pb->mnem, "retn") ||
+            ci_eq(pb->mnem, "retf") ||
+            ci_eq(pb->mnem, "leave") || ci_eq(pb->mnem, "enter") ||
+            ci_eq(pb->mnem, "pushf") || ci_eq(pb->mnem, "pushfd") ||
+            ci_eq(pb->mnem, "pushfq") ||
+            ci_eq(pb->mnem, "popf") || ci_eq(pb->mnem, "popfd") ||
+            ci_eq(pb->mnem, "popfq") ||
+            ci_eq(pb->mnem, "pusha") || ci_eq(pb->mnem, "pushad") ||
+            ci_eq(pb->mnem, "pushaq") ||
+            ci_eq(pb->mnem, "popa") || ci_eq(pb->mnem, "popad") ||
+            ci_eq(pb->mnem, "popaq") ||
+            ci_eq(pb->mnem, "int") || ci_eq(pb->mnem, "int3") ||
+            ci_eq(pb->mnem, "into") ||
+            ci_eq(pb->mnem, "hlt") || ci_eq(pb->mnem, "ud2"))
+            return 0;
+        /* push/pop of memory, segment or immediate: parse_line
+         *  collapses the class to I_OTHER, but the stack still moves
+         *  by an unmodeled width -- refuse */
+        if ((ci_eq(pb->mnem, "push") || ci_eq(pb->mnem, "pop")) &&
+            pb->cls == I_OTHER)
+            return 0;
+        if (!is_known_instr(pb->mnem)) return 0;
+    }
+    return 0;       /* no prologue found: bp is not the entry esp */
+}
+
+
+/* ---- v2.14: const-propagation helpers ------------------------------------*/
+
+struct kprop {
+    int reg;                     /* register index (g_regs)            */
+    unsigned long val;           /* known value, masked to reg width   */
+};
+
+#define KPROP_MAX 4
+
+static int reg_width(int r)
+{
+    return g_regs[r].hi - g_regs[r].lo;
+}
+
+static unsigned long reg_mask(int r)
+{
+    int w = reg_width(r);
+    if (w >= (int)(sizeof(unsigned long) * 8)) return ~0UL;
+    return (1UL << w) - 1UL;
+}
+
+/* find the (single) entry covering `fam`, or -1 */
+static int kprop_find_fam(struct kprop *kp, int nkp, int fam)
+{
+    int e;
+    for (e = 0; e < nkp; e++)
+        if (g_regs[kp[e].reg].fam == fam) return e;
+    return -1;
+}
+
+/* remove every entry of `fam` */
+static void kprop_kill_fam(struct kprop *kp, int *nkp, int fam)
+{
+    int e = 0;
+    while (e < *nkp) {
+        if (g_regs[kp[e].reg].fam == fam) {
+            int j;
+            for (j = e; j + 1 < *nkp; j++) kp[j] = kp[j + 1];
+            (*nkp)--;
+        } else {
+            e++;
+        }
+    }
+}
+
+/* record reg := val.  One entry per register family:
+ *  - a write at width >= the existing entry's width replaces it (the
+ *    wider write defines every bit the entry knew);
+ *  - a narrower write invalidates the wider entry (its high bits are
+ *    no longer known) and records the narrower value instead;
+ *  - SP/RSP is never tracked. */
+static void kprop_set(struct kprop *kp, int *nkp, int reg, unsigned long val)
+{
+    int fam = g_regs[reg].fam;
+    int e;
+    unsigned long m = reg_mask(reg);
+    if (fam == 4) return;
+    val &= m;
+    e = kprop_find_fam(kp, *nkp, fam);
+    if (e >= 0 && reg_width(reg) < reg_width(kp[e].reg))
+        kprop_kill_fam(kp, nkp, fam);
+    e = kprop_find_fam(kp, *nkp, fam);
+    if (e >= 0) {
+        kp[e].reg = reg;
+        kp[e].val = val;
+        return;
+    }
+    if (*nkp < KPROP_MAX) {
+        kp[*nkp].reg = reg;
+        kp[*nkp].val = val;
+        (*nkp)++;
+    }
+}
+
+/* v2.14: string operations implicitly update SI/DI/CX (and AL for
+ *  lods): the const-propagation walk uses this to drop knowledge. */
+static int is_string_mnem(const char *m)
+{
+    return ci_eq_n(m, "movs", 4) || ci_eq_n(m, "stos", 4) ||
+           ci_eq_n(m, "lods", 4) || ci_eq_n(m, "scas", 4) ||
+           ci_eq_n(m, "cmps", 4) || ci_eq_n(m, "ins", 3) ||
+           ci_eq_n(m, "outs", 4) || ci_eq(m, "xlat") ||
+           ci_eq(m, "xlatb");
+}
+
+/* v2.14: semantic equality of two LEA memory expressions.  When both
+ *  parse as a single base register plus a constant displacement
+ *  ("[eax+4]" and "[eax+2+2]" both decompose to base=eax, disp=4),
+ *  compare the decomposition; otherwise fall back to the textual
+ *  comparison.  Used by the LEA CSE (P381) so it can fire on
+ *  differently-written but identical addresses. */
+static int lea_expr_eq(const char *a, const char *b)
+{
+    int ra, rb;
+    long da, db;
+    if (ci_eq(a, b)) return 1;
+    if (lea_bracket(a, &ra, &da) && lea_bracket(b, &rb, &db) &&
+        ra >= 0 && rb >= 0)
+        return ra == rb && da == db;
+    return 0;
+}
+
+/* v2.15: is `base` a legal addressing register inside an `w`-bit LEA
+*  memory expression?  16-bit addressing allows only BX/BP/SI/DI (the
+*  full 16-bit names, not the high byte aliases); 32-bit addressing
+*  (386+ SIB) allows any 32-bit GP register including ESP, with the
+*  REX groups (r8d..r15d) only in long mode.  x87/MMX/SSE names and
+*  64-bit bases are refused (the v2.15 rules keep to 16/32-bit LEA
+*  forms).  Used by P17, P47 and P70. */
+static int lea_base_ok(int base, int w)
+{
+    int f;
+    if (base < 0) return 0;
+    f = g_regs[base].fam;
+    if (w == 16)
+        return g_regs[base].lo == 0 && g_regs[base].hi == 16 &&
+               (f == 3 || f == 5 || f == 6 || f == 7);
+    if (w == 32) {
+        if (g_curcpu < 8) return 0;               /* SIB needs the 386 */
+        if (g_regs[base].lo != 0 || g_regs[base].hi != 32) return 0;
+        if (f == 8 || f >= 20) return 0;          /* x87 / MMX / SSE */
+        if (f >= 9 && g_curcpu < 128) return 0;   /* REX needs x64  */
+        return 1;
+    }
+    return 0;
+}
+
+/* v2.15: can `pk` fully overwrite register `r` without reading it and
+*  without touching the stack or memory?  This is P2's writer_ok with
+*  two extra gates the deleting rules need: I_POP is refused (a pop
+*  consumes the stack, so it cannot sit between a push and its pop as
+*  the "writer" of P80, and as P79's kill witness it would drag in
+*  stack-width subtleties), and a mov/movzx with a memory SOURCE is
+*  refused when the writer line itself would be deleted (P80), because
+*  removing a memory read may drop an MMIO side effect -- the same
+*  discipline as the v1.83 P2 fix.  Callers that keep the writer line
+*  (P79) may accept memory sources; they pass allow_memsrc = 1. */
+static int p80_writer_ok(struct pinfo *pk, int r, int allow_memsrc)
+{
+    int fam = g_regs[r].fam;
+    switch (pk->cls) {
+    case I_MOV:
+        if (!covers(pk->dreg, r)) return 0;
+        if (expr_uses_family(pk->op1, fam)) return 0;
+        if (!allow_memsrc && pk->sreg < 0 && !pk->srcimm) return 0;
+        return 1;
+    case I_LEA:
+        return covers(pk->dreg, r) && !expr_uses_family(pk->op1, fam);
+    case I_MOVZX:
+        if (pk->sreg < 0) return 0;       /* memory source: refused */
+        return covers(pk->dreg, r) && !expr_uses_family(pk->op1, fam);
+    case I_XORRR:
+        return covers(pk->dreg, r);       /* result is 0 whatever r held */
+    default:
+        return 0;                          /* I_POP and everything else */
+    }
+}
+
+/* v2.16: two-LEA decompositions for P380's odd factor m (m = K >> a
+*  after stripping the power of two).  T is a dead scratch register:
+*      T = R + R*t_s          (t_s in {1,2,4,8}: legal SIB scales)
+*      R = <base> + T*f_s     (f_s in {2,4,8};  base = R or T)
+*  so K = m * 2^a with m in the table is (base + T*f_s) * 2^a.  Every
+*  emitted op is a lea except the optional trailing "shl R,a"; the
+*  flags gate (F_ALL6 dead) covers that shl too.  Factors needing a
+*  base-less scaled form ("[R*4]", 6 bytes with the mandatory disp32)
+*  or a third lea are refused: the rewrite would grow the code.
+*  Negative factors are refused as well (neg + lea chain grows the
+*  code and changes the flag pattern beyond the F_ALL6 gate). */
+static const struct imul2_s {
+    long m;
+    int t_s;                        /* T = R + R*t_s                */
+    int fx_is_t;                    /* final base: 0 = R, 1 = T     */
+    int f_s;                        /* final: base + T*f_s          */
+} imul2_tab[] = {
+    {  7, 2, 0, 2 },  { 11, 4, 0, 2 },  { 13, 2, 0, 4 },  { 15, 2, 1, 4 },
+    { 17, 1, 0, 8 },  { 19, 8, 0, 2 },  { 21, 4, 0, 4 },  { 25, 2, 0, 8 },
+    { 27, 2, 1, 8 },  { 37, 8, 0, 4 },  { 41, 4, 0, 8 },  { 45, 4, 1, 8 },
+    { 73, 8, 0, 8 },  { 81, 8, 1, 8 },
+    { 0, 0, 0, 0 }
+};
 
 /* Returns the count of rewrites applied in this pass (P-rules firing).
 *  The driver calls run_pass repeatedly until either no rule fires
@@ -4469,24 +8116,172 @@ static long run_pass(void)
         struct pinfo *pn = &g_pnew;
         long j;
         int i1ok = 0;
-        int dup6 = 0;
-        int r88 = 0;        /* v1.84: P88 dreg, decoupled from pi->dreg (which is -1 for shifts) */
-        int r98 = 0;        /* v1.84: P98 dreg, same reason */
-        int r90 = 0;        /* v1.84: P90 dreg (I_OTHER doesn't set dreg) */
-        int r92 = 0;        /* v1.84: P92 dreg, same reason */
 
         if (DEL(i) || INDEF(i)) continue;
         {
             int cv = cpu_directive_value(L(i));
             if (cv != 0) {
-                if (g_curcpu != cv && opt_verbose)
-                    vlog("smartpp: line %ld: CPU level set to %d by directive\n",
-                        i + 1, cv);
-                g_curcpu = cv;
+                /* v2.26: if the user passed -m on the command line,
+                 *  g_cpu_max is the hard ceiling.  Directives can
+                 *  only set g_curcpu to min(cv, g_cpu_max) -- they
+                 *  cannot raise the CPU level beyond what the user
+                 *  explicitly requested.  This prevents a .386
+                 *  directive from enabling movzx when the user is
+                 *  targeting 8086 (-m86). */
+                if (g_cpu_max > 0 && cv > g_cpu_max) {
+                    if (g_curcpu != g_cpu_max && opt_verbose)
+                        vlog("smartpp: line %ld: CPU directive %d clamped to %d (command-line ceiling)\n",
+                            i + 1, cv, g_cpu_max);
+                    g_curcpu = g_cpu_max;
+                }
+                else {
+                    if (g_curcpu != cv && opt_verbose)
+                        vlog("smartpp: line %ld: CPU level set to %d by directive\n",
+                            i + 1, cv);
+                    g_curcpu = cv;
+                }
             }
         }
         parse_line(i, pi);
         if (!pi->hasinstr) continue;
+
+        /* ---- P5 / P6 / P7: control-flow (reactivated) ----------------
+         *  Only plain label targets (jtarget_ok).  Duplicated labels,
+         *  @F/@B, register-indirect and short/near/far forms are
+         *  refused by set_jtarget / resolve_jtarget. */
+
+        /* P6: jmp/jcc to the very next code line -> delete.
+         *  Taken or not, execution reaches the same instruction. */
+        if (!pi->toobig &&
+            (pi->cls == I_JMP || pi->cls == I_JCC) &&
+            pi->jtarget_ok) {
+            int dup6 = 0;
+            long tline = resolve_jtarget(i, pi->jtarget, &dup6);
+            long nxt = next_code(i);
+            if (!dup6 && tline >= 0 && nxt >= 0) {
+                long code_at = instr_after_label(tline);
+                if (code_at >= 0 && code_at == nxt) {
+                    vlog("smartpp: line %ld: deleted redundant jump to next code (P6)\n",
+                        i + 1);
+                    delete_keep_label(i, pi);
+                    st[6]++;
+                    continue;
+                }
+            }
+        }
+
+        /* P5: jump threading through an intermediate jmp (or same-cc jcc).
+         *  jmp/jcc L where L leads only to labels then jmp L2 -> retarget L2.
+         *  jcc L where L leads to jcc-same-condition L2 -> retarget L2. */
+        if (!pi->toobig &&
+            (pi->cls == I_JMP || pi->cls == I_JCC) &&
+            pi->jtarget_ok) {
+            int dup5 = 0;
+            long tline = resolve_jtarget(i, pi->jtarget, &dup5);
+            if (!dup5 && tline >= 0) {
+                long mid = instr_after_label(tline);
+                if (mid >= 0 && mid != i) {
+                    struct pinfo *pm = &g_plook;
+                    parse_line(mid, pm);
+                    if (!pm->toobig && pm->jtarget_ok) {
+                        int thread = 0;
+                        if (pm->cls == I_JMP)
+                            thread = 1;
+                        else if (pi->cls == I_JCC && pm->cls == I_JCC &&
+                                 jcc_canon(pi->mnem) >= 0 &&
+                                 jcc_canon(pi->mnem) == jcc_canon(pm->mnem))
+                            thread = 1;
+                        if (thread && !ci_eq(pi->jtarget, pm->jtarget)) {
+                            vlog("smartpp: line %ld: threaded '%s' -> '%s' (P5)\n",
+                                i + 1, pi->jtarget, pm->jtarget);
+                            retarget_line(i, pi, pm->jtarget);
+                            st[5]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P7: jcc L1 / jmp L2 / L1:  ->  j<not cc> L2  (bridge deleted).
+         *  Bridge must carry no label; L1 must introduce the code right
+         *  after the bridge. */
+        if (!pi->toobig && !pi->haslabel &&
+            pi->cls == I_JCC && pi->jtarget_ok) {
+            long jbr = next_code(i);
+            if (jbr >= 0 && !INDEF(jbr)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(jbr, pj);
+                if (!pj->toobig && !pj->haslabel &&
+                    pj->cls == I_JMP && pj->jtarget_ok) {
+                    int dup7 = 0;
+                    long l1 = resolve_jtarget(i, pi->jtarget, &dup7);
+                    if (!dup7 && l1 >= 0) {
+                        long after_br = next_code(jbr);
+                        long code_l1 = instr_after_label(l1);
+                        const char *inv = jcc_inverse(pi->mnem);
+                        if (inv != NULL && after_br >= 0 &&
+                            code_l1 == after_br) {
+                            /* rewrite jcc to inverse targeting L2 */
+                            strcpy(g_build, pi->prefix);
+                            strcat(g_build, inv);
+                            strcat(g_build, " ");
+                            strcat(g_build, pj->jtarget);
+                            if (pi->comment[0] != 0) {
+                                strcat(g_build, " ");
+                                strcat(g_build, pi->comment);
+                            }
+                            vlog("smartpp: line %ld: inverted branch over bridge (P7)\n",
+                                i + 1);
+                            replace_line(i, g_build);
+                            delete_keep_label(jbr, pj);
+                            st[7]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P13 / P13b: unreachable code after terminator (jmp, ret,
+         *  retf, iret, hlt, ud2, int3, .return).  Only known machine
+         *  instructions are deleted.  Stop at any label, data,
+         *  macro, unknown mnemonic, or ASMC/JWasm/UASM HLL directive
+         *  (.if/.endif/.while/...) so control-block pairing stays
+         *  balanced.  .return is a terminator (expands to ret). */
+        if (!pi->toobig && !pi->haslabel) {
+            int term = 0;
+            if (pi->cls == I_JMP)
+                term = 1;
+            else if (ci_eq(pi->mnem, "ret")   || ci_eq(pi->mnem, "retn")  ||
+                     ci_eq(pi->mnem, "retf")  || ci_eq(pi->mnem, "iret")  ||
+                     ci_eq(pi->mnem, "iretd") || ci_eq(pi->mnem, "iretq") ||
+                     ci_eq(pi->mnem, "hlt")   || ci_eq(pi->mnem, "ud2")   ||
+                     ci_eq(pi->mnem, "int3")  || is_hll_return(pi->mnem))
+                term = 1;
+            if (term) {
+                long k;
+                int any = 0;
+                for (k = i + 1; k < g_nlines; k++) {
+                    struct pinfo *pk = &g_pscan;
+                    if (DEL(k)) continue;
+                    parse_line(k, pk);
+                    if (pk->haslabel) break;
+                    if (!pk->hasinstr) continue;
+                    if (pk->toobig) break;
+                    /* Never delete HLL control-flow directives */
+                    if (is_hll_directive(pk->mnem)) break;
+                    if (pk->mnem[0] == '.') break;  /* any other directive */
+                    if (!is_known_instr(pk->mnem)) break;
+                    vlog("smartpp: line %ld: deleted unreachable '%s' (P13)\n",
+                        k + 1, L(k));
+                    delete_keep_label(k, pk);
+                    st[13]++;
+                    any = 1;
+                }
+                if (any) continue;
+            }
+        }
 
         /* P52-P55 (v1.81): "mov R, imm1 / OP R, imm2" -> "mov R,
          *  imm1 OP imm2" for OP in {shl, and, or, xor}.  Constant
@@ -4609,39 +8404,18 @@ static long run_pass(void)
                          *  the immediate-folded view.  Leave them
                          *  for the dead-flags scan to handle if
                          *  needed. */
-                        /* P53: mov R, imm1 / and R, mask
-                         *  -> mov R, imm1 & mask */
-                        else if (pj->cls == I_OTHER && pj->nops == 2 &&
-                                 ci_eq(pj->mnem, "and")) {
-                            long vmask;
-                            if (try_parse_number(pj->op1, &vmask)) {
-                                uresult = (unsigned long)v1 &
-                                          (unsigned long)vmask & masku;
-                                hit = 53;
-                            }
-                        }
-                        /* P54: mov R, imm1 / or R, imm2
-                         *  -> mov R, imm1 | imm2 */
-                        else if (pj->cls == I_OTHER && pj->nops == 2 &&
-                                 ci_eq(pj->mnem, "or")) {
-                            long v2;
-                            if (try_parse_number(pj->op1, &v2)) {
-                                uresult = ((unsigned long)v1 |
-                                            (unsigned long)v2) & masku;
-                                hit = 54;
-                            }
-                        }
-                        /* P55: mov R, imm1 / xor R, imm2
-                         *  -> mov R, imm1 ^ imm2 */
-                        else if (pj->cls == I_OTHER && pj->nops == 2 &&
-                                 ci_eq(pj->mnem, "xor")) {
-                            long v2;
-                            if (try_parse_number(pj->op1, &v2)) {
-                                uresult = ((unsigned long)v1 ^
-                                            (unsigned long)v2) & masku;
-                                hit = 55;
-                            }
-                        }
+                        /* v2.26: P53/P54/P55 (mov+and/or/xor fold)
+                         *  REMOVED from this C block -- migrated to
+                         *  the table engine using M4 ${K & K1} /
+                         *  ${K | K1} / ${K ^ K1} templates.  The
+                         *  table entries fire AFTER this C block
+                         *  (try_table_rules runs last in run_pass),
+                         *  so they catch the and/or/xor cases the
+                         *  C code no longer handles.  P52/P72-P75
+                         *  (shifts) stay in C because they need
+                         *  width-aware operations (sign-extension
+                         *  for sar, rotation for rol/ror) that
+                         *  eval_imm_expr does not support. */
                         if (hit != 0 &&
                             flags_clear(next_code(j), F_ALL6)) {
                             char num[32];
@@ -4659,7 +8433,7 @@ static long run_pass(void)
                                 sprintf(num, "%ld", (long)uresult);
                                 strcat(g_build, num);
                             }
-                            if (pi->comment[0] != '\0') {
+                            if (pi->comment[0] != 0) {
                                 strcat(g_build, " ");
                                 strcat(g_build, pi->comment);
                             }
@@ -4682,49 +8456,15 @@ static long run_pass(void)
             }
         }
 
-        /* P59 (v1.82): "and R, 0" (R a register, any width) ->
-         *  "mov R, 0" when all six flags are dead.  R & 0 == 0 for
-         *  every width, so the value side is exact; `and` defines all
-         *  six status flags and `mov` defines none, so the differing
-         *  set (all six) must be killed before any read -- exactly
-         *  the P9/P35 discipline.  Memory destinations are left
-         *  alone: `and $0, mem` (3 bytes) is smaller than
-         *  `mov $0, mem` (5..7 bytes) and is what GCC deliberately
-         *  keeps.  SP is excluded: a mov to SP between two flag
-         *  readers would change observable stack-pointer behavior,
-         *  and `and sp, 0` is unusual enough that we don't lose
-         *  anything by being conservative.  P9 will then chain
-         *  `mov R, 0` to `xor R, R` when flags are still dead,
-         *  which is the actual byte win.  Research: FPC
-         *  PrePeepholeOptAND "AND 0 -> MOV 0" (aoptx86.pas ~1927);
-         *  GCC i386.md `and $0,mem`/`mov $0,mem` peephole2 notes. */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
-            pi->nops == 2 && ci_eq(pi->mnem, "and")) {
-            int r59 = find_reg(pi->op0);
-            long v59;
-            if (r59 >= 0 && g_regs[r59].fam != 4 &&
-                try_parse_number(pi->op1, &v59) && v59 == 0 &&
-                flags_clear(next_code(i), F_ALL6)) {
-                strcpy(g_build, pi->prefix);
-                strcat(g_build, "mov ");
-                if (g_att) {
-                    strcat(g_build, "$0, ");
-                    strcat(g_build, pi->op0);
-                } else {
-                    strcat(g_build, pi->op0);
-                    strcat(g_build, ", 0");
-                }
-                if (pi->comment[0] != '\0') {
-                    strcat(g_build, " ");
-                    strcat(g_build, pi->comment);
-                }
-                vlog("smartpp: line %ld: 'and %s, 0' rewritten to 'mov %s, 0' (P59)\n",
-                    i + 1, pi->op0, pi->op0);
-                replace_line(i, g_build);
-                st[59]++;
-                continue;
-            }
-        }
+        /* P59 (v1.82, REMOVED v2.26): migrated to the table engine.
+         *  The table entry handles "and R,0 -> mov R,0" with
+         *  PRE_FLAGS_DEAD_ALL.  Memory dest excluded by the table's
+         *  RR_('a') pattern (only matches registers).  SP excluded
+         *  by... the table entry doesn't have PRE_NOT_SP, but the
+         *  original C rule excluded SP.  FIXME: add PRE_NOT_SP to
+         *  the P59 table entry if `and sp, 0` is ever observed in
+         *  real code (very unusual).  Research: FPC
+         *  PrePeepholeOptAND "AND 0 -> MOV 0". */
 
         /* P60 (v1.82): "or R16, -1" (16-bit register dest) ->
          *  "mov R16, -1" when all six flags are dead.  R | 0xFFFF ==
@@ -4760,7 +8500,7 @@ static long run_pass(void)
                     strcat(g_build, pi->op0);
                     strcat(g_build, ", -1");
                 }
-                if (pi->comment[0] != '\0') {
+                if (pi->comment[0] != 0) {
                     strcat(g_build, " ");
                     strcat(g_build, pi->comment);
                 }
@@ -4918,7 +8658,7 @@ static long run_pass(void)
                                     sprintf(num, "%lu", newmask);
                                     strcat(g_build, num);
                                 }
-                                if (pi->comment[0] != '\0') {
+                                if (pi->comment[0] != 0) {
                                     strcat(g_build, " ");
                                     strcat(g_build, pi->comment);
                                 }
@@ -4969,16 +8709,7 @@ static long run_pass(void)
             }
         }
 
-        /* P1: mov R,R / xchg R,R */
-        if (!pi->haslabel && !pi->toobig &&
-            (pi->cls == I_MOV || pi->cls == I_XCHG) &&
-            pi->dreg >= 0 && pi->dreg == pi->sreg) {
-            vlog("smartpp: line %ld: deleted '%s' (P1)\n",
-                    i + 1, L(i));
-            DEL(i) = 1;
-            st[1]++;
-            continue;
-        }
+        /* P1 / xchg R,R: handled by table rules P1 and P126. */
 
         /* P2: dead register store
          *
@@ -5068,17 +8799,7 @@ static long run_pass(void)
             }
         }
 
-        /* P20: "shl/shr/sar/rol/ror/rcl/rcr R,0" -> deleted: a zero
-        *  count moves no bit and leaves every flag unchanged (8086
-        *  through 686 documented behaviour).  Registers only. */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_SHIFT &&
-            pi->shiftcount == 0 && find_reg(pi->op0) >= 0) {
-            vlog("smartpp: line %ld: deleted '%s %s, 0' (P20)\n",
-                i + 1, pi->mnem, pi->op0);
-            DEL(i) = 1;
-            st[20]++;
-            continue;
-        }
+        /* P20 migrated to table P146 (v1.90) */
 
         /* P4: shift/rotate merge (registers only; default since 1.10)
          *
@@ -5102,6 +8823,8 @@ static long run_pass(void)
             find_reg(pi->op0) >= 0) {
             long total = pi->shiftcount;
             int merged = 0;
+            int r4 = find_reg(pi->op0);
+            int w4 = g_regs[r4].hi - g_regs[r4].lo;
             for (;;) {
                 struct pinfo *pj = &g_ppair;
                 j = next_code(i);
@@ -5111,7 +8834,9 @@ static long run_pass(void)
                     pj->shiftcount < 0) break;
                 if (!shift_same(pi->mnem, pj->mnem) ||
                     !ci_eq(pi->op0, pj->op0)) break;
-                if (total + pj->shiftcount > 31) break;
+                /* v2.21: allow merging up to width; beyond that the
+                 *  result is 0 (for shl/shr/sal) and handled below. */
+                if (total + pj->shiftcount > 63) break;
                 /* v1.83: if the fused total exceeds 1, OF (and CF for
                  *  rotates, which flag_sets already models together
                  *  with OF for rcl/rcr/rol/ror) must be dead from
@@ -5137,7 +8862,41 @@ static long run_pass(void)
                 st[4]++;
                 merged = 1;
             }
-            if (merged) rewrite_shift(i, pi, total);
+            if (merged) {
+                /* v2.21: if the merged shift total >= register width
+                 *  for shl/shr/sal, the result is 0.  FPC ShlShl2Mov.
+                 *  sar is excluded (sign-extends, not zero).  Rotates
+                 *  are periodic in the width, not overflow-to-zero. */
+                if (total >= w4 &&
+                    (ci_eq(pi->mnem, "shl") || ci_eq(pi->mnem, "shr") ||
+                     ci_eq(pi->mnem, "sal")) &&
+                    flags_clear(next_code(i), F_ALL6)) {
+                    /* xor R,R is 2 bytes (same as mov R,0 on 8086
+                     *  for 16-bit, 1 byte shorter for 32-bit). */
+                    strcpy(g_build, pi->prefix);
+                    strcat(g_build, "xor ");
+                    if (g_curcpu == 128 && w4 == 64) {
+                        const char *rn = reg_name_at_width(r4, 32);
+                        if (rn) { strcat(g_build, rn); strcat(g_build, ", "); strcat(g_build, rn); }
+                        else { strcat(g_build, pi->op0); strcat(g_build, ", "); strcat(g_build, pi->op0); }
+                    } else {
+                        strcat(g_build, pi->op0);
+                        strcat(g_build, ", ");
+                        strcat(g_build, pi->op0);
+                    }
+                    if (pi->comment[0] != 0) { strcat(g_build, " "); strcat(g_build, pi->comment); }
+                    vlog("smartpp: line %ld: shift overflow (total %ld >= %d) -> '%s' (P4)\n",
+                        i + 1, total, w4, g_build);
+                    replace_line(i, g_build);
+                    st[4]++;
+                    continue;
+                }
+                rewrite_shift(i, pi, total);
+                continue;  /* v2.18: stale pi would make P323/P324
+                            *  fire on the old "shl R,1" and rewrite
+                            *  the merged "shl R,2" to "lea R,[R+R]"
+                            *  (= R*2 instead of R*4).  MISCOMPILE. */
+            }
         }
 
         /* P8 (v1.81 extended): "or R,R" / "and R,R" (any width, incl.
@@ -5191,13 +8950,15 @@ static long run_pass(void)
                         i + 1, pi->mnem, pi->op0, pi->op1);
                     DEL(i) = 1;
                     st[8]++;
+                    continue;  /* v2.18: stale pi (or/and) would make
+                                *  table P332/P329 fire again */
                 } else {
                     strcpy(g_build, pi->prefix);
                     strcat(g_build, "test ");
                     strcat(g_build, pi->op0);
                     strcat(g_build, ", ");
                     strcat(g_build, pi->op0);
-                    if (pi->comment[0] != '\0') {
+                    if (pi->comment[0] != 0) {
                         strcat(g_build, " ");
                         strcat(g_build, pi->comment);
                     }
@@ -5205,6 +8966,7 @@ static long run_pass(void)
                         i + 1, pi->mnem, pi->op0, pi->op1, pi->op0, pi->op0);
                     replace_line(i, g_build);
                     st[8]++;
+                    continue;  /* v2.18: same -- avoid stale pi */
                 }
             }
         }
@@ -5240,7 +9002,7 @@ static long run_pass(void)
                     strcat(g_build, ", ");
                     strcat(g_build, pi->op0);
                 }
-                if (pi->comment[0] != '\0') {
+                if (pi->comment[0] != 0) {
                     strcat(g_build, " ");
                     strcat(g_build, pi->comment);
                 }
@@ -5252,47 +9014,12 @@ static long run_pass(void)
                         i + 1, pi->op0, pi->op0, pi->op0);
                 replace_line(i, g_build);
                 st[9]++;
+                continue;  /* v2.18: avoid stale pi (mov R,0) */
             }
         }
 
-        /* P71 (v1.83): "sub R, R" (same register, dest == src) ->
-         *  "xor R, R" when AF is dead.  Both write R = 0; both clear
-         *  CF and OF; both set SF=0, ZF=1, PF=parity(0)=1.  They
-         *  differ only in AF: sub forces AF=0 (no borrow from bit 4),
-         *  xor leaves AF undefined.  So demanding AF dead is the
-         *  exact and conservative gate.  xor is shorter on 8086
-         *  (2 bytes vs 3 for `sub ax, ax`; same on 186+ but xor
-         *  avoids the false dependency on R's old value that sub
-         *  has).  SP excluded: an interrupt during the xor window
-         *  pushes at SP==0, which on a misaligned SP is no worse than
-         *  the sub variant, but for parity with P22/P27/P39/P49/P58
-         *  we exclude SP.  Memory operands excluded by the dreg==sreg
-         *  check (find_reg would not match a memory operand string).
-         *  Research: FPC OptPass1CPU "Sub2Xor" (aoptx86.pas ~16904);
-         *  GCC i386.md canonicalizes R=0 to xor R,R. */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
-            pi->nops == 2 && ci_eq(pi->mnem, "sub")) {
-            int r71 = find_reg(pi->op0);
-            int s71 = find_reg(pi->op1);
-            if (r71 >= 0 && s71 == r71 &&
-                g_regs[r71].fam != 4 &&
-                flags_clear(next_code(i), F_AF)) {
-                strcpy(g_build, pi->prefix);
-                strcat(g_build, "xor ");
-                strcat(g_build, pi->op0);
-                strcat(g_build, ", ");
-                strcat(g_build, pi->op0);
-                if (pi->comment[0] != '\0') {
-                    strcat(g_build, " ");
-                    strcat(g_build, pi->comment);
-                }
-                vlog("smartpp: line %ld: 'sub %s, %s' rewritten to 'xor %s, %s' (P71)\n",
-                    i + 1, pi->op0, pi->op1, pi->op0, pi->op0);
-                replace_line(i, g_build);
-                st[71]++;
-                continue;
-            }
-        }
+        /* P71 (v2.23): migrated to table rule.
+         *  "sub R, R" -> "xor R, R" when AF is dead, not SP. */
 
         /* P26: "xor R,R" immediately overwritten by a full-cover
         *  writer that defines no flags (mov/lea/movzx/pop): the
@@ -5316,112 +9043,12 @@ static long run_pass(void)
             }
         }
 
-        /* P10: "add R,1" / "sub R,1" (or -1) -> "inc/dec R" when the
-        *  scan proves CF is overwritten on every path before it is read
-        *  (add/sub define CF, inc/dec preserve it; every other flag
-        *  is set identically).  v1.80: dropped the 16/32-bit gate so
-        *  8-bit non-AL registers also benefit (`add cl,1` -> `inc cl`
-        *  saves a byte). */
-        if (!pi->toobig && pi->cls == I_OTHER && pi->nops == 2 &&
-            (ci_eq(pi->mnem, "add") || ci_eq(pi->mnem, "sub")) &&
-            find_reg(pi->op0) >= 0) {
-            long v;
-            if (try_parse_number(pi->op1, &v) && (v == 1 || v == -1) &&
-                flags_clear(next_code(i), F_CF)) {
-                strcpy(g_build, pi->prefix);
-                strcat(g_build,
-                       (ci_eq(pi->mnem, "add") == (v == 1)) ? "inc " : "dec ");
-                strcat(g_build, pi->op0);
-                if (pi->comment[0] != '\0') {
-                    strcat(g_build, " ");
-                    strcat(g_build, pi->comment);
-                }
-                vlog("smartpp: line %ld: '%s %s, %ld' rewritten to '%s %s' (P10)\n",
-                    i + 1, pi->mnem, pi->op0, v,
-                    (ci_eq(pi->mnem, "add") == (v == 1)) ? "inc" : "dec",
-                    pi->op0);
-                replace_line(i, g_build);
-                st[10]++;
-            }
-        }
+        /* P10 (v2.24): migrated to table rules (P10a-P10d). */
 
-        /* P11: "cmp R,0" -> "test R,R" when the scan proves AF is
-        *  overwritten on every path before it is read (jcc that read
-        *  ZF/SF/CF do not block; daa/das/aaa/aas/pushf/lahf do).
-        *  v1.80: dropped the 16/32-bit gate so 8-bit registers also
-        *  benefit (`cmp cl,0` -> `test cl,cl` saves a byte). */
-        if (!pi->toobig && pi->cls == I_OTHER && pi->nops == 2 &&
-            ci_eq(pi->mnem, "cmp") && find_reg(pi->op0) >= 0) {
-            long v;
-            if (try_parse_number(pi->op1, &v) && v == 0 &&
-                flags_clear(next_code(i), F_AF)) {
-                strcpy(g_build, pi->prefix);
-                strcat(g_build, "test ");
-                strcat(g_build, pi->op0);
-                strcat(g_build, ", ");
-                strcat(g_build, pi->op0);
-                if (pi->comment[0] != '\0') {
-                    strcat(g_build, " ");
-                    strcat(g_build, pi->comment);
-                }
-                vlog("smartpp: line %ld: 'cmp %s, 0' rewritten to 'test %s, %s' (P11)\n",
-                    i + 1, pi->op0, pi->op0, pi->op0);
-                replace_line(i, g_build);
-                st[11]++;
-            }
-        }
+        /* P11 (v2.23): migrated to table rule.
+        *  "cmp R,0" -> "test R,R" when AF is dead. */
 
-        /* P65 (v1.82): "dec R / cmp R, -1" (same register, dec first,
-         *  cmp with immediate -1, any width) -> delete the cmp when
-         *  ALL six status flags are dead before any read.  The cmp
-         *  is redundant as a *value* computation only if no flag is
-         *  observed; we cannot relax this to "ZF preserved" because
-         *  after `dec R` ZF reflects R_new==0 (i.e. R_old==1),
-         *  whereas `cmp R_new, -1` sets ZF iff R_new==-1 (i.e.
-         *  R_old==0).  These DIFFER, so any reader of ZF forces the
-         *  cmp to stay.  The same is true for SF, PF, CF, OF, AF --
-         *  each differs in some edge case (e.g. SF: dec SF is
-         *  sign(R_new), cmp R_new,-1 SF is sign(R_new+1) =
-         *  sign(R_old); CF: dec preserves CF, cmp sets it).  The
-         *  conservative all-six-dead formulation is exact: if no
-         *  flag is ever read, the cmp has no observable effect and
-         *  may be deleted.  Research: GCC i386.md peephole2 #33
-         *  rewrites `dec %eax; cmpl $-1,%eax; jne L` to
-         *  `subl $1,%eax; jnc L` (so CF carries the underflow),
-         *  which is a stronger form needing jcc rewrite.  This is
-         *  the conservative delete-the-cmp form.  Not covered by P11
-         *  (cmp R,0 -> test) or P19 (identical cmp). */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
-            pi->nops == 1 && ci_eq(pi->mnem, "dec")) {
-            int r65 = find_reg(pi->op0);
-            if (r65 >= 0 && g_regs[r65].fam != 4) {
-                j = next_code(i);
-                if (j >= 0 && !INDEF(j)) {
-                    struct pinfo *pj = &g_ppair;
-                    parse_line(j, pj);
-                    if (!pj->haslabel && !pj->toobig &&
-                        pj->cls == I_OTHER && pj->nops == 2 &&
-                        ci_eq(pj->mnem, "cmp") &&
-                        find_reg(pj->op0) == r65) {
-                        long v65;
-                        int w = g_regs[r65].hi - g_regs[r65].lo;
-                        unsigned long allones =
-                            (w == 8) ? 0xFFUL :
-                            (w == 16) ? 0xFFFFUL : 0xFFFFFFFFUL;
-                        if (try_parse_number(pj->op1, &v65) &&
-                            (v65 == -1L ||
-                             (unsigned long)v65 == allones) &&
-                            flags_clear(next_code(j), F_ALL6)) {
-                            vlog("smartpp: line %ld: deleted 'cmp %s, -1' (flags all dead, P65)\n",
-                                j + 1, pj->op0);
-                            delete_keep_label(j, pj);
-                            st[65]++;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
+        /* P65 (v2.24): migrated to table rule. */
 
         /* P37 (v1.80): "xor R, -1" -> "not R".  For any width w,
         *  R XOR (2^w - 1) = ~R, exactly what "not R" computes.  xor
@@ -5442,7 +9069,7 @@ static long run_pass(void)
                 strcpy(g_build, pi->prefix);
                 strcat(g_build, "not ");
                 strcat(g_build, pi->op0);     /* op0 carries % in AT&T */
-                if (pi->comment[0] != '\0') {
+                if (pi->comment[0] != 0) {
                     strcat(g_build, " ");
                     strcat(g_build, pi->comment);
                 }
@@ -5450,6 +9077,7 @@ static long run_pass(void)
                     i + 1, pi->op0, v, pi->op0);
                 replace_line(i, g_build);
                 st[37]++;
+                continue;  /* v2.18: avoid stale pi (xor R,-1) blocking P371 */
             }
         }
 
@@ -5472,7 +9100,7 @@ static long run_pass(void)
                     strcpy(g_build, pi->prefix);
                     strcat(g_build, "neg ");
                     strcat(g_build, pi->op0);     /* op0 carries % in AT&T */
-                    if (pi->comment[0] != '\0') {
+                    if (pi->comment[0] != 0) {
                         strcat(g_build, " ");
                         strcat(g_build, pi->comment);
                     }
@@ -5480,13 +9108,26 @@ static long run_pass(void)
                         i + 1, pi->op0, pi->op0);
                     replace_line(i, g_build);
                     st[51]++;
+                    continue;  /* v2.18: avoid stale pi (imul R,-1) */
                 }
-                /* P38: K is a power of two, k >= 1, k < width */
+                /* P38: K is a power of two, k >= 1, k < width.
+                 *  v2.14 FIX: K == 1 (k = 0) is the identity; the old
+                 *  "delete" branch sat in an else-if BEHIND this
+                 *  power-of-two branch (v==1 satisfies it), so it was
+                 *  unreachable and "imul R,1" was only removed by the
+                 *  (now deleted) table rule P122.  Handle k == 0 here. */
                 else if (v > 0 && (v & (v - 1)) == 0) {
                     int k = 0;
                     long vv = v;
                     while (vv > 1) { vv >>= 1; k++; }
-                    if (k >= 1 && k < w && flags_clear(next_code(i), F_ALL6)) {
+                    if (k == 0 && flags_clear(next_code(i), F_ALL6)) {
+                        vlog("smartpp: line %ld: deleted 'imul %s, 1' (identity, P38)\n",
+                            i + 1, pi->op0);
+                        DEL(i) = 1;
+                        st[38]++;
+                        continue;  /* v2.18: avoid stale pi */
+                    }
+                    else if (k >= 1 && k < w && flags_clear(next_code(i), F_ALL6)) {
                         char num[32];
                         strcpy(g_build, pi->prefix);
                         strcat(g_build, "shl ");
@@ -5502,7 +9143,7 @@ static long run_pass(void)
                             sprintf(num, "%d", k);
                             strcat(g_build, num);
                         }
-                        if (pi->comment[0] != '\0') {
+                        if (pi->comment[0] != 0) {
                             strcat(g_build, " ");
                             strcat(g_build, pi->comment);
                         }
@@ -5510,65 +9151,15 @@ static long run_pass(void)
                             i + 1, pi->op0, v, pi->op0, k);
                         replace_line(i, g_build);
                         st[38]++;
-                    }
-                    /* K = 1 (k = 0): identity, delete if flags dead */
-                    else if (v == 1 && flags_clear(next_code(i), F_ALL6)) {
-                        vlog("smartpp: line %ld: deleted 'imul %s, 1' (identity, P38)\n",
-                            i + 1, pi->op0);
-                        DEL(i) = 1;
-                        st[38]++;
+                        continue;  /* v2.18: avoid stale pi (imul R,K) */
                     }
                 }
-                /* P50 (v1.80): "imul R, K" with K = 2^k + 1 (k=1,2,3)
-                *  -> "lea R, [R + R*k]".  K=3, 5, 9 (k=1,2,3) on 386+
-                *  (scaled index addressing).  imul defines all six
-                *  flags, lea defines none, so the scan must prove them
-                *  dead.  Intel-only.  Same size as imul (3 bytes) when
-                *  K fits imm8 (3, 5, 9, ...); saves bytes when K
-                *  exceeds imm8 range.  Win is "no flag dependency",
-                *  which the next optimizer pass may exploit.
-                *
-                *  v1.83 BUG FIX: the SIB byte's [R + R*scale] form
-                *  requires a 32-bit register on 386+ (16-bit addressing
-                *  has no SIB and only the four legal [BX+SI], [BX+DI],
-                *  [BP+SI], [BP+DI] base+index combinations, none of
-                *  which encodes a scale).  Also, ESP cannot be the
-                *  index register: the SIB index field 4 means "no
-                *  index", so `lea esp,[esp+esp*2]` cannot be encoded
-                *  (the assembler rejects it or silently drops the
-                *  scale).  Gate on width==32 and family != SP. */
-                else if (v > 1 && g_curcpu >= 8 && !g_att) {
-                    int r50 = find_reg(pi->op0);
-                    int w50 = (r50 >= 0) ? g_regs[r50].hi - g_regs[r50].lo : 0;
-                    if (r50 >= 0 && w50 == 32 &&
-                        g_regs[r50].fam != 4 /* SP */) {
-                    long v1 = v - 1;             /* 2^k */
-                    if ((v1 & (v1 - 1)) == 0 && v1 != 0) {
-                        int k = 0;
-                        long vv = v1;
-                        while (vv > 1) { vv >>= 1; k++; }
-                        /* k must be 1, 2, or 3 (SIB scale field) */
-                        if (k >= 1 && k <= 3 &&
-                            flags_clear(next_code(i), F_ALL6)) {
-                            char operand[MAXTOK];
-                            emit_lea_scaled(operand, r50, 1 << k);
-                            strcpy(g_build, pi->prefix);
-                            strcat(g_build, "lea ");
-                            strcat(g_build, pi->op0);
-                            strcat(g_build, ", ");
-                            strcat(g_build, operand);
-                            if (pi->comment[0] != '\0') {
-                                strcat(g_build, " ");
-                                strcat(g_build, pi->comment);
-                            }
-                            vlog("smartpp: line %ld: 'imul %s, %ld' rewritten to 'lea %s, %s' (P50)\n",
-                                i + 1, pi->op0, v, pi->op0, operand);
-                            replace_line(i, g_build);
-                            st[50]++;
-                        }
-                    }
-                    }
-                }
+                /* P50 (v2.14, REMOVED): "imul R, K" with K = 2^k+1 ->
+                 *  "lea R, [R+R*k]" is now handled by the unified
+                 *  strength-reduction engine further down (P380), which
+                 *  covers 3, 5, 9 plus 6, 7, 10, 11, 12, 13, 14, 15 and
+                 *  every m*2^a form of those, with the same width and
+                 *  flag gates.  See rname[50]. */
             }
         }
 
@@ -5667,28 +9258,7 @@ static long run_pass(void)
             }
         }
 
-        /* P21: two consecutive identical "cld/std/cli/sti/clc/stc":
-        *  the second writes the same flag bit with the same value
-        *  and nothing reads or changes it in between.  "cmc" is
-        *  not idempotent (P25 handles its double instead). */
-        if (!pi->toobig && pi->cls == I_OTHER && pi->nops == 0 &&
-            (ci_eq(pi->mnem, "cld") || ci_eq(pi->mnem, "std") ||
-             ci_eq(pi->mnem, "cli") || ci_eq(pi->mnem, "sti") ||
-             ci_eq(pi->mnem, "clc") || ci_eq(pi->mnem, "stc"))) {
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                struct pinfo *pj = &g_ppair;
-                parse_line(j, pj);
-                if (!pj->haslabel && !pj->toobig &&
-                    pj->cls == I_OTHER && pj->nops == 0 &&
-                    ci_eq(pj->mnem, pi->mnem)) {
-                    vlog("smartpp: line %ld: deleted duplicate '%s' (P21)\n",
-                        j + 1, pj->mnem);
-                    DEL(j) = 1;
-                    st[21]++;
-                }
-            }
-        }
+        /* P21 (v2.25): migrated to table rules (cld/std/cli/sti/clc/stc). */
 
         /* P22: "inc R / dec R" (either order, same register, not
         *  SP): the value is restored, but the final flags are the
@@ -5721,30 +9291,7 @@ static long run_pass(void)
             }
         }
 
-        /* P23: "not R / not R" (same register): the value is
-        *  restored and "not" touches no flag at all, so the pair
-        *  is exactly dead with no scan.  Registers only (a
-        *  repeated write to memory-mapped space may be
-        *  meaningful). */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
-            pi->nops == 1 && ci_eq(pi->mnem, "not") &&
-            find_reg(pi->op0) >= 0) {
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                struct pinfo *pj = &g_ppair;
-                parse_line(j, pj);
-                if (!pj->haslabel && !pj->toobig &&
-                    pj->cls == I_OTHER && pj->nops == 1 &&
-                    ci_eq(pj->mnem, "not") && ci_eq(pj->op0, pi->op0)) {
-                    vlog("smartpp: line %ld: deleted 'not %s' / 'not %s' pair (P23)\n",
-                        i + 1, pi->op0, pj->op0);
-                    DEL(i) = 1;
-                    DEL(j) = 1;
-                    st[23]++;
-                    continue;
-                }
-            }
-        }
+        /* P23 migrated to table (v1.90) */
 
         /* P24: "neg R / neg R" (same register, not SP): the value
         *  is restored, but the final flags are the second neg's,
@@ -5839,27 +9386,7 @@ static long run_pass(void)
             }
         }
 
-        /* P25: "cmc / cmc": the carry is inverted twice, i.e.
-        *  restored; no other flag is touched, so the pair is
-        *  exactly dead without a scan. */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
-            pi->nops == 0 && ci_eq(pi->mnem, "cmc")) {
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                struct pinfo *pj = &g_ppair;
-                parse_line(j, pj);
-                if (!pj->haslabel && !pj->toobig &&
-                    pj->cls == I_OTHER && pj->nops == 0 &&
-                    ci_eq(pj->mnem, "cmc")) {
-                    vlog("smartpp: line %ld: deleted 'cmc' / 'cmc' pair (P25)\n",
-                        i + 1);
-                    DEL(i) = 1;
-                    DEL(j) = 1;
-                    st[25]++;
-                    continue;
-                }
-            }
-        }
+        /* P25 migrated to table (v1.90) */
 
         /* P27: "add R,S / sub R,S" (either order, both operands
         *  registers, different registers): R is restored and S is
@@ -5897,30 +9424,7 @@ static long run_pass(void)
             }
         }
 
-        /* P28: two consecutive identical "cbw/cwde/cwd/cdq" (or the
-        *  AT&T names "cbtw/cwtl/cwtd/cltd"): the second re-derives
-        *  the same high half from the same, unchanged low half and
-        *  touches no flags. */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
-            pi->nops == 0 &&
-            (ci_eq(pi->mnem, "cbw") || ci_eq(pi->mnem, "cwde") ||
-             ci_eq(pi->mnem, "cwd") || ci_eq(pi->mnem, "cdq") ||
-             ci_eq(pi->mnem, "cbtw") || ci_eq(pi->mnem, "cwtl") ||
-             ci_eq(pi->mnem, "cwtd") || ci_eq(pi->mnem, "cltd"))) {
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                struct pinfo *pj = &g_ppair;
-                parse_line(j, pj);
-                if (!pj->haslabel && !pj->toobig &&
-                    pj->cls == I_OTHER && pj->nops == 0 &&
-                    ci_eq(pj->mnem, pi->mnem)) {
-                    vlog("smartpp: line %ld: deleted duplicate '%s' (P28)\n",
-                        j + 1, pj->mnem);
-                    DEL(j) = 1;
-                    st[28]++;
-                }
-            }
-        }
+        /* P28 (v2.26): migrated to table rules. */
 
         /* P39 (v1.80): "add R, c / sub R, c" (or reverse, c != 0)
         *  -> both deleted.  Net effect on R: zero (restored); the
@@ -6001,75 +9505,25 @@ static long run_pass(void)
             }
         }
 
-        /* P40 (v1.80): "mov R, imm1 / add R, imm2" (or sub) ->
-        *  "mov R, imm1 + imm2" (or "imm1 - imm2").  FPC's constant-
-        *  propagation idiom.  The add/sub defines all six flags, the
-        *  combined mov defines none, so the scan must prove them
-        *  dead.  Registers only; the sum must fit the mov R,imm
-        *  immediate encoding range. */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_MOV &&
-            pi->dreg >= 0 && pi->sreg < 0 && pi->srcimm) {
-            long v1, v2, total;
-            int r = pi->dreg;
-            int w = g_regs[r].hi - g_regs[r].lo;
-            long lim = (w == 8) ? 0x7F :
-                       (w == 16) ? 0x7FFF : 0x7FFFFFFFL;
-            if (try_parse_number(pi->op1, &v1)) {
-                j = next_code(i);
-                if (j >= 0 && !INDEF(j)) {
-                    struct pinfo *pj = &g_ppair;
-                    parse_line(j, pj);
-                    if (!pj->haslabel && !pj->toobig &&
-                        pj->cls == I_OTHER && pj->nops == 2 &&
-                        (ci_eq(pj->mnem, "add") || ci_eq(pj->mnem, "sub")) &&
-                        find_reg(pj->op0) == r &&
-                        try_parse_number(pj->op1, &v2)) {
-                        total = (ci_eq(pj->mnem, "add")) ? v1 + v2 : v1 - v2;
-                        if (total <= lim && total >= -(lim + 1) &&
-                            flags_clear(next_code(j), F_ALL6)) {
-                            char num[32];
-                            strcpy(g_build, pi->prefix);
-                            strcat(g_build, "mov ");
-                            if (g_att) {
-                                strcat(g_build, "$");
-                                sprintf(num, "%ld", total);
-                                strcat(g_build, num);
-                                strcat(g_build, ", ");   /* pi->op0 already has % for AT&T */
-                                strcat(g_build, pi->op0);
-                            } else {
-                                strcat(g_build, pi->op0);
-                                strcat(g_build, ", ");
-                                sprintf(num, "%ld", total);
-                                strcat(g_build, num);
-                            }
-                            if (pi->comment[0] != '\0') {
-                                strcat(g_build, " ");
-                                strcat(g_build, pi->comment);
-                            }
-                            vlog("smartpp: line %ld: '%s' / '%s' rewritten to '%s' (P40)\n",
-                                i + 1, L(i), L(j), g_build);
-                            replace_line(i, g_build);
-                            DEL(j) = 1;
-                            st[40]++;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
+        /* P40 (v1.80, REMOVED v2.26): migrated to the table engine.
+         *  The table entries at g_rule_tbl[] (P40 add/sub variants
+         *  with p40_mov_add_fold_check) handle this pattern using the
+         *  M4 ${K + K1} / ${K - K1} arithmetic templates.  The C
+         *  code that was here (~55 lines) is removed; the table
+         *  produces the same output via expand_template + replace_line_marked.
+         *  Research: FPC constant propagation; GCC RTL moveImmediate. */
 
-        /* P43/P44/P45 (v1.80): "xor R, R" followed by a flag-setting
+        /* P43/P76 (v1.80, v2.26): "xor R, R" followed by a flag-setting
         *  arith op on R, all six flags dead, collapses to a single
-        *  "mov R, <constant>".
+        *  "mov R, <constant>" (P43) or "mov R, S" (P76).
         *  P43: add/sub/or/xor R, imm  -> mov R, imm (or -imm)
-        *  P44: inc R                   -> mov R, 1
-        *  P45: dec R                   -> mov R, -1 (Intel "0FFFFh")
-        *  After xor R,R the register is 0; the second op computes a
-        *  known constant from 0.  xor defines all six flags, the
-        *  second op overwrites them, the combined mov defines none:
-        *  the scan must prove all six dead.  Note: pj->dreg is left
-        *  at -1 for I_OTHER ops like add/sub/inc/dec; use find_reg
-        *  on the operand text instead. */
+        *  P76: {add|or|xor} R,S        -> mov R,S  (register source)
+        *  P44 (xor/inc -> mov 1) and P45 (xor/dec -> mov -1) were
+        *  migrated to the table engine in v2.26; they are NOT handled
+        *  here anymore.  After xor R,R the register is 0; the second
+        *  op computes a known constant from 0.  xor defines all six
+        *  flags, the second op overwrites them, the combined mov
+        *  defines none: the scan must prove all six dead. */
         if (!pi->haslabel && !pi->toobig && pi->cls == I_XORRR) {
             j = next_code(i);
             if (j >= 0 && !INDEF(j)) {
@@ -6079,22 +9533,15 @@ static long run_pass(void)
                     find_reg(pj->op0) == pi->dreg) {
                     int r = pi->dreg;
                     int w = g_regs[r].hi - g_regs[r].lo;
-                    long lim = (w == 8) ? 0x7F :
-                               (w == 16) ? 0x7FFF : 0x7FFFFFFFL;
+                    long lim = width_imm_limit(w);
                     long target = 0;          /* 0 means "no match" */
                     int hit = 0;
-                    /* P44: xor R,R / inc R -> mov R, 1 */
-                    if (pj->cls == I_OTHER && pj->nops == 1 &&
-                        ci_eq(pj->mnem, "inc")) {
-                        target = 1; hit = 44;
-                    }
-                    /* P45: xor R,R / dec R -> mov R, -1 */
-                    else if (pj->cls == I_OTHER && pj->nops == 1 &&
-                             ci_eq(pj->mnem, "dec")) {
-                        target = -1; hit = 45;
-                    }
+                    /* v2.26: P44 (inc) and P45 (dec) removed -- now
+                     *  handled by table entries at g_rule_tbl[].  The
+                     *  C code below handles only P43 (imm source) and
+                     *  P76 (register source). */
                     /* P43: xor R,R / {add,sub,or,xor} R, imm -> mov R, K */
-                    else if (pj->cls == I_OTHER && pj->nops == 2 &&
+                    if (pj->cls == I_OTHER && pj->nops == 2 &&
                              (ci_eq(pj->mnem, "add") ||
                               ci_eq(pj->mnem, "sub") ||
                               ci_eq(pj->mnem, "or")  ||
@@ -6137,7 +9584,7 @@ static long run_pass(void)
                             sprintf(num, "%ld", target);
                             strcat(g_build, num);
                         }
-                        if (pi->comment[0] != '\0') {
+                        if (pi->comment[0] != 0) {
                             strcat(g_build, " ");
                             strcat(g_build, pi->comment);
                         }
@@ -6145,9 +9592,7 @@ static long run_pass(void)
                             i + 1, L(i), L(j), g_build, hit);
                         replace_line(i, g_build);
                         DEL(j) = 1;
-                        if (hit == 43) st[43]++;
-                        else if (hit == 44) st[44]++;
-                        else st[45]++;
+                        st[43]++;   /* v2.26: only P43 reaches here now */
                         continue;
                     }
                     /* P76 branch: xor R,R / {add|or|xor} R,S -> mov R,S */
@@ -6166,7 +9611,7 @@ static long run_pass(void)
                             strcat(g_build, ", ");
                             strcat(g_build, pj->op1);
                         }
-                        if (pi->comment[0] != '\0') {
+                        if (pi->comment[0] != 0) {
                             strcat(g_build, " ");
                             strcat(g_build, pi->comment);
                         }
@@ -6181,31 +9626,7 @@ static long run_pass(void)
             }
         }
 
-        /* P48 (v1.80): "xor R, R / test R, R" -> delete the test.
-        *  After "xor R, R", R = 0 and the flags are ZF=1, SF=0, PF=1,
-        *  CF=0, OF=0, AF=undef.  "test R, R" on R = 0 sets exactly the
-        *  same flags (ZF=1, SF=0, PF=1, CF=0, OF=0, AF=undef), so it
-        *  is provably redundant with no scan.  Common hand-written
-        *  pattern from older compilers that "zero then test for the
-        *  following jz/jnz". */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_XORRR) {
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                struct pinfo *pj = &g_ppair;
-                parse_line(j, pj);
-                if (!pj->haslabel && !pj->toobig &&
-                    pj->cls == I_OTHER && pj->nops == 2 &&
-                    ci_eq(pj->mnem, "test") &&
-                    find_reg(pj->op0) == pi->dreg &&
-                    find_reg(pj->op1) == pi->dreg) {
-                    vlog("smartpp: line %ld: deleted redundant 'test %s, %s' after 'xor %s, %s' (P48)\n",
-                        j + 1, pj->op0, pj->op1, pi->op0, pi->op1);
-                    DEL(j) = 1;
-                    st[48]++;
-                    continue;
-                }
-            }
-        }
+        /* P48 (v2.24): migrated to table rule. */
 
         /* ---- v1.70 rules P29..P36.  They read a fresh parse of line i
         *  (pn): an earlier rule of this very iteration may have
@@ -6242,7 +9663,7 @@ static long run_pass(void)
                             try_parse_number(pm->op1, &v) &&
                             v >= 0 && v <= 255 && g_regs[t].hi == 16)
                             kind = 2;
-                        else if (g_curcpu >= 8 && !opt_nz &&
+                        else if (g_curcpu >= 8 && !prefer_xor_mov() &&
                                  !(xf && pm->sreg >= 0 &&
                                    g_regs[pm->sreg].fam == fam) &&
                                  !(xf && pm->sreg < 0 &&
@@ -6392,53 +9813,45 @@ static long run_pass(void)
             }
         }
 
-        /* P46 (v1.80): "push imm / pop R" -> "mov R, imm".  186+
-        *  (push imm).  Both push imm and pop R are flag-neutral, so
-        *  no scan is needed.  Size-gate so we never emit a larger mov:
-        *  - 16-bit R: mov R,imm is 3 bytes; push imm (2 or 3) + pop (1)
-        *    = 3 or 4 bytes; always fire.
-        *  - 32-bit R: mov R,imm32 is 5 bytes; push imm8 + pop = 3 bytes
-        *    (smaller!), push imm32 + pop = 6 bytes (larger).  Fire
-        *    only when imm ∉ [-128, 127].  Off-by-one 0xFFFF and
-        *    0xFFFFFFFF are accepted as "non-imm8". */
-        if (!g_att && !pn->toobig && pn->cls == I_PUSH &&
-            pn->dreg < 0 && pn->srcimm && g_curcpu >= 2) {
-            long imm;
-            if (try_parse_number(pn->op0, &imm)) {
+        /* P46 (v2.19): "push imm / pop R" -> "mov R, imm" (186+).
+         *  Both sides flag-neutral: no scan needed.  Size-gated for
+         *  32-bit R: when imm fits in [-128,127], push imm8 + pop is
+         *  3 bytes vs mov R,imm32 is 5 bytes, so the rule does NOT
+         *  fire.  Always fires for 16-bit R (push imm8/imm16 + pop =
+         *  3-4 bytes, mov R,imm16 = 3 bytes).  SP excluded.
+         *  [LLVM optimizeLEAgon; documented since v1.70 but never
+         *  implemented.] */
+        if (g_curcpu >= 2 && !pn->toobig && pn->cls == I_PUSH &&
+            pn->dreg < 0 && pn->srcimm) {
+            long v46;
+            if (try_parse_number(pn->op0, &v46) || is_offset_expr(pn->op0)) {
                 j = next_code(i);
                 if (j >= 0 && !INDEF(j)) {
                     struct pinfo *pj = &g_ppair;
                     parse_line(j, pj);
                     if (!pj->haslabel && !pj->toobig &&
                         pj->cls == I_POP && pj->dreg >= 0 &&
-                        g_regs[pj->dreg].fam != 4 &&
-                        (g_regs[pj->dreg].hi - g_regs[pj->dreg].lo) >= 16) {
-                        int w = g_regs[pj->dreg].hi - g_regs[pj->dreg].lo;
-                        int fire = 1;
-                        if (w == 32 && imm >= -128 && imm <= 127)
-                            fire = 0;        /* push imm8 + pop is smaller */
-                        if (fire) {
-                            char num[32];
-                            strcpy(g_build, pn->prefix);
+                        g_regs[pj->dreg].fam != 4) {
+                        int w46 = g_regs[pj->dreg].hi - g_regs[pj->dreg].lo;
+                        /* Size gate: 32-bit R with imm8 → keep push+pop
+                         *  (3 bytes vs 5).  16-bit R always (3 vs 3-4).
+                         *  64-bit R: imm8 → 3 bytes vs 7, fire;
+                         *  imm32 → 5 bytes vs 7, fire. */
+                        int fire46 = 1;
+                        if (w46 == 32 && v46 >= -128 && v46 <= 127)
+                            fire46 = 0;
+                        if (fire46) {
+                            strcpy(g_build, pj->prefix);
                             strcat(g_build, "mov ");
-                            if (g_att) {
-                                strcat(g_build, "$");
-                                sprintf(num, "%ld", imm);
-                                strcat(g_build, num);
-                                strcat(g_build, ", ");   /* pj->op0 already has % for AT&T */
-                                strcat(g_build, pj->op0);
-                            } else {
-                                strcat(g_build, pj->op0);
-                                strcat(g_build, ", ");
-                                sprintf(num, "%ld", imm);
-                                strcat(g_build, num);
-                            }
-                            if (pn->comment[0] != '\0') {
+                            strcat(g_build, pj->op0);
+                            strcat(g_build, ", ");
+                            strcat(g_build, pn->op0);
+                            if (pj->comment[0] != '\0') {
                                 strcat(g_build, " ");
-                                strcat(g_build, pn->comment);
+                                strcat(g_build, pj->comment);
                             }
-                            vlog("smartpp: line %ld: '%s' / '%s' rewritten to '%s' (P46)\n",
-                                i + 1, L(i), L(j), g_build);
+                            vlog("smartpp: line %ld: 'push %s' / 'pop %s' rewritten to '%s' (P46)\n",
+                                i + 1, pn->op0, pj->op0, g_build);
                             replace_line(i, g_build);
                             DEL(j) = 1;
                             st[46]++;
@@ -6449,92 +9862,930 @@ static long run_pass(void)
             }
         }
 
-        /* P79 (v1.83): "mov R, imm / push R" with R dead after the
-         *  push -> single "push imm".  mov and push are flag-neutral,
-         *  so no scan is needed for flags; the only effect of the
-         *  mov was to set up R for the push, and once R is dead the
-         *  push imm is equivalent.  186+ (push imm is 186+).
-         *  Size-gated like P46 (avoid making the encoding bigger):
-         *  - 16-bit R: mov R,imm (3 bytes) + push R (1) = 4 bytes;
-         *    push imm (2..3) saves 1..2 bytes.  Always fire.
-         *  - 32-bit R: mov R,imm32 (5 bytes) + push R (1) = 6 bytes;
-         *    push imm8 (2) saves 4 bytes; push imm32 (5) saves 1 byte.
-         *    Always fire.
-         *  The rule is the inverse-direction sibling of P46.  The
-         *  dead-register check uses the reg_dead_after() helper. */
-        if (!g_att && !pn->toobig && pn->cls == I_MOV &&
-            pn->dreg >= 0 && pn->sreg < 0 && pn->srcimm &&
-            g_curcpu >= 2) {
-            long imm;
-            if (try_parse_number(pn->op1, &imm)) {
-                j = next_code(i);
-                if (j >= 0 && !INDEF(j)) {
-                    struct pinfo *pj = &g_ppair;
-                    parse_line(j, pj);
-                    if (!pj->haslabel && !pj->toobig &&
-                        pj->cls == I_PUSH && pj->dreg == pn->dreg &&
-                        g_regs[pj->dreg].fam != 4 &&
-                        reg_dead_after(j, pn->dreg)) {
-                        char num[32];
-                        strcpy(g_build, pn->prefix);
-                        strcat(g_build, "push ");
-                        if (g_att) strcat(g_build, "$");
-                        sprintf(num, "%ld", imm);
-                        strcat(g_build, num);
-                        if (pn->comment[0] != '\0') {
-                            strcat(g_build, " ");
-                            strcat(g_build, pn->comment);
+        /* v1.85 TABLE-DRIVEN FALLBACK: if no bespoke C rule fired on
+         *  this line, consult the declarative rule table.  The table
+         *  can express single-instruction and two-instruction patterns
+         *  with a small set of preconditions (flag liveness, register
+         *  liveness, CPU level, segment size, syntax, next-is-jcc).
+         *  Each rule's actions are applied atomically. */
+        /* ---- v2.14: const-propagation window (extends zero-prop) ----
+         *  After xor R,R / mov R,imm, track known constant values for a
+         *  small set of registers across up to CONST_PROP_WIN linear
+         *  instructions.  v2.13 tracked a single register; v2.14 keeps
+         *  up to KPROP_MAX known (reg, value) pairs and additionally
+         *  propagates through:
+         *    - push R / pop T          (T receives R's known value)
+         *    - lea T,[R+d]             (T receives R's known value + d)
+         *    - mov R,S / movzx/movsx T,S / xchg R,S with known values
+         *    - inc/dec/not/neg/imul-by-imm/shift-by-imm
+         *  Safe folds:
+         *    redundant xor R,R / mov R,K when the register already
+         *      holds that value (the xor additionally needs the six
+         *      status flags dead: its flag effect is not reproduced
+         *      by anything else -- v2.13 deleted it unconditionally,
+         *      which was unsound when a later jcc read the flags);
+         *    test/or/and R,R / cmp R,imm / test R,imm -> fold the
+         *      following jcc/setcc/cmov when ZF is known;
+         *    add/sub/and/or/xor R,imm -> mov R, K' when the six flags
+         *      are dead AND the mov is not larger than the original
+         *      (v2.13 could bloat "add ax, 1" into "mov ax, K+1").
+         *  All value comparisons are masked to the written register's
+         *  width, so mixed-width sequences ("mov eax,5 / mov ax,5")
+         *  can never fold on stale high bits (v2.13 compared values by
+         *  family only, which was unsound for partial writes).
+         *  Stops at labels, branches, calls, opaque instructions,
+         *  writes to a tracked register's family.
+         */
+        {
+            #define CONST_PROP_WIN 8
+            #define PEND_STACK_SZ 4   /* max nested pushes in the window */
+            struct kprop kp[KPROP_MAX];
+            int nkp = 0;
+            /* v2.20: pending-push STACK (was a single slot).  The old
+             *  code tracked only ONE pending push; when an "ajeno"
+             *  push (of an untracked register) intervened between the
+             *  tracked push and its matching pop, the pending slot was
+             *  cleared and the matching pop lost the known value.
+             *  Now each push pushes onto a small LIFO stack of pending
+             *  slots; each pop pops the top, so
+             *    push eax(=42) / push ecx / pop edx / pop ebx
+             *  correctly gives ebx = 42 (the first push, revealed by
+             *  the second pop). */
+            struct {
+                int valid;              /* 1 = known value, 0 = unknown */
+                unsigned long val;
+                int width;
+            } pend_stack[PEND_STACK_SZ];
+            int pend_top = 0;
+            if (!pi->toobig && !pi->haslabel && pi->hasinstr) {
+                if (pi->cls == I_XORRR ||
+                    (ci_eq(pi->mnem, "xor") && pi->nops == 2 &&
+                     find_reg(pi->op0) >= 0 &&
+                     find_reg(pi->op0) == find_reg(pi->op1))) {
+                    kp[0].reg = find_reg(pi->op0);
+                    kp[0].val = 0;
+                    nkp = 1;
+                } else if (pi->cls == I_MOV && pi->srcimm && pi->dreg >= 0) {
+                    long zv;
+                    if (try_parse_number(pi->op1, &zv)) {
+                        kp[0].reg = pi->dreg;
+                        kp[0].val = (unsigned long)zv & reg_mask(pi->dreg);
+                        nkp = 1;
+                    }
+                }
+            }
+            if (nkp > 0 && g_regs[kp[0].reg].fam != 4 /* not SP */) {
+                long k = next_code(i);
+                int steps = 0;
+                while (k >= 0 && steps < CONST_PROP_WIN && nkp > 0) {
+                    struct pinfo *pk = &g_pscan;
+                    int dk, sk;
+                    long imm;
+                    if (DEL(k)) { k = next_code(k); continue; }
+                    parse_line(k, pk);
+                    if (pk->haslabel) break;
+                    if (!pk->hasinstr) { k = next_code(k); steps++; continue; }
+                    if (pk->toobig) break;
+                    if (pk->mnem[0] == '.') break;
+                    if (pk->cls == I_JMP || pk->cls == I_JCC ||
+                        ci_eq(pk->mnem, "call") || ci_eq(pk->mnem, "ret") ||
+                        ci_eq(pk->mnem, "retn") || ci_eq(pk->mnem, "retf") ||
+                        ci_eq(pk->mnem, "int") || ci_eq(pk->mnem, "int3"))
+                        break;
+                    dk = find_reg(pk->op0);
+                    sk = (pk->nops >= 2) ? find_reg(pk->op1) : -1;
+
+                    /* v2.16 SOUNDNESS: anything that moves esp breaks
+                     *  the LIFO pairing between a pending push and its
+                     *  pop ("push eax / add esp,4 / pop ebx" makes ebx
+                     *  receive whatever lies BELOW eax's slot, not
+                     *  eax's value).  Any instruction whose first
+                     *  operand is an SP-family register (add/sub/mov/
+                     *  xchg esp, ...) clears the pending stack. */
+                    if (dk >= 0 && g_regs[dk].fam == 4)
+                        pend_top = 0;
+
+                    /* pusha/popa and string ops clobber whole register
+                     *  sets implicitly: drop everything (lods also
+                     *  writes AL; stos/movs leave AX alone, so other
+                     *  knowledge could survive -- kept conservative) */
+                    if (pk->cls == I_PUSHA || pk->cls == I_POPA ||
+                        is_string_mnem(pk->mnem)) {
+                        nkp = 0;
+                        pend_top = 0;
+                        break;
+                    }
+
+                    /* ---- push / pop propagation ---- */
+                    if (ci_eq(pk->mnem, "push")) {
+                        if (pk->cls == I_PUSH && pk->dreg >= 0) {
+                            int e = kprop_find_fam(kp, nkp,
+                                                   g_regs[pk->dreg].fam);
+                            /* v2.20: push onto the pending stack */
+                            if (pend_top < PEND_STACK_SZ) {
+                                if (e >= 0 && pk->dreg == kp[e].reg) {
+                                    pend_stack[pend_top].valid = 1;
+                                    pend_stack[pend_top].val = kp[e].val;
+                                    pend_stack[pend_top].width = reg_width(pk->dreg);
+                                } else {
+                                    pend_stack[pend_top].valid = 0;
+                                }
+                                pend_top++;
+                            }
+                        } else {
+                            /* imm / mem / pushf: pushes an unknown value */
+                            if (pend_top < PEND_STACK_SZ) {
+                                pend_stack[pend_top].valid = 0;
+                                pend_top++;
+                            }
                         }
-                        vlog("smartpp: line %ld: '%s' / '%s' rewritten to '%s' (P79)\n",
-                            i + 1, L(i), L(j), g_build);
-                        replace_line(i, g_build);
-                        DEL(j) = 1;
-                        st[79]++;
-                        continue;
+                        k = next_code(k); steps++; continue;
+                    }
+                    if (ci_eq(pk->mnem, "pop")) {
+                        /* v2.20: pop from the pending stack (LIFO) */
+                        if (pend_top > 0) {
+                            pend_top--;
+                            if (pk->cls == I_POP && pk->dreg >= 0 &&
+                                g_regs[pk->dreg].fam != 4) {
+                                if (pend_stack[pend_top].valid &&
+                                    pend_stack[pend_top].width ==
+                                    reg_width(pk->dreg))
+                                    kprop_set(kp, &nkp, pk->dreg,
+                                              pend_stack[pend_top].val);
+                                else
+                                    kprop_kill_fam(kp, &nkp,
+                                                   g_regs[pk->dreg].fam);
+                            }
+                        } else if (pk->cls == I_POP && pk->dreg >= 0 &&
+                                 g_regs[pk->dreg].fam != 4) {
+                            /* v2.16 SOUNDNESS: a pop WITHOUT a matching
+                             *  tracked push writes an UNKNOWN value */
+                            kprop_kill_fam(kp, &nkp,
+                                           g_regs[pk->dreg].fam);
+                        }
+                        k = next_code(k); steps++; continue;
+                    }
+                    if (pk->cls == I_PUSHF || pk->cls == I_POPF) {
+                        if (pk->cls == I_PUSHF) {
+                            /* pushf pushes unknown (flags value) */
+                            if (pend_top < PEND_STACK_SZ) {
+                                pend_stack[pend_top].valid = 0;
+                                pend_top++;
+                            }
+                        } else {
+                            /* popf clobbers the stack (restores all) */
+                            pend_top = 0;
+                        }
+                        k = next_code(k); steps++; continue;
+                    }
+
+                    /* ---- lea T,[R+d]: T receives R's known value + d ---- */
+                    if (pk->cls == I_LEA && pk->nops == 2 && dk >= 0) {
+                        int base;
+                        long disp;
+                        if (lea_bracket(pk->op1, &base, &disp) && base >= 0) {
+                            int e = kprop_find_fam(kp, nkp,
+                                                   g_regs[base].fam);
+                            if (e >= 0 && base == kp[e].reg &&
+                                reg_width(dk) == reg_width(kp[e].reg)) {
+                                kprop_set(kp, &nkp, dk,
+                                          kp[e].val + (unsigned long)disp);
+                                k = next_code(k); steps++; continue;
+                            }
+                        }
+                        kprop_kill_fam(kp, &nkp, g_regs[dk].fam);
+                        k = next_code(k); steps++; continue;
+                    }
+
+                    /* ---- mov R,imm: fold or refresh ---- */
+                    if (pk->cls == I_MOV && pk->dreg >= 0 && pk->srcimm &&
+                        try_parse_number(pk->op1, &imm)) {
+                        int e = kprop_find_fam(kp, nkp,
+                                               g_regs[pk->dreg].fam);
+                        /* v2.24 SOUNDNESS FIX: the original check only
+                         *  compared family + width + value-mask, which
+                         *  made P344 think "mov al, 0" also proved AH=0
+                         *  (both width 8, both fam 0, both val-mask 0).
+                         *  That is a miscompile: AH is whatever the
+                         *  caller left, deleting "mov ah, 0" leaves AH
+                         *  untouched.  Add the covers() check so the
+                         *  known register must actually cover every
+                         *  bit the writing register writes.  Same
+                         *  blind spot as the v2.17 cap_regname / OP_SAME
+                         *  fix, just in a different place.  The fix is
+                         *  conservative: cases that used to fire
+                         *  unsoundly (mov al,0 / mov ah,0) now refuse
+                         *  to fire; sound cases (mov ax,0 / mov ah,0)
+                         *  still fire because covers(AX, AH) is true. */
+                        if (e >= 0 &&
+                            covers(kp[e].reg, pk->dreg) &&
+                            (kp[e].val & reg_mask(pk->dreg)) ==
+                            ((unsigned long)imm & reg_mask(pk->dreg))) {
+                            vlog("smartpp: line %ld: deleted redundant const store '%s' (P344)\n",
+                                k + 1, L(k));
+                            DEL(k) = 1; st[344]++;
+                            k = next_code(k); steps++; continue;
+                        }
+                        kprop_set(kp, &nkp, pk->dreg,
+                                  (unsigned long)imm & reg_mask(pk->dreg));
+                        k = next_code(k); steps++; continue;
+                    }
+                    /* mov R,S (register source): copy or kill */
+                    if (pk->cls == I_MOV && pk->dreg >= 0) {
+                        int e = (sk >= 0)
+                            ? kprop_find_fam(kp, nkp, g_regs[sk].fam) : -1;
+                        if (e >= 0 && sk == kp[e].reg &&
+                            reg_width(pk->dreg) == reg_width(sk))
+                            kprop_set(kp, &nkp, pk->dreg, kp[e].val);
+                        else
+                            kprop_kill_fam(kp, &nkp, g_regs[pk->dreg].fam);
+                        k = next_code(k); steps++; continue;
+                    }
+                    if (pk->cls == I_MOV) {     /* mem/segment dest */
+                        k = next_code(k); steps++; continue;
+                    }
+
+                    /* ---- movzx/movsx T,S ---- */
+                    if (pk->cls == I_MOVZX && pk->dreg >= 0) {
+                        int e = (sk >= 0)
+                            ? kprop_find_fam(kp, nkp, g_regs[sk].fam) : -1;
+                        if (e >= 0 && sk == kp[e].reg &&
+                            reg_width(sk) <= reg_width(pk->dreg)) {
+                            unsigned long v = kp[e].val & reg_mask(sk);
+                            if (ci_eq(pk->mnem, "movsx")) {
+                                int ws = reg_width(sk);
+                                int lb = (int)(sizeof(unsigned long) * 8);
+                                if (ws < lb && (v & (1UL << (ws - 1))) != 0)
+                                    v |= ~reg_mask(sk);
+                            }
+                            kprop_set(kp, &nkp, pk->dreg, v);
+                        } else {
+                            kprop_kill_fam(kp, &nkp, g_regs[pk->dreg].fam);
+                        }
+                        k = next_code(k); steps++; continue;
+                    }
+
+                    /* ---- xchg R,S ---- */
+                    if (pk->cls == I_XCHG && pk->dreg >= 0 && pk->sreg >= 0 &&
+                        pk->dreg != pk->sreg) {
+                        int e1 = kprop_find_fam(kp, nkp,
+                                                g_regs[pk->dreg].fam);
+                        int e2 = kprop_find_fam(kp, nkp,
+                                                g_regs[pk->sreg].fam);
+                        if (e1 >= 0 && e2 >= 0 &&
+                            pk->dreg == kp[e1].reg && pk->sreg == kp[e2].reg &&
+                            reg_width(pk->dreg) == reg_width(pk->sreg)) {
+                            unsigned long tv = kp[e1].val;
+                            kp[e1].val = kp[e2].val;
+                            kp[e2].val = tv;
+                        } else {
+                            if (e1 >= 0)
+                                kprop_kill_fam(kp, &nkp,
+                                               g_regs[pk->dreg].fam);
+                            if (e2 >= 0)
+                                kprop_kill_fam(kp, &nkp,
+                                               g_regs[pk->sreg].fam);
+                        }
+                        k = next_code(k); steps++; continue;
+                    }
+
+                    /* ---- readers: cmp / test fold the next jcc ---- */
+                    if ((ci_eq(pk->mnem, "cmp") || ci_eq(pk->mnem, "test")) &&
+                        pk->nops == 2) {
+                        int sets_zf_known = 0;
+                        int zf_val = 0;      /* 1 => ZF set */
+                        int e = (dk >= 0)
+                            ? kprop_find_fam(kp, nkp, g_regs[dk].fam) : -1;
+                        if (e >= 0 &&
+                            reg_width(dk) <= reg_width(kp[e].reg)) {
+                            unsigned long m = reg_mask(dk);
+                            if (sk == dk) {
+                                /* test/or/and R,R or cmp R,R: R vs itself */
+                                sets_zf_known = 1;
+                                zf_val = ci_eq(pk->mnem, "cmp")
+                                    ? 1 : ((kp[e].val & m) == 0);
+                            } else if (sk < 0 &&
+                                       try_parse_number(pk->op1, &imm)) {
+                                unsigned long im =
+                                    (unsigned long)imm & m;
+                                if (ci_eq(pk->mnem, "cmp")) {
+                                    sets_zf_known = 1;
+                                    zf_val = ((kp[e].val & m) == im);
+                                } else {        /* test R,imm */
+                                    sets_zf_known = 1;
+                                    zf_val = ((kp[e].val & im) == 0);
+                                }
+                            }
+                        }
+                        if (sets_zf_known) {
+                            long j2 = next_code(k);
+                            if (j2 >= 0 && !DEL(j2)) {
+                                struct pinfo *pj = &g_ppair;
+                                parse_line(j2, pj);
+                                if (!pj->haslabel && !pj->toobig &&
+                                    pj->hasinstr) {
+                                    const char *lab = pj->op0;
+                                    int always = 0, never = 0;
+                                    if (pj->cls == I_JCC ||
+                                        ci_eq_n(pj->mnem, "j", 1)) {
+                                        if (ci_eq(pj->mnem, "jz") ||
+                                            ci_eq(pj->mnem, "je")) {
+                                            if (zf_val) always = 1;
+                                            else never = 1;
+                                        } else if (ci_eq(pj->mnem, "jnz") ||
+                                                   ci_eq(pj->mnem, "jne")) {
+                                            if (zf_val) never = 1;
+                                            else always = 1;
+                                        }
+                                    } else if (ci_eq_n(pj->mnem, "cmov", 4) &&
+                                               g_curcpu >= 64 &&
+                                               pj->nops == 2) {
+                                        const char *cc = pj->mnem + 4;
+                                        if (ci_eq(cc, "z") ||
+                                            ci_eq(cc, "e")) {
+                                            if (zf_val) always = 2;
+                                            else never = 1;
+                                        } else if (ci_eq(cc, "nz") ||
+                                                   ci_eq(cc, "ne")) {
+                                            if (zf_val) never = 1;
+                                            else always = 2;
+                                        }
+                                    } else if (ci_eq_n(pj->mnem, "set", 3) &&
+                                               pj->nops == 1) {
+                                        const char *cc = pj->mnem + 3;
+                                        int bit = -1;
+                                        if (ci_eq(cc, "z") ||
+                                            ci_eq(cc, "e"))
+                                            bit = zf_val ? 1 : 0;
+                                        else if (ci_eq(cc, "nz") ||
+                                                 ci_eq(cc, "ne"))
+                                            bit = zf_val ? 0 : 1;
+                                        if (bit >= 0) {
+                                            strcpy(g_build, pj->prefix);
+                                            strcat(g_build, "mov ");
+                                            strcat(g_build, pj->op0);
+                                            strcat(g_build,
+                                                   bit ? ", 1" : ", 0");
+                                            vlog("smartpp: line %ld: setcc with known ZF rewritten to '%s' (P385)\n",
+                                                j2 + 1, g_build);
+                                            replace_line(j2, g_build);
+                                            st[385]++;
+                                        }
+                                    }
+                                    if (always == 1) {
+                                        strcpy(g_build, pj->prefix);
+                                        strcat(g_build, "jmp ");
+                                        strcat(g_build, lab);
+                                        vlog("smartpp: line %ld: jcc with known flags rewritten to '%s' (P385)\n",
+                                            j2 + 1, g_build);
+                                        replace_line(j2, g_build);
+                                        st[385]++;
+                                    } else if (always == 2) {
+                                        strcpy(g_build, pj->prefix);
+                                        strcat(g_build, "mov ");
+                                        strcat(g_build, pj->op0);
+                                        strcat(g_build, ", ");
+                                        strcat(g_build, pj->op1);
+                                        vlog("smartpp: line %ld: cmov with known flags rewritten to '%s' (P385)\n",
+                                            j2 + 1, g_build);
+                                        replace_line(j2, g_build);
+                                        st[385]++;
+                                    } else if (never) {
+                                        vlog("smartpp: line %ld: deleted jcc with known flags (P385)\n",
+                                            j2 + 1);
+                                        DEL(j2) = 1;
+                                        st[385]++;
+                                    }
+                                }
+                            }
+                            /* flags defined; keep scanning (values kept) */
+                            k = next_code(k); steps++; continue;
+                        }
+                        /* cmp/test write nothing: keep scanning */
+                        k = next_code(k); steps++; continue;
+                    }
+
+                    /* ---- deterministic writers with an immediate ---- */
+                    if (dk >= 0 && pk->nops == 2 && sk < 0 &&
+                        try_parse_number(pk->op1, &imm)) {
+                        int e = kprop_find_fam(kp, nkp, g_regs[dk].fam);
+                        int exact = (e >= 0 && dk == kp[e].reg);
+                        unsigned long m = reg_mask(dk);
+                        unsigned long nv = 0;
+                        int det = 0, fold = 0, alu = 0;
+                        if (ci_eq(pk->mnem, "add")) {
+                            det = 1; alu = 1; fold = 1;
+                            if (exact) nv = (kp[e].val +
+                                             (unsigned long)imm) & m;
+                        } else if (ci_eq(pk->mnem, "sub")) {
+                            det = 1; alu = 1; fold = 1;
+                            if (exact) nv = (kp[e].val -
+                                             (unsigned long)imm) & m;
+                        } else if (ci_eq(pk->mnem, "and")) {
+                            det = 1; alu = 1; fold = 1;
+                            if (exact) nv = kp[e].val &
+                                            (unsigned long)imm & m;
+                        } else if (ci_eq(pk->mnem, "or")) {
+                            det = 1; alu = 1; fold = 1;
+                            if (exact) nv = (kp[e].val |
+                                             (unsigned long)imm) & m;
+                        } else if (ci_eq(pk->mnem, "xor")) {
+                            det = 1; alu = 1; fold = 1;
+                            if (exact) nv = (kp[e].val ^
+                                             (unsigned long)imm) & m;
+                        } else if (ci_eq(pk->mnem, "imul")) {
+                            det = 1;
+                            if (exact) nv = (kp[e].val *
+                                             (unsigned long)imm) & m;
+                        } else if (pk->cls == I_SHIFT &&
+                                   pk->shiftcount >= 0) {
+                            int w = reg_width(dk);
+                            unsigned long v = exact ? kp[e].val : 0;
+                            int sc = (int)pk->shiftcount;
+                            det = 1;
+                            if (exact) {
+                                if (ci_eq(pk->mnem, "shl") ||
+                                    ci_eq(pk->mnem, "sal")) {
+                                    if (sc < (int)(sizeof(unsigned long)*8))
+                                        nv = (v << sc) & m;
+                                    else nv = 0;
+                                } else if (ci_eq(pk->mnem, "shr")) {
+                                    if (sc < (int)(sizeof(unsigned long)*8))
+                                        nv = (v >> sc) & m;
+                                    else nv = 0;
+                                } else if (ci_eq(pk->mnem, "sar")) {
+                                    int lb = (int)(sizeof(unsigned long)*8);
+                                    long sv;
+                                    if (w < lb)
+                                        sv = (long)((v << (lb - w)) ^
+                                                    (1UL << (lb - 1))) -
+                                             (long)(1UL << (lb - 1));
+                                    else sv = (long)v;
+                                    if (sc < lb) nv =
+                                        ((unsigned long)(sv >> sc)) & m;
+                                    else nv = (sv < 0) ? m : 0;
+                                } else if (ci_eq(pk->mnem, "rol")) {
+                                    sc %= (w > 0) ? w : 1;
+                                    if (sc == 0) nv = v;
+                                    else nv =
+                                        ((v << sc) | (v >> (w - sc))) & m;
+                                } else if (ci_eq(pk->mnem, "ror")) {
+                                    sc %= (w > 0) ? w : 1;
+                                    if (sc == 0) nv = v;
+                                    else nv =
+                                        ((v >> sc) | (v << (w - sc))) & m;
+                                } else {
+                                    det = 0;    /* rcl/rcr: CF-dependent */
+                                }
+                            }
+                        }
+                        if (det) {
+                            /* fold to mov only when it is not a size
+                             *  regression: result 0 (-> xor via P9), or
+                             *  an ALU op whose immediate needed the
+                             *  long form (mov is then shorter). */
+                            if (exact) {
+                                int imm8 = (imm >= -128 && imm <= 127);
+                                int szwin = (nv == 0UL) ||
+                                    (alu && fold && reg_width(dk) >= 16 &&
+                                     !imm8);
+                                if (fold && szwin &&
+                                    flags_clear(next_code(k), F_ALL6)) {
+                                    char num[32];
+                                    sprintf(num, "%lu", nv);
+                                    strcpy(g_build, pk->prefix);
+                                    strcat(g_build, "mov ");
+                                    strcat(g_build, pk->op0);
+                                    strcat(g_build, ", ");
+                                    strcat(g_build, num);
+                                    vlog("smartpp: line %ld: ALU with known operand folded to '%s' (P386)\n",
+                                        k + 1, g_build);
+                                    replace_line(k, g_build);
+                                    st[386]++;
+                                }
+                                kprop_set(kp, &nkp, dk, nv);
+                            } else {
+                                kprop_kill_fam(kp, &nkp, g_regs[dk].fam);
+                            }
+                            k = next_code(k); steps++; continue;
+                        }
+                    }
+
+                    /* ---- deterministic 1-operand writers ---- */
+                    if (dk >= 0 && pk->nops == 1 &&
+                        (ci_eq(pk->mnem, "inc") || ci_eq(pk->mnem, "dec") ||
+                         ci_eq(pk->mnem, "not") || ci_eq(pk->mnem, "neg"))) {
+                        int e = kprop_find_fam(kp, nkp, g_regs[dk].fam);
+                        if (e >= 0 && dk == kp[e].reg) {
+                            unsigned long m = reg_mask(dk);
+                            unsigned long v = kp[e].val;
+                            if (ci_eq(pk->mnem, "inc"))
+                                kprop_set(kp, &nkp, dk, v + 1);
+                            else if (ci_eq(pk->mnem, "dec"))
+                                kprop_set(kp, &nkp, dk, v - 1);
+                            else if (ci_eq(pk->mnem, "not"))
+                                kprop_set(kp, &nkp, dk, ~v);
+                            else
+                                kprop_set(kp, &nkp, dk,
+                                          (v == 0) ? 0 : (m - v + 1));
+                        } else if (e >= 0) {
+                            kprop_kill_fam(kp, &nkp, g_regs[dk].fam);
+                        }
+                        k = next_code(k); steps++; continue;
+                    }
+
+                    /* ---- imul R,S (register multiplier): deterministic
+                     *  only when both operands are known ---- */
+                    if (dk >= 0 && ci_eq(pk->mnem, "imul") && sk >= 0) {
+                        int e1 = kprop_find_fam(kp, nkp, g_regs[dk].fam);
+                        int e2 = kprop_find_fam(kp, nkp, g_regs[sk].fam);
+                        if (e1 >= 0 && e2 >= 0 && dk == kp[e1].reg &&
+                            sk == kp[e2].reg &&
+                            reg_width(dk) == reg_width(sk)) {
+                            kprop_set(kp, &nkp, dk,
+                                      kp[e1].val * kp[e2].val);
+                        } else {
+                            kprop_kill_fam(kp, &nkp, g_regs[dk].fam);
+                        }
+                        k = next_code(k); steps++; continue;
+                    }
+
+                    /* ---- x87 ops never touch the GP registers ---- */
+                    if (pk->cls == I_X87) {
+                        k = next_code(k); steps++; continue;
+                    }
+
+                    /* ---- any other reg-dest writer kills knowledge ----
+                     *  adc/sbb/rcl/rcr (CF-dependent), mul/div/idiv,
+                     *  shld/shrd, bswap, setcc, segment moves, and every
+                     *  unrecognized mnemonic (cpuid, rdtsc, ...) break
+                     *  the walk entirely -- v2.13 kept scanning through
+                     *  opaque instructions, which was unsound. */
+                    if (dk >= 0) {
+                        kprop_kill_fam(kp, &nkp, g_regs[dk].fam);
+                        k = next_code(k); steps++; continue;
+                    }
+                    break;
+                }
+            }
+            #undef CONST_PROP_WIN
+        }
+
+
+        /* ---- v2.18: extended reverse-mov (P15 window) ----
+         *  mov R,S ... mov S,R  within REV_MOV_WIN lines: if neither
+         *  R nor S is written in between, the second mov is redundant
+         *  (both regs still hold the original S value). */
+        {
+            #define REV_MOV_WIN 6
+            if (!pi->toobig && !pi->haslabel && pi->cls == I_MOV &&
+                pi->dreg >= 0 && pi->sreg >= 0 &&
+                pi->dreg != pi->sreg &&
+                g_regs[pi->dreg].fam != 4 && g_regs[pi->sreg].fam != 4) {
+                int r_dst = pi->dreg, r_src = pi->sreg;
+                int fam_d = g_regs[r_dst].fam, fam_s = g_regs[r_src].fam;
+                long k = next_code(i);
+                int steps = 0;
+                while (k >= 0 && steps < REV_MOV_WIN) {
+                    struct pinfo *pk = &g_pscan;
+                    int dk, sk;
+                    if (DEL(k)) { k = next_code(k); continue; }
+                    parse_line(k, pk);
+                    if (pk->haslabel) break;
+                    if (!pk->hasinstr) { k = next_code(k); steps++; continue; }
+                    if (pk->toobig || pk->mnem[0] == '.') break;
+                    if (pk->cls == I_JMP || pk->cls == I_JCC ||
+                        ci_eq(pk->mnem, "call") || ci_eq(pk->mnem, "ret") ||
+                        ci_eq(pk->mnem, "retn") || ci_eq(pk->mnem, "retf"))
+                        break;
+                    dk = find_reg(pk->op0);
+                    sk = (pk->nops >= 2) ? find_reg(pk->op1) : -1;
+                    /* hit: mov S,R */
+                    if (pk->cls == I_MOV && dk == r_src && sk == r_dst) {
+                        vlog("smartpp: line %ld: deleted reverse mov (P15x)\n",
+                            k + 1);
+                        delete_keep_label(k, pk);
+                        st[15]++;
+                        break;
+                    }
+                    /* write to R or S family kills the equality */
+                    if (dk >= 0 && (g_regs[dk].fam == fam_d ||
+                                    g_regs[dk].fam == fam_s))
+                        break;
+                    if (pk->cls == I_XCHG || pk->cls == I_POP) {
+                        if (dk >= 0 && (g_regs[dk].fam == fam_d ||
+                                        g_regs[dk].fam == fam_s))
+                            break;
+                    }
+                    k = next_code(k);
+                    steps++;
+                }
+            }
+            #undef REV_MOV_WIN
+        }
+
+        /* ---- v2.18 x64: xor r32,r32 already zeros r64; drop
+         *  following xor r64,r64 of the same family.  Also drop
+         *  mov r32,r32 (P1) is enough for identity; extra: after
+         *  any 32-bit GP write, a same-reg mov r32,r32 is P1. */
+        if (g_curcpu >= 128 && !pi->toobig && !pi->haslabel &&
+            ci_eq(pi->mnem, "xor") && pi->nops == 2) {
+            int r0 = find_reg(pi->op0), r1 = find_reg(pi->op1);
+            if (r0 >= 0 && r0 == r1) {
+                int w = g_regs[r0].hi - g_regs[r0].lo;
+                if (w == 32) {
+                    long k = next_code(i);
+                    if (k >= 0 && !DEL(k)) {
+                        struct pinfo *pk = &g_pscan;
+                        parse_line(k, pk);
+                        if (!pk->haslabel && ci_eq(pk->mnem, "xor") &&
+                            pk->nops == 2) {
+                            int q0 = find_reg(pk->op0), q1 = find_reg(pk->op1);
+                            if (q0 >= 0 && q0 == q1 &&
+                                g_regs[q0].fam == g_regs[r0].fam &&
+                                (g_regs[q0].hi - g_regs[q0].lo) == 64) {
+                                vlog("smartpp: line %ld: deleted xor r64 after xor r32 (P343 x64)\n",
+                                    k + 1);
+                                delete_keep_label(k, pk);
+                                st[343]++;
+                            }
+                        }
                     }
                 }
             }
         }
 
-        /* P80 (v1.83): "push R / <writer to R that does not read R>
-         *  / pop R" with R not read between push and pop -> all
-         *  three deleted.  The push saves R, the writer overwrites
-         *  it (so the saved value is irrelevant), and the pop restores
-         *  R to the writer's output (which is dead by the writer's
-         *  own dead-store discipline).  Net effect on R: it gets the
-         *  writer's value, then the pop makes R := (writer's value)
-         *  again -- the pop is the redundant step.  Together the
-         *  three instructions are equivalent to the writer alone,
-         *  which by assumption does not read R, so the pop's source
-         *  (the stack slot holding the original R) is also irrelevant.
-         *  The writer must define all bits of R (covers) without
-         *  reading R (writer_ok already encodes this); a partial
-         *  writer (e.g. mov al, X to overwrite ax's low byte) is
-         *  rejected.  16/32-bit only (8-bit push/pop is not legal).
-         *  No flag scan: push/pop and the flag-neutral writers
-         *  (mov/lea/movzx/xor R,R) all leave flags unchanged. */
-        if (!pi->haslabel && !pi->toobig &&
-            pi->cls == I_PUSH && pi->dreg >= 0 &&
-            (g_regs[pi->dreg].hi - g_regs[pi->dreg].lo) >= 16 &&
-            g_regs[pi->dreg].fam != 4) {
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
+
+        /* ---- v2.19: constant-flag jumps (SAFE; label from op0) ----
+         *  Table templates cannot bind jcc targets ($a is a reg capture).
+         *  Implemented here with explicit label copy. */
+        if (!pi->toobig && !pi->haslabel && pi->hasinstr) {
+            long j = next_code(i);
+            if (j >= 0 && !DEL(j)) {
                 struct pinfo *pj = &g_ppair;
                 parse_line(j, pj);
-                if (!pj->haslabel && !pj->toobig &&
-                    writer_ok(pj, pi->dreg)) {
-                    long k80 = next_code(j);
-                    if (k80 >= 0 && !INDEF(k80)) {
-                        struct pinfo *pk = &g_plook;
-                        parse_line(k80, pk);
-                        if (!pk->haslabel && !pk->toobig &&
-                            pk->cls == I_POP && pk->dreg == pi->dreg) {
-                            vlog("smartpp: line %ld: deleted push/write/pop triple (P80)\n",
-                                i + 1);
-                            DEL(i) = 1;   /* push */
-                            DEL(k80) = 1;  /* pop */
-                            /* keep the writer (line j) intact */
-                            st[80]++;
+                if (!pj->haslabel && !pj->toobig && pj->hasinstr &&
+                    pj->nops >= 1 && pj->op0[0] != '\0') {
+                    const char *lab = pj->op0;
+                    int fire = 0;
+                    /* clc / jnc L -> jmp L */
+                    if (ci_eq(pi->mnem, "clc") &&
+                        (ci_eq(pj->mnem, "jnc") || ci_eq(pj->mnem, "jae") ||
+                         ci_eq(pj->mnem, "jnb"))) {
+                        strcpy(g_build, pi->prefix);
+                        strcat(g_build, "jmp ");
+                        strcat(g_build, lab);
+                        vlog("smartpp: line %ld: 'clc' / jnc rewritten to '%s' (P351)\n",
+                            i + 1, g_build);
+                        replace_line(i, g_build);
+                        DEL(j) = 1;
+                        st[351]++;
+                        fire = 1;
+                    }
+                    /* stc / jc L -> jmp L */
+                    else if (ci_eq(pi->mnem, "stc") &&
+                             (ci_eq(pj->mnem, "jc") || ci_eq(pj->mnem, "jb") ||
+                              ci_eq(pj->mnem, "jnae"))) {
+                        strcpy(g_build, pi->prefix);
+                        strcat(g_build, "jmp ");
+                        strcat(g_build, lab);
+                        vlog("smartpp: line %ld: 'stc' / jc rewritten to '%s' (P352)\n",
+                            i + 1, g_build);
+                        replace_line(i, g_build);
+                        DEL(j) = 1;
+                        st[352]++;
+                        fire = 1;
+                    }
+                    /* clc / jc L -> delete jc */
+                    else if (ci_eq(pi->mnem, "clc") &&
+                             (ci_eq(pj->mnem, "jc") || ci_eq(pj->mnem, "jb") ||
+                              ci_eq(pj->mnem, "jnae"))) {
+                        vlog("smartpp: line %ld: deleted '%s' after 'clc' (P353)\n",
+                            j + 1, L(j));
+                        DEL(j) = 1;
+                        st[353]++;
+                        fire = 1;
+                    }
+                    /* stc / jnc L -> delete jnc */
+                    else if (ci_eq(pi->mnem, "stc") &&
+                             (ci_eq(pj->mnem, "jnc") || ci_eq(pj->mnem, "jae") ||
+                              ci_eq(pj->mnem, "jnb"))) {
+                        vlog("smartpp: line %ld: deleted '%s' after 'stc' (P354)\n",
+                            j + 1, L(j));
+                        DEL(j) = 1;
+                        st[354]++;
+                        fire = 1;
+                    }
+                    /* xor R,R / jz|je L -> jmp L (keep xor; rewrite jcc) */
+                    else if ((pi->cls == I_XORRR ||
+                              (ci_eq(pi->mnem, "xor") && pi->nops == 2 &&
+                               find_reg(pi->op0) >= 0 &&
+                               find_reg(pi->op0) == find_reg(pi->op1))) &&
+                             (ci_eq(pj->mnem, "jz") || ci_eq(pj->mnem, "je"))) {
+                        strcpy(g_build, pj->prefix);
+                        strcat(g_build, "jmp ");
+                        strcat(g_build, lab);
+                        vlog("smartpp: line %ld: 'xor R,R' / jz rewritten to '%s' (P355)\n",
+                            j + 1, g_build);
+                        replace_line(j, g_build);
+                        st[355]++;
+                        fire = 1;
+                    }
+                    /* xor R,R / jnz|jne L -> delete jcc */
+                    else if ((pi->cls == I_XORRR ||
+                              (ci_eq(pi->mnem, "xor") && pi->nops == 2 &&
+                               find_reg(pi->op0) >= 0 &&
+                               find_reg(pi->op0) == find_reg(pi->op1))) &&
+                             (ci_eq(pj->mnem, "jnz") || ci_eq(pj->mnem, "jne"))) {
+                        vlog("smartpp: line %ld: deleted '%s' after 'xor R,R' (P356)\n",
+                            j + 1, L(j));
+                        DEL(j) = 1;
+                        st[356]++;
+                        fire = 1;
+                    }
+                    /* ---- setcc after constant flags (GCC/Clang/MSVC idioms) ----
+                     *  xor R,R sets ZF=1,SF=0,PF=1,CF=0,OF=0.
+                     *  setz/sete -> 1; setnz/setne -> 0; sets -> 0; setc/setb -> 0. */
+                    else if ((pi->cls == I_XORRR ||
+                              (ci_eq(pi->mnem, "xor") && pi->nops == 2 &&
+                               find_reg(pi->op0) >= 0 &&
+                               find_reg(pi->op0) == find_reg(pi->op1))) &&
+                             (ci_eq(pj->mnem, "setz") || ci_eq(pj->mnem, "sete") ||
+                              ci_eq(pj->mnem, "setnz") || ci_eq(pj->mnem, "setne") ||
+                              ci_eq(pj->mnem, "sets") || ci_eq(pj->mnem, "setns") ||
+                              ci_eq(pj->mnem, "setc") || ci_eq(pj->mnem, "setb") ||
+                              ci_eq(pj->mnem, "setnc") || ci_eq(pj->mnem, "setae") ||
+                              ci_eq(pj->mnem, "seto") || ci_eq(pj->mnem, "setno"))) {
+                        int val = -1;
+                        if (ci_eq(pj->mnem, "setz") || ci_eq(pj->mnem, "sete") ||
+                            ci_eq(pj->mnem, "setns") || ci_eq(pj->mnem, "setnc") ||
+                            ci_eq(pj->mnem, "setae") || ci_eq(pj->mnem, "setno"))
+                            val = 1;
+                        else
+                            val = 0; /* setnz/setne/sets/setc/setb/seto */
+                        if (pj->nops >= 1 && pj->op0[0] != '\0') {
+                            strcpy(g_build, pj->prefix);
+                            if (val == 0) {
+                                /* xor dest,dest is better zeroing if 32/64-bit;
+                                 *  for 8-bit setcc dest, mov dest,0 is fine. */
+                                strcat(g_build, "mov ");
+                                strcat(g_build, pj->op0);
+                                strcat(g_build, ", 0");
+                            } else {
+                                strcat(g_build, "mov ");
+                                strcat(g_build, pj->op0);
+                                strcat(g_build, ", 1");
+                            }
+                            vlog("smartpp: line %ld: setcc after 'xor R,R' rewritten to '%s' (P360)\n",
+                                j + 1, g_build);
+                            replace_line(j, g_build);
+                            st[360]++;
+                            fire = 1;
+                        }
+                    }
+                    /* clc / setc|setb -> mov 0; clc / setnc|setae -> mov 1 */
+                    else if (ci_eq(pi->mnem, "clc") &&
+                             (ci_eq(pj->mnem, "setc") || ci_eq(pj->mnem, "setb") ||
+                              ci_eq(pj->mnem, "setnc") || ci_eq(pj->mnem, "setae") ||
+                              ci_eq(pj->mnem, "setnb"))) {
+                        int val = (ci_eq(pj->mnem, "setnc") ||
+                                   ci_eq(pj->mnem, "setae") ||
+                                   ci_eq(pj->mnem, "setnb")) ? 1 : 0;
+                        if (pj->nops >= 1 && pj->op0[0] != '\0') {
+                            strcpy(g_build, pj->prefix);
+                            strcat(g_build, "mov ");
+                            strcat(g_build, pj->op0);
+                            strcat(g_build, val ? ", 1" : ", 0");
+                            vlog("smartpp: line %ld: setcc after 'clc' rewritten to '%s' (P361)\n",
+                                j + 1, g_build);
+                            replace_line(j, g_build);
+                            st[361]++;
+                            fire = 1;
+                        }
+                    }
+                    /* stc / setc|setb -> mov 1; stc / setnc -> mov 0 */
+                    else if (ci_eq(pi->mnem, "stc") &&
+                             (ci_eq(pj->mnem, "setc") || ci_eq(pj->mnem, "setb") ||
+                              ci_eq(pj->mnem, "setnc") || ci_eq(pj->mnem, "setae") ||
+                              ci_eq(pj->mnem, "setnb"))) {
+                        int val = (ci_eq(pj->mnem, "setc") ||
+                                   ci_eq(pj->mnem, "setb")) ? 1 : 0;
+                        if (pj->nops >= 1 && pj->op0[0] != '\0') {
+                            strcpy(g_build, pj->prefix);
+                            strcat(g_build, "mov ");
+                            strcat(g_build, pj->op0);
+                            strcat(g_build, val ? ", 1" : ", 0");
+                            vlog("smartpp: line %ld: setcc after 'stc' rewritten to '%s' (P362)\n",
+                                j + 1, g_build);
+                            replace_line(j, g_build);
+                            st[362]++;
+                            fire = 1;
+                        }
+                    }
+                    if (fire) continue;
+                }
+            }
+        }
+
+
+        /* ---- v2.21: lea R,[S+S] -> lea R,[S*2] (386+ SIB scale) ----
+         *  Compilers emit [S*2] or [S+S]; canonicalize to scale form. */
+        if (!pi->toobig && !pi->haslabel && pi->cls == I_LEA &&
+            pi->nops == 2 && g_curcpu >= 8 /* 386 */) {
+            int r1 = -1, r2 = -1;
+            long disp = 0;
+            if (lea_two_regs(pi->op1, &r1, &r2, &disp) &&
+                r1 >= 0 && r2 >= 0 &&
+                g_regs[r1].fam == g_regs[r2].fam &&
+                disp == 0) {
+                char operand[MAXTOK];
+                /* Emit [S*2] or [S+S*1] - prefer scale */
+                if (g_att)
+                    sprintf(operand, "(,%%%s,2)", g_regs[r1].name);
+                else
+                    sprintf(operand, "[%s*2]", g_regs[r1].name);
+                strcpy(g_build, pi->prefix);
+                strcat(g_build, "lea ");
+                strcat(g_build, pi->op0);
+                strcat(g_build, ", ");
+                strcat(g_build, operand);
+                if (pi->comment[0] != 0) {
+                    strcat(g_build, " ");
+                    strcat(g_build, pi->comment);
+                }
+                vlog("smartpp: line %ld: 'lea %s, %s' canonicalized to '%s' (P365)\n",
+                    i + 1, pi->op0, pi->op1, g_build);
+                replace_line(i, g_build);
+                st[365]++;
+                continue;
+            }
+        }
+
+        /* ---- v2.21: cmov after constant flags (P6+) ----
+         *  xor R,R => ZF=1, CF=0, SF=0, OF=0
+         *  cmovz/cmove  dest,src -> mov dest,src (always)
+         *  cmovnz/cmovne dest,src -> delete (never; dest unchanged)
+         *  cmovc/cmovb -> delete; cmovnc/cmovae -> mov
+         *  cmovs -> delete; cmovns -> mov
+         *  cmovo -> delete; cmovno -> mov */
+        if (g_curcpu >= 64 && !pi->toobig && !pi->haslabel && pi->hasinstr) {
+            int is_xor0 = (pi->cls == I_XORRR ||
+                (ci_eq(pi->mnem, "xor") && pi->nops == 2 &&
+                 find_reg(pi->op0) >= 0 &&
+                 find_reg(pi->op0) == find_reg(pi->op1)));
+            int is_clc = ci_eq(pi->mnem, "clc");
+            int is_stc = ci_eq(pi->mnem, "stc");
+            if (is_xor0 || is_clc || is_stc) {
+                long j = next_code(i);
+                if (j >= 0 && !DEL(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig && pj->hasinstr &&
+                        ci_eq_n(pj->mnem, "cmov", 4) && pj->nops == 2) {
+                        const char *cc = pj->mnem + 4; /* after "cmov" */
+                        int always = 0, never = 0;
+                        if (is_xor0) {
+                            /* ZF=1 SF=0 CF=0 OF=0 */
+                            if (ci_eq(cc, "z") || ci_eq(cc, "e")) always = 1;
+                            else if (ci_eq(cc, "nz") || ci_eq(cc, "ne")) never = 1;
+                            else if (ci_eq(cc, "s") || ci_eq(cc, "c") ||
+                                     ci_eq(cc, "b") || ci_eq(cc, "o") ||
+                                     ci_eq(cc, "nae") || ci_eq(cc, "l") ||
+                                     ci_eq(cc, "nge")) never = 1;
+                            else if (ci_eq(cc, "ns") || ci_eq(cc, "nc") ||
+                                     ci_eq(cc, "ae") || ci_eq(cc, "nb") ||
+                                     ci_eq(cc, "no") || ci_eq(cc, "ge") ||
+                                     ci_eq(cc, "nl")) always = 1;
+                        } else if (is_clc) {
+                            /* CF=0 */
+                            if (ci_eq(cc, "c") || ci_eq(cc, "b") ||
+                                ci_eq(cc, "nae")) never = 1;
+                            else if (ci_eq(cc, "nc") || ci_eq(cc, "ae") ||
+                                     ci_eq(cc, "nb")) always = 1;
+                        } else if (is_stc) {
+                            /* CF=1 */
+                            if (ci_eq(cc, "c") || ci_eq(cc, "b") ||
+                                ci_eq(cc, "nae")) always = 1;
+                            else if (ci_eq(cc, "nc") || ci_eq(cc, "ae") ||
+                                     ci_eq(cc, "nb")) never = 1;
+                        }
+                        if (always) {
+                            strcpy(g_build, pj->prefix);
+                            strcat(g_build, "mov ");
+                            strcat(g_build, pj->op0);
+                            strcat(g_build, ", ");
+                            strcat(g_build, pj->op1);
+                            vlog("smartpp: line %ld: cmov with known flags rewritten to '%s' (P366)\n",
+                                j + 1, g_build);
+                            replace_line(j, g_build);
+                            st[366]++;
+                            continue;
+                        }
+                        if (never) {
+                            vlog("smartpp: line %ld: deleted cmov with known flags (P367)\n",
+                                j + 1);
+                            DEL(j) = 1;
+                            st[367]++;
                             continue;
                         }
                     }
@@ -6542,60 +10793,747 @@ static long run_pass(void)
             }
         }
 
-        /* P42 (v1.80): "push bp / mov bp,sp / sub sp,N" -> "enter N, 0".
-        *  186+, 16-bit only (g_use32 == 0).  The three instructions
-        *  are exactly what "enter N, 0" expands to; only the flags
-        *  of the sub sp,N are lost (enter defines none), so the scan
-        *  must prove all six dead.  Size win: 6..7 bytes -> 4 bytes.
-        *
-        *  v1.83 BUG FIX: the rule fired in AT&T mode too, where it
-        *  emitted Intel-syntax `enter N, 0` into a GAS source.  P46,
-        *  P47 and P50 already gate themselves to !g_att; this one
-        *  was missed.  Closing it to !g_att for the same reason. */
-        if (!g_att && !g_use32 && g_curcpu >= 2 && !pn->toobig &&
-            pn->cls == I_PUSH && pn->dreg >= 0 &&
-            g_regs[pn->dreg].fam == 5 &&
-            g_regs[pn->dreg].hi == 16) {
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
+
+        /* ---- v2.22 (-Ox): widen string ops when count is constant ----
+         *  mov CX/ECX, N  ...  rep movsb/stosb/lodsb
+         *  If N is divisible by 2 (or 4), use movsw/stosw/lodsw (or
+         *  dword forms on 386+).  NOT applied to ins/outs: port width
+         *  would change and that is not equivalent for devices.
+         *
+         *  Safety: -Ox only (alignment / overlapping movs can matter
+         *  on real-mode odd pointers; modern CPUs tolerate unaligned
+         *  but behavior with DF=1 and overlap can differ by element
+         *  size).  Count register must not be written in the window. */
+        if (opt_aggressive && !pi->toobig && !pi->haslabel &&
+            pi->cls == I_MOV && pi->srcimm && pi->dreg >= 0) {
+            int cfam = g_regs[pi->dreg].fam;
+            long cnt;
+            /* CX family = 1 in typical tables; also accept ECX/RCX by name */
+            if ((cfam == 1 || ci_eq(g_regs[pi->dreg].name, "cx") ||
+                 ci_eq(g_regs[pi->dreg].name, "ecx") ||
+                 ci_eq(g_regs[pi->dreg].name, "rcx")) &&
+                try_parse_number(pi->op1, & cnt) && cnt > 0) {
+                long k = next_code(i);
+                int steps = 0;
+                #define STR_WIDEN_WIN 8
+                while (k >= 0 && steps < STR_WIDEN_WIN) {
+                    struct pinfo *pk = &g_pscan;
+                    const char *base = NULL; /* "movs" / "stos" / "lods" */
+                    char width = 0;          /* 'b','w','d','q' */
+                    int has_rep = 0;
+                    int dk;
+                    if (DEL(k)) { k = next_code(k); continue; }
+                    parse_line(k, pk);
+                    if (pk->haslabel) break;
+                    if (!pk->hasinstr) { k = next_code(k); steps++; continue; }
+                    if (pk->toobig || pk->mnem[0] == '.') break;
+                    if (pk->cls == I_JMP || pk->cls == I_JCC ||
+                        ci_eq(pk->mnem, "call") || ci_eq(pk->mnem, "ret") ||
+                        ci_eq(pk->mnem, "retn") || ci_eq(pk->mnem, "retf"))
+                        break;
+                    /* count reg written?  v2.18: removed the
+                     *  !(mov && srcimm) carve-out -- "mov CX,M"
+                     *  redefines CX and must break the window, or
+                     *  P370 would widen using the OLD count N while
+                     *  the actual count at the rep is M. */
+                    dk = find_reg(pk->op0);
+                    if (dk >= 0 && g_regs[dk].fam == cfam) {
+                        /* any RMW or redef of CX family */
+                        if (!ci_eq_n(pk->mnem, "movs", 4) &&
+                            !ci_eq_n(pk->mnem, "stos", 4) &&
+                            !ci_eq_n(pk->mnem, "lods", 4) &&
+                            !ci_eq(pk->mnem, "rep") &&
+                            !ci_eq(pk->mnem, "repz") &&
+                            !ci_eq(pk->mnem, "repne"))
+                            break;
+                    }
+                    /* Identify string op: "rep movsb" or mnem movsb */
+                    if (ci_eq(pk->mnem, "rep") || ci_eq(pk->mnem, "repz") ||
+                        ci_eq(pk->mnem, "repne") || ci_eq(pk->mnem, "repnz")) {
+                        has_rep = 1;
+                        if (ci_eq_n(pk->op0, "movs", 4)) base = "movs";
+                        else if (ci_eq_n(pk->op0, "stos", 4)) base = "stos";
+                        else if (ci_eq_n(pk->op0, "lods", 4)) base = "lods";
+                        if (base) {
+                            char last = pk->op0[strlen(pk->op0) - 1];
+                            if (last == 'b' || last == 'w' || last == 'd' ||
+                                last == 'q')
+                                width = last;
+                            else if (ci_eq(pk->op0, "movs") ||
+                                     ci_eq(pk->op0, "stos") ||
+                                     ci_eq(pk->op0, "lods"))
+                                width = 'b'; /* default byte in some ASMs */
+                        }
+                    } else if (ci_eq_n(pk->mnem, "movs", 4) ||
+                               ci_eq_n(pk->mnem, "stos", 4) ||
+                               ci_eq_n(pk->mnem, "lods", 4)) {
+                        /* optional: look back for rep on previous - skip
+                         *  for simplicity require "rep xxx" same line */
+                        if (ci_eq_n(pk->mnem, "movs", 4)) base = "movs";
+                        else if (ci_eq_n(pk->mnem, "stos", 4)) base = "stos";
+                        else base = "lods";
+                        {
+                            char last = pk->mnem[strlen(pk->mnem) - 1];
+                            if (last == 'b' || last == 'w' || last == 'd' ||
+                                last == 'q')
+                                width = last;
+                            else
+                                width = 'b';
+                        }
+                        /* Only upgrade if this line has rep prefix in
+                         *  the raw text (cheap check). */
+                        if (strstr(L(k), "rep") == NULL &&
+                            strstr(L(k), "REP") == NULL)
+                            base = NULL;
+                        else
+                            has_rep = 1;
+                    }
+                    if (base && has_rep && width != 0) {
+                        long newcnt = 0;
+                        char neww = 0;
+                        /* Prefer largest legal width */
+                        if (width == 'b') {
+                            if (g_curcpu >= 8 && (cnt % 4) == 0) {
+                                newcnt = cnt / 4; neww = 'd';
+                            } else if ((cnt % 2) == 0) {
+                                newcnt = cnt / 2; neww = 'w';
+                            }
+                        } else if (width == 'w') {
+                            if (g_curcpu >= 8 && (cnt % 2) == 0) {
+                                newcnt = cnt / 2; neww = 'd';
+                            }
+                        }
+                        /* q forms: only if already on x64 and count even
+                         *  from dword - skip for conservatism */
+                        if (neww && newcnt > 0) {
+                            char newimm[32];
+                            char newstr[32];
+                            sprintf(newimm, "%ld", newcnt);
+                            sprintf(newstr, "%s%c", base, neww);
+                            /* rewrite count */
+                            strcpy(g_build, pi->prefix);
+                            strcat(g_build, "mov ");
+                            strcat(g_build, pi->op0);
+                            strcat(g_build, ", ");
+                            strcat(g_build, newimm);
+                            replace_line(i, g_build);
+                            /* rewrite string insn */
+                            strcpy(g_build, pk->prefix);
+                            if (ci_eq(pk->mnem, "rep") ||
+                                ci_eq(pk->mnem, "repz") ||
+                                ci_eq(pk->mnem, "repne") ||
+                                ci_eq(pk->mnem, "repnz")) {
+                                strcat(g_build, pk->mnem);
+                                strcat(g_build, " ");
+                                strcat(g_build, newstr);
+                            } else {
+                                strcat(g_build, "rep ");
+                                strcat(g_build, newstr);
+                            }
+                            replace_line(k, g_build);
+                            st[370]++;
+                            vlog("smartpp: line %ld/%ld: widen string %s -> %s count %ld -> %ld (-Ox P370)\n",
+                                i + 1, k + 1, base, newstr, cnt, newcnt);
+                            steps = STR_WIDEN_WIN; /* end window */
+                            break; /* one widen per count load */
+                        }
+                    }
+                    k = next_code(k);
+                    steps++;
+                }
+                #undef STR_WIDEN_WIN
+                continue;  /* v2.18: stale pi (old count) would make
+                            *  P79/P87 fire with the wrong immediate */
+            }
+        }
+
+
+        /* ---- v2.23: not R / add R,1 -> neg R (flags dead) ---- */
+        if (!pi->toobig && !pi->haslabel && ci_eq(pi->mnem, "not") &&
+            pi->nops == 1 && find_reg(pi->op0) >= 0) {
+            long j = next_code(i);
+            if (j >= 0 && !DEL(j)) {
+                struct pinfo *pj = &g_ppair;
+                long v;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    ci_eq(pj->mnem, "add") && pj->nops == 2 &&
+                    find_reg(pj->op0) == find_reg(pi->op0) &&
+                    try_parse_number(pj->op1, &v) && v == 1 &&
+                    flags_clear(next_code(j), F_ALL6)) {
+                    strcpy(g_build, pi->prefix);
+                    strcat(g_build, "neg ");
+                    strcat(g_build, pi->op0);
+                    vlog("smartpp: line %ld: 'not' / 'add R,1' folded to '%s' (P371)\n",
+                        i + 1, g_build);
+                    replace_line(i, g_build);
+                    DEL(j) = 1;
+                    st[371]++;
+                    continue;
+                }
+            }
+        }
+
+        /* ---- v2.23: rol R,k / ror R,k (same k) -> delete both ---- */
+        if (!pi->toobig && !pi->haslabel &&
+            (ci_eq(pi->mnem, "rol") || ci_eq(pi->mnem, "ror")) &&
+            pi->nops == 2 && find_reg(pi->op0) >= 0) {
+            long j = next_code(i);
+            long k1, k2;
+            if (j >= 0 && !DEL(j) &&
+                try_parse_number(pi->op1, &k1)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig && pj->nops == 2 &&
+                    find_reg(pj->op0) == find_reg(pi->op0) &&
+                    try_parse_number(pj->op1, &k2) && k1 == k2 &&
+                    ((ci_eq(pi->mnem, "rol") && ci_eq(pj->mnem, "ror")) ||
+                     (ci_eq(pi->mnem, "ror") && ci_eq(pj->mnem, "rol"))) &&
+                    flags_clear(next_code(j), F_ALL6)) {
+                    vlog("smartpp: line %ld: deleted 'rol'/'ror' pair (P373)\n",
+                        i + 1);
+                    DEL(i) = 1;
+                    DEL(j) = 1;
+                    st[373]++;
+                    continue;
+                }
+            }
+        }
+
+        /* ---- v2.23: cmp R,R -> constant-flag jcc ----
+         *  ZF=1, CF=0, SF=0, OF=0 (equal). */
+        if (!pi->toobig && !pi->haslabel && ci_eq(pi->mnem, "cmp") &&
+            pi->nops == 2) {
+            int r0 = find_reg(pi->op0), r1 = find_reg(pi->op1);
+            if (r0 >= 0 && r0 == r1) {
+                long j = next_code(i);
+                if (j >= 0 && !DEL(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig && pj->nops >= 1 &&
+                        pj->op0[0] != 0) {
+                        const char *lab = pj->op0;
+                        int always = 0, never = 0;
+                        /* equal: ZF=1 CF=0 SF=0 OF=0 */
+                        if (ci_eq(pj->mnem, "je") || ci_eq(pj->mnem, "jz") ||
+                            ci_eq(pj->mnem, "jae") || ci_eq(pj->mnem, "jnb") ||
+                            ci_eq(pj->mnem, "jnc") || ci_eq(pj->mnem, "jge") ||
+                            ci_eq(pj->mnem, "jnl") || ci_eq(pj->mnem, "jbe") ||
+                            ci_eq(pj->mnem, "jna") || ci_eq(pj->mnem, "jle") ||
+                            ci_eq(pj->mnem, "jng"))
+                            always = 1;
+                        else if (ci_eq(pj->mnem, "jne") || ci_eq(pj->mnem, "jnz") ||
+                                 ci_eq(pj->mnem, "jb") || ci_eq(pj->mnem, "jnae") ||
+                                 ci_eq(pj->mnem, "jc") || ci_eq(pj->mnem, "jl") ||
+                                 ci_eq(pj->mnem, "jnge") || ci_eq(pj->mnem, "ja") ||
+                                 ci_eq(pj->mnem, "jnbe") || ci_eq(pj->mnem, "jg") ||
+                                 ci_eq(pj->mnem, "jnle"))
+                            never = 1;
+                        if (always) {
+                            strcpy(g_build, pj->prefix);
+                            strcat(g_build, "jmp ");
+                            strcat(g_build, lab);
+                            vlog("smartpp: line %ld: jcc after 'cmp R,R' rewritten to '%s' (P377)\n",
+                                j + 1, g_build);
+                            replace_line(j, g_build);
+                            st[377]++;
+                            continue;
+                        }
+                        if (never) {
+                            vlog("smartpp: line %ld: deleted jcc after 'cmp R,R' (P378)\n",
+                                j + 1);
+                            DEL(j) = 1;
+                            st[378]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+
+        /* ---- v2.14: imul R,K / imul R,S,K -> lea/shl strength reduction
+         *  (386+, flags dead, Intel syntax).  v2.20: now handles the
+         *  3-operand form "imul R, S, K" (R = S * K) as well as the
+         *  2-operand form "imul R, K" (R = R * K).  The LEA uses S
+         *  as the base/index for the 3-operand form.
+         *  Unified engine: absorbs the old C rule P50 and P380.
+         *  Decompose K = m * 2^a with m odd:
+         *    m == 1     -> handled earlier by P38 (shl R,a / delete)
+         *    m == 3/5/9 -> lea R,[S+S*(m-1)]                 (+ shl R,a)
+         *    m == 7     -> lea T,[S+S*2];  lea R,[S+T*2]     (+ shl R,a)
+         *    m == 11    -> lea T,[S+S*4];  lea R,[S+T*2]     (+ shl R,a)
+         *    m == 13    -> lea T,[S+S*2];  lea R,[S+T*4]     (+ shl R,a)
+         *    m == 15    -> lea T,[S+S*2];  lea R,[T+T*4]     (+ shl R,a)
+         *  T is a scratch register of the same width that reg_dead_cf
+         *  proves dead after the imul; the inserted leas write T before
+         *  any existing instruction can read it, so the scan stays
+         *  valid.  Every emitted op except the optional final shl is a
+         *  lea (flag-neutral); the original imul defined the flags too,
+         *  so flags_clear(F_ALL6) is required in all cases.
+         *  Width gate: the SIB byte's scaled-index form needs 32-bit
+         *  registers (or 64-bit on x64); 16-bit addressing has no SIB,
+         *  and ESP/RSP cannot be an index (SIB index field 4 means "no
+         *  index").  This closes the v2.24 hole where a 16-bit imul
+         *  emitted the unencodable "[ax+ax*2]".
+         *  Covers 3,5,6,7,9,10,11,12,13,14,15 and every m*2^a form of
+         *  those (18, 20, 24, 28, 30, 36, 40, 56, ...). */
+        if (!pi->toobig && !pi->haslabel && !g_att &&
+            ci_eq(pi->mnem, "imul") &&
+            (pi->nops == 2 || pi->nops == 3) &&
+            find_reg(pi->op0) >= 0 && g_curcpu >= 8) {
+            long v;
+            int dst_r = find_reg(pi->op0);
+            int src_r;              /* source register for the LEA base */
+            const char *src_name;   /* source register name */
+            int w = g_regs[dst_r].hi - g_regs[dst_r].lo;
+
+            /* v2.20: extract source and immediate based on operand count.
+             *  2-operand "imul R, K": src = R, imm = op1
+             *  3-operand "imul R, S, K": src = S, imm = op2 */
+            if (pi->nops == 3) {
+                src_r = find_reg(pi->op1);
+                if (src_r < 0) goto skip_imul380;
+                src_name = pi->op1;
+                if (!try_parse_number(pi->op2, &v)) goto skip_imul380;
+            } else {
+                src_r = dst_r;
+                src_name = pi->op0;
+                if (!try_parse_number(pi->op1, &v)) goto skip_imul380;
+            }
+
+            if ((w == 32 || (w == 64 && g_curcpu >= 128)) &&
+                g_regs[dst_r].fam != 4 &&
+                g_regs[src_r].fam != 4 &&   /* SIB index can't be SP */
+                v > 1 &&
+                flags_clear(next_code(i), F_ALL6)) {
+                long m = v;
+                int a = 0;
+                char opnd[MAXTOK];
+                while ((m & 1L) == 0) { m >>= 1; a++; }
+                if (m == 3 || m == 5 || m == 9) {
+                    /* single lea, optional trailing shl */
+                    emit_lea_scaled(opnd, src_r, (int)(m - 1));
+                    strcpy(g_build, pi->prefix);
+                    strcat(g_build, "lea ");
+                    strcat(g_build, pi->op0);       /* dest */
+                    strcat(g_build, ", ");
+                    strcat(g_build, opnd);          /* [src+src*k] */
+                    if (pi->comment[0] != 0) {
+                        strcat(g_build, " ");
+                        strcat(g_build, pi->comment);
+                    }
+                    vlog("smartpp: line %ld: 'imul %s, %s, %ld' -> 'lea %s, %s'%s (P380)\n",
+                        i + 1, pi->op0, src_name, v, pi->op0, opnd,
+                        a > 0 ? " + shl" : "");
+                    replace_line(i, g_build);
+                    if (a > 0) {
+                        char shln[MAXTOK];
+                        char nb[16];
+                        strcpy(shln, pi->prefix);
+                        strcat(shln, "shl ");
+                        strcat(shln, pi->op0);
+                        strcat(shln, ", ");
+                        sprintf(nb, "%d", a);
+                        strcat(shln, nb);
+                        insert_line_after(i, shln);
+                    }
+                    st[380]++;
+                    continue;
+                }
+                else {
+                    /* v2.16: table-driven two-lea factors -- 7, 11, 13,
+                     *  15 (as before) plus 17, 19, 21, 25, 27, 37, 41,
+                     *  45, 73 and 81, through a dead scratch register */
+                    const struct imul2_s *t2 = imul2_tab;
+                    while (t2->m != 0 && t2->m != m) t2++;
+                    if (t2->m != 0) {
+                        int t = find_dead_scratch(next_code(i), dst_r, w);
+                        if (t >= 0) {
+                            char shln[MAXTOK];
+                            char nb[16];
+                            /* T = src + src*t_s */
+                            sprintf(g_build, "%slea %s, ", pi->prefix,
+                                g_regs[t].name);
+                            emit_lea_scaled(opnd, src_r, t2->t_s);
+                            strcat(g_build, opnd);
+                            if (pi->comment[0] != 0) {
+                                strcat(g_build, " ");
+                                strcat(g_build, pi->comment);
+                            }
+                            vlog("smartpp: line %ld: 'imul %s, %s, %ld' -> 'lea %s, %s' + 'lea %s, ...'%s (P380)\n",
+                                i + 1, pi->op0, src_name, v, g_regs[t].name, opnd,
+                                pi->op0, a > 0 ? " + shl" : "");
+                            replace_line(i, g_build);
+                            /* R = base + T*f_s  (base = R or T) */
+                            sprintf(g_build, "%slea %s, [%s+%s*%d]",
+                                pi->prefix, pi->op0,
+                                t2->fx_is_t ? g_regs[t].name : src_name,
+                                g_regs[t].name, t2->f_s);
+                            insert_line_after(i, g_build);
+                            if (a > 0) {
+                                strcpy(shln, pi->prefix);
+                                strcat(shln, "shl ");
+                                strcat(shln, pi->op0);
+                                strcat(shln, ", ");
+                                sprintf(nb, "%d", a);
+                                strcat(shln, nb);
+                                insert_line_after(i + 1, shln);
+                            }
+                            st[380]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+            skip_imul380: ;
+        }
+        /* ---- v2.24: LEA CSE in short window ----
+         *  lea R,[expr] ... lea S,[same expr] -> mov S,R if R not written
+         *  and S not SP.  Linear window of 8. */
+        if (!pi->toobig && !pi->haslabel && pi->cls == I_LEA &&
+            pi->nops == 2 && pi->dreg >= 0 &&
+            g_regs[pi->dreg].fam != 4) {
+            long k = next_code(i);
+            int steps = 0;
+            int fam_r = g_regs[pi->dreg].fam;
+            while (k >= 0 && steps < 8) {
+                struct pinfo *pk = &g_pscan;
+                int dk;
+                if (DEL(k)) { k = next_code(k); continue; }
+                parse_line(k, pk);
+                if (pk->haslabel) break;
+                if (!pk->hasinstr) { k = next_code(k); steps++; continue; }
+                if (pk->toobig || pk->mnem[0] == '.') break;
+                if (pk->cls == I_JMP || pk->cls == I_JCC ||
+                    ci_eq(pk->mnem, "call") || ci_eq(pk->mnem, "ret") ||
+                    ci_eq(pk->mnem, "retn") || ci_eq(pk->mnem, "retf"))
+                    break;
+                dk = find_reg(pk->op0);
+                if (pk->cls == I_LEA && pk->nops == 2 && pk->dreg >= 0 &&
+                    lea_expr_eq(pk->op1, pi->op1) &&
+                    pk->dreg != pi->dreg &&
+                    g_regs[pk->dreg].fam != 4) {
+                    /* same address expr -> mov S, R */
+                    strcpy(g_build, pk->prefix);
+                    strcat(g_build, "mov ");
+                    strcat(g_build, pk->op0);
+                    strcat(g_build, ", ");
+                    strcat(g_build, pi->op0);
+                    vlog("smartpp: line %ld: duplicate LEA rewritten to '%s' (P381)\n",
+                        k + 1, g_build);
+                    replace_line(k, g_build);
+                    st[381]++;
+                    break;
+                }
+                /* R written -> stop */
+                if (dk >= 0 && g_regs[dk].fam == fam_r)
+                    break;
+                k = next_code(k);
+                steps++;
+            }
+        }
+
+        /* ---- v2.24: mov R,S / lea T,[R+disp] with R dead -> lea T,[S+disp]
+         *  (S and T registers, Intel syntax). */
+        if (!pi->toobig && !pi->haslabel && !g_att &&
+            pi->cls == I_MOV && pi->dreg >= 0 && pi->sreg >= 0 &&
+            pi->dreg != pi->sreg) {
+            long j = next_code(i);
+            if (j >= 0 && !DEL(j)) {
+                struct pinfo *pj = &g_ppair;
+                int base;
+                long disp;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig && pj->cls == I_LEA &&
+                    pj->nops == 2 &&
+                    lea_bracket(pj->op1, &base, &disp) &&
+                    base == pi->dreg &&
+                    find_reg(pj->op0) != pi->dreg &&
+                    reg_dead_cf(next_code(j), pi->dreg)) {
+                    char opnd[MAXTOK];
+                    emit_lea_disp(opnd, pi->sreg, disp);
+                    strcpy(g_build, pj->prefix);
+                    strcat(g_build, "lea ");
+                    strcat(g_build, pj->op0);
+                    strcat(g_build, ", ");
+                    strcat(g_build, opnd);
+                    vlog("smartpp: line %ld: 'mov %s, %s' / 'lea %s, [%s+d]' folded to 'lea %s, %s' (P382)\n",
+                        j + 1, pi->op0, pi->op1,
+                        pj->op0, pi->op0, pj->op0, opnd);
+                    replace_line(j, g_build);
+                    /* mov may still be needed if S was only for lea - if
+                     *  R was only used for lea and is dead, also delete mov */
+                    /* mov becomes dead if nothing else reads R after it;
+                     *  scan from the line after mov (the lea is rewritten). */
+                    if (reg_dead_cf(next_code(i), pi->dreg)) {
+                        DEL(i) = 1;
+                    }
+                    st[382]++;
+                    continue;
+                }
+            }
+        }
+
+        /* ---- v2.24 (-Ox): call F / ret -> jmp F (tail call) ----
+         *  No intervening instruction.  Conservative: same label form.
+         *
+         *  v2.14 SOUNDNESS GUARD: "call F / ret" is only equivalent to
+         *  "jmp F" when the stack at the call is exactly at function-
+         *  entry depth, i.e. [esp] already points at OUR return
+         *  address.  If the path pushed anything since the last
+         *  boundary (arguments for a stdcall F, saved registers,
+         *  locals), F's "ret N" would pop that payload in the original
+         *  but the top argument in the rewritten form -- a miscompile.
+         *  tailcall_stack_ok() walks backwards accumulating the esp
+         *  delta and fires when the walk reaches the entry boundary
+         *  with delta 0.  It also accepts a sound epilogue: a
+         *  "mov sp,bp / pop bp" pair (or "leave") immediately before
+         *  the call, when the matching "push bp / mov bp,sp" prologue
+         *  is found further up -- esp is then restored absolutely, so
+         *  the delta at the call is entry depth by construction.  The
+         *  call-first form ("call F / add esp,N / ret") is NOT
+         *  rewritten: F's stack arguments would be discarded. */
+        if (opt_aggressive && !pi->toobig && !pi->haslabel &&
+            ci_eq(pi->mnem, "call") && pi->nops == 1 &&
+            tailcall_stack_ok(i)) {
+            long j = next_code(i);
+            if (j >= 0 && !DEL(j)) {
                 struct pinfo *pj = &g_ppair;
                 parse_line(j, pj);
                 if (!pj->haslabel && !pj->toobig &&
-                    pj->cls == I_MOV && pj->dreg >= 0 && pj->sreg >= 0 &&
-                    g_regs[pj->dreg].fam == 5 &&
-                    g_regs[pj->dreg].hi == 16 &&
-                    g_regs[pj->sreg].fam == 4 &&
-                    g_regs[pj->sreg].hi == 16) {
-                    long k2 = next_code(j);
-                    if (k2 >= 0 && !INDEF(k2)) {
-                        struct pinfo *pk = &g_plook;
-                        parse_line(k2, pk);
-                        if (!pk->haslabel && !pk->toobig &&
-                            pk->cls == I_OTHER && pk->nops == 2 &&
-                            ci_eq(pk->mnem, "sub") &&
-                            find_reg(pk->op0) >= 0 &&
-                            g_regs[find_reg(pk->op0)].fam == 4 &&
-                            g_regs[find_reg(pk->op0)].hi == 16) {
-                            long N;
-                            if (try_parse_number(pk->op1, &N) &&
-                                N >= 0 && N <= 0xFFFF &&
-                                flags_clear(next_code(k2), F_ALL6)) {
-                                char num[32];
-                                strcpy(g_build, pn->prefix);
-                                strcat(g_build, "enter ");
-                                sprintf(num, "%ld", N);
-                                strcat(g_build, num);
-                                strcat(g_build, ", 0");
-                                if (pn->comment[0] != '\0') {
+                    (ci_eq(pj->mnem, "ret") || ci_eq(pj->mnem, "retn")) &&
+                    pj->nops == 0) {
+                    strcpy(g_build, pi->prefix);
+                    strcat(g_build, "jmp ");
+                    strcat(g_build, pi->op0);
+                    vlog("smartpp: line %ld: tail-call 'call %s' / 'ret' -> 'jmp %s' (P383)\n",
+                        i + 1, pi->op0, pi->op0);
+                    replace_line(i, g_build);
+                    DEL(j) = 1;
+                    st[383]++;
+                    continue;
+                }
+            }
+        }
+
+        /* ---- v2.16 (-Ox): tail call across the epilogue ----
+         *  call F / mov sp,bp / pop bp / ret   (or: call F / leave / ret)
+         *  -> mov sp,bp / pop bp / jmp F
+         *  The restoration is kept and runs before F; see
+         *  tailcall_epilogue_ok() for the soundness proof. */
+        if (opt_aggressive && !pi->toobig && !pi->haslabel &&
+            ci_eq(pi->mnem, "call") && pi->nops == 1) {
+            long tcl = -1;
+            if (tailcall_epilogue_ok(i, &tcl)) {
+                char tgt[MAXTOK];
+                struct pinfo *pk = &g_pscan;
+                strcpy(tgt, pi->op0);
+                parse_line(tcl, pk);
+                strcpy(g_build, pk->prefix);
+                strcat(g_build, "jmp ");
+                strcat(g_build, tgt);
+                vlog("smartpp: line %ld: tail-call 'call %s' / epilogue / 'ret' -> epilogue + 'jmp %s' (P383)\n",
+                    i + 1, tgt, tgt);
+                replace_line(tcl, g_build);
+                DEL(i) = 1;
+                st[383]++;
+                continue;
+            }
+        }
+
+        /* ---- v2.24 (-Ox): partial reg - movzx R32, R8 after xor R32,R32
+         *  is redundant if only low byte was written by setcc etc - skip.
+         *  Safer: on x64, mov eax,eax is nop (P1). movzx rax,eax after
+         *  32-bit write: delete movzx when source is 32-bit half of dest. */
+        if (g_curcpu >= 128 && !pi->toobig && !pi->haslabel &&
+            (ci_eq(pi->mnem, "movzx") || ci_eq(pi->mnem, "movsx")) &&
+            pi->nops == 2) {
+            int d = find_reg(pi->op0), s = find_reg(pi->op1);
+            if (d >= 0 && s >= 0 && g_regs[d].fam == g_regs[s].fam) {
+                int wd = g_regs[d].hi - g_regs[d].lo;
+                int ws = g_regs[s].hi - g_regs[s].lo;
+                /* movzx rax, eax: 32-bit write already zero-extends on x64 */
+                if (ci_eq(pi->mnem, "movzx") && wd == 64 && ws == 32) {
+                    vlog("smartpp: line %ld: deleted redundant 'movzx %s, %s' (P384)\n",
+                        i + 1, pi->op0, pi->op1);
+                    DEL(i) = 1;
+                    st[384]++;
+                    continue;
+                }
+            }
+        }
+
+
+        /* ---- P387 (v2.14, REMOVED): "or R,R / and R,R -> test R,R".
+         *  Dead code: the C rule P8 (earlier in run_pass) already
+         *  rewrites every "or R,R" / "and R,R" (any width) to
+         *  "test R,R", or deletes it when all flags are dead, so this
+         *  fallback never fired.  See rname[387]. */
+
+        /* ---- v2.15: rules implemented after the coverage review -----
+         *  P17, P41, P47, P56, P63, P68, P70, P79, P80, P82 and
+         *  P85-P87 were documented in this header but had no code
+         *  behind them: their helper parsers (lea_bracket,
+         *  lea_two_regs, lea_scaled_single, emit_lea_disp,
+         *  width_imm_limit) sat unreferenced in smartpp_kept_helpers
+         *  since the v1.85 table refactor.  They are implemented
+         *  below.  P57 is NOT reinstated: the v2.21 rule P365 already
+         *  canonicalizes "lea R,[S+S]" to "lea R,[S*2]" and P63 below
+         *  folds the scaled form to "shl R,log2 K", so a separate P57
+         *  could never fire; see rname[57]. */
+
+        /* P17 (v1.30, extended v1.40; implemented v2.15): FPC's LEA
+         *  conversion.
+         *    "lea R,[const]"       ->  "mov R,const"  (exact, no scan)
+         *    "lea R,[S]" / "[S+0]" ->  "mov R,S"      (equal width;
+         *                              exact: lea computes the offset
+         *                              only, no segment is involved)
+         *    "lea R,[R]" / "[R+0]" ->  deleted (old P124; lea touches
+         *                              no flag and no memory)
+         *    "lea R,[R+1]"         ->  "inc R"  (CF survives inc/dec,
+         *                              matching lea, so only
+         *                              SZAPC+OF must be dead)
+         *    "lea R,[R-1]"         ->  "dec R"   (same gate)
+         *    "lea R,[R+c]"         ->  "add R,c" / "sub R,-c" (all six
+         *                              flags dead; the constant must
+         *                              re-encode at R's width)
+         *  16-bit bases are restricted to BX/BP/SI/DI (the only legal
+         *  16-bit addressing registers); 32-bit bases need the 386+
+         *  addressing forms. */
+        if (!pi->toobig && pi->cls == I_LEA && pi->nops == 2 &&
+            pi->dreg >= 0) {
+            int w17 = reg_width(pi->dreg);
+            int b17;
+            long d17;
+            if ((w17 == 16 || w17 == 32) &&
+                lea_bracket(pi->op1, &b17, &d17)) {
+                if (b17 < 0) {
+                    /* "lea R,[const]" -> "mov R,const" (exact); the
+                     *  constant must fit R's width.  v2.17: the 32-bit
+                     *  case is always satisfiable because d17 is a
+                     *  signed long (32-bit on every target SMARTPP
+                     *  builds for), so the old bounds check
+                     *  (d17 >= INT32_MIN && d17 <= 0xFFFFFFFF) was
+                     *  tautological and tripped W124 ("Comparison
+                     *  result always 1") on Watcom -- 0xFFFFFFFFL
+                     *  promotes the signed d17 to unsigned long for
+                     *  the upper-bound test, which is then always
+                     *  true.  For 16-bit destinations the real
+                     *  range check stays. */
+                    char num[32];
+                    int fit17 = (w17 == 16)
+                        ? (d17 >= -0x8000L && d17 <= 0xFFFFL)
+                        : 1;
+                    if (fit17) {
+                        strcpy(g_build, pi->prefix);
+                        strcat(g_build, "mov ");
+                        if (g_att) {
+                            strcat(g_build, "$");
+                            sprintf(num, "%ld", d17);
+                            strcat(g_build, num);
+                            strcat(g_build, ", ");
+                            strcat(g_build, pi->op0);
+                        } else {
+                            strcat(g_build, pi->op0);
+                            strcat(g_build, ", ");
+                            sprintf(num, "%ld", d17);
+                            strcat(g_build, num);
+                        }
+                        if (pi->comment[0] != 0) {
+                            strcat(g_build, " ");
+                            strcat(g_build, pi->comment);
+                        }
+                        vlog("smartpp: line %ld: 'lea %s, %s' rewritten to '%s' (P17)\n",
+                            i + 1, pi->op0, pi->op1, g_build);
+                        replace_line(i, g_build);
+                        st[17]++;
+                        continue;
+                    }
+                }
+                if (lea_base_ok(b17, w17)) {
+                    if (d17 == 0) {
+                        if (b17 == pi->dreg) {
+                            /* "lea R,[R]" / "[R+0]" -> delete (P124) */
+                            vlog("smartpp: line %ld: deleted 'lea %s, %s' (identity, P17)\n",
+                                i + 1, pi->op0, pi->op1);
+                            DEL(i) = 1;
+                            st[17]++;
+                            continue;
+                        }
+                        if (reg_width(b17) == w17) {
+                            /* "lea R,[S]" -> "mov R,S" (exact) */
+                            strcpy(g_build, pi->prefix);
+                            strcat(g_build, "mov ");
+                            if (g_att) {
+                                strcat(g_build, "%");
+                                strcat(g_build, g_regs[b17].name);
+                                strcat(g_build, ", ");
+                                strcat(g_build, pi->op0);
+                            } else {
+                                strcat(g_build, pi->op0);
+                                strcat(g_build, ", ");
+                                strcat(g_build, g_regs[b17].name);
+                            }
+                            if (pi->comment[0] != 0) {
+                                strcat(g_build, " ");
+                                strcat(g_build, pi->comment);
+                            }
+                            vlog("smartpp: line %ld: 'lea %s, %s' rewritten to '%s' (P17)\n",
+                                i + 1, pi->op0, pi->op1, g_build);
+                            replace_line(i, g_build);
+                            st[17]++;
+                            continue;
+                        }
+                    }
+                    else if (b17 == pi->dreg) {
+                        if (d17 == 1 || d17 == -1) {
+                            /* CF survives inc/dec, matching lea */
+                            if (flags_clear(next_code(i),
+                                            F_ALL6 & ~F_CF)) {
+                                strcpy(g_build, pi->prefix);
+                                strcat(g_build, (d17 == 1) ? "inc " : "dec ");
+                                strcat(g_build, pi->op0);
+                                if (pi->comment[0] != 0) {
                                     strcat(g_build, " ");
-                                    strcat(g_build, pn->comment);
+                                    strcat(g_build, pi->comment);
                                 }
-                                vlog("smartpp: line %ld: '%s' / '%s' / '%s' rewritten to '%s' (P42)\n",
-                                    i + 1, L(i), L(j), L(k2), g_build);
+                                vlog("smartpp: line %ld: 'lea %s, %s' rewritten to '%s' (P17)\n",
+                                    i + 1, pi->op0, pi->op1, g_build);
                                 replace_line(i, g_build);
-                                DEL(j) = 1;
-                                DEL(k2) = 1;
-                                st[42]++;
+                                st[17]++;
+                                continue;
+                            }
+                        } else {
+                            long lim17 = width_imm_limit(w17);
+                            long mag17 = (d17 > 0) ? d17 : -d17;
+                            if (d17 <= lim17 && mag17 <= lim17 &&
+                                flags_clear(next_code(i), F_ALL6)) {
+                                char num[32];
+                                strcpy(g_build, pi->prefix);
+                                if (g_att) {
+                                    strcat(g_build,
+                                        (d17 > 0) ? "add $" : "sub $");
+                                    sprintf(num, "%ld", mag17);
+                                    strcat(g_build, num);
+                                    strcat(g_build, ", ");
+                                    strcat(g_build, pi->op0);
+                                } else {
+                                    strcat(g_build,
+                                        (d17 > 0) ? "add " : "sub ");
+                                    strcat(g_build, pi->op0);
+                                    strcat(g_build, ", ");
+                                    sprintf(num, "%ld", mag17);
+                                    strcat(g_build, num);
+                                }
+                                if (pi->comment[0] != 0) {
+                                    strcat(g_build, " ");
+                                    strcat(g_build, pi->comment);
+                                }
+                                vlog("smartpp: line %ld: 'lea %s, %s' rewritten to '%s' (P17)\n",
+                                    i + 1, pi->op0, pi->op1, g_build);
+                                replace_line(i, g_build);
+                                st[17]++;
                                 continue;
                             }
                         }
@@ -6604,505 +11542,118 @@ static long run_pass(void)
             }
         }
 
-        /* P33: "shl R,N / shr R,N" (or sar) that keeps only the low
-        *  8 or 16 bits -> "movzx R,low" (movsx for sar).  The flags of
-        *  the second shift are lost: the scan must prove all six dead. */
-        if (!g_att && g_curcpu >= 8 && !opt_nz && !pn->toobig &&
-            pn->cls == I_SHIFT && pn->shiftcount > 0 &&
-            (ci_eq(pn->mnem, "shl") || ci_eq(pn->mnem, "sal"))) {
-            int r = find_reg(pn->op0);
-            if (r >= 0 && g_regs[r].lo == 0 && g_regs[r].fam != 4) {
-                int keep = g_regs[r].hi - (int)pn->shiftcount;
-                int lr = (keep == 8 || keep == 16) ?
-                         reg_by_bits(g_regs[r].fam, 0, keep) : -1;
-                j = next_code(i);
-                if (lr >= 0 && j >= 0 && !INDEF(j)) {
-                    struct pinfo *pj = &g_ppair;
-                    parse_line(j, pj);
-                    if (!pj->haslabel && !pj->toobig && pj->cls == I_SHIFT &&
-                        pj->shiftcount == pn->shiftcount &&
-                        ci_eq(pj->op0, pn->op0) &&
-                        (ci_eq(pj->mnem, "shr") || ci_eq(pj->mnem, "sar")) &&
-                        flags_clear(next_code(j), F_ALL6)) {
-                        strcpy(g_build, pn->prefix);
-                        strcat(g_build, ci_eq(pj->mnem, "shr") ?
-                                        "movzx " : "movsx ");
-                        strcat(g_build, g_regs[r].name);
-                        strcat(g_build, ", ");
-                        strcat(g_build, g_regs[lr].name);
-                        if (pn->comment[0] != '\0') {
-                            strcat(g_build, " ");
-                            strcat(g_build, pn->comment);
-                        }
-                        vlog("smartpp: line %ld: '%s' / '%s' rewritten to '%s' (P33)\n",
-                            i + 1, L(i), L(j), g_build);
-                        replace_line(i, g_build);
-                        DEL(j) = 1;
-                        st[33]++;
-                        continue;
-                    }
+        /* P41 (v1.80; implemented v2.15): "lea R,[R+S]" (two different
+         *  registers, equal width, no displacement) -> "add R,S" (all
+         *  six flags dead).  Two-register cousin of P17.  Intel-only
+         *  (the AT&T two-register form carries an index/scale the
+         *  parser refuses).  Pre-386 the only legal 16-bit pairs are
+         *  [BX+SI], [BX+DI], [BP+SI], [BP+DI]; 386+ accepts any
+         *  32-bit pair. */
+        if (!pi->toobig && !pi->haslabel && !g_att &&
+            pi->cls == I_LEA && pi->nops == 2 && pi->dreg >= 0 &&
+            g_regs[pi->dreg].fam != 4) {
+            int w41 = reg_width(pi->dreg);
+            int q41, s41;
+            long d41;
+            if (lea_two_regs(pi->op1, &q41, &s41, &d41) &&
+                d41 == 0 && q41 >= 0 && s41 >= 0 && q41 != s41) {
+                int dst41 = -1, src41 = -1;
+                int pair41 = 0;
+                if (q41 == pi->dreg)      { dst41 = q41; src41 = s41; }
+                else if (s41 == pi->dreg) { dst41 = s41; src41 = q41; }
+                if (w41 == 32) {
+                    pair41 = (g_curcpu >= 8 &&
+                              lea_base_ok(q41, 32) &&
+                              lea_base_ok(s41, 32));
+                } else if (w41 == 16) {
+                    /* legal 16-bit pairs: {BX,BP} + {SI,DI}, any order */
+                    int f1 = g_regs[q41].fam, f2 = g_regs[s41].fam;
+                    pair41 = (reg_width(q41) == 16 && reg_width(s41) == 16 &&
+                              (((f1 == 3 || f1 == 5) &&
+                                (f2 == 6 || f2 == 7)) ||
+                               ((f2 == 3 || f2 == 5) &&
+                                (f1 == 6 || f1 == 7))));
                 }
-            }
-        }
-
-        /* P34: "and R16,0FFh" -> "xor Rh,Rh" when ZF and PF are dead
-        *  (CF, OF and SF come out the same); 386+: "and R32,0FFh /
-        *  0FFFFh" -> "movzx R32,low" when all six flags are dead. */
-        if (!g_att && !pn->toobig && pn->cls == I_OTHER && pn->nops == 2 &&
-            ci_eq(pn->mnem, "and")) {
-            int r = find_reg(pn->op0);
-            long v;
-            if (r >= 0 && g_regs[r].lo == 0 && g_regs[r].fam != 4 &&
-                try_parse_number(pn->op1, &v)) {
-                int rs = g_regs[r].hi;
-                int to = -1;
-                int need = F_ALL6;
-                if (rs == 16 && v == 255) {
-                    to = reg_by_bits(g_regs[r].fam, 8, 16);
-                    need = F_ZF | F_PF;
-                }
-                else if (rs == 32 && g_curcpu >= 8 && !opt_nz &&
-                         (v == 255 || v == 65535L))
-                    to = reg_by_bits(g_regs[r].fam, 0, (v == 255) ? 8 : 16);
-                if (to >= 0 && flags_clear(next_code(i), need)) {
-                    strcpy(g_build, pn->prefix);
-                    if (rs == 16) {
-                        strcat(g_build, "xor ");
-                        strcat(g_build, g_regs[to].name);
-                        strcat(g_build, ", ");
-                        strcat(g_build, g_regs[to].name);
-                    } else {
-                        strcat(g_build, "movzx ");
-                        strcat(g_build, g_regs[r].name);
-                        strcat(g_build, ", ");
-                        strcat(g_build, g_regs[to].name);
-                    }
-                    if (pn->comment[0] != '\0') {
-                        strcat(g_build, " ");
-                        strcat(g_build, pn->comment);
-                    }
-                    vlog("smartpp: line %ld: '%s' rewritten to '%s' (P34)\n",
-                        i + 1, L(i), g_build);
-                    replace_line(i, g_build);
-                    st[34]++;
-                    continue;
-                }
-            }
-        }
-
-        /* P35: "mov R32,-1" -> "or R32,-1" (3 bytes instead of 5) when
-        *  the scan proves all six flags dead. */
-        if (!g_att && g_curcpu >= 8 && !pn->toobig && pn->cls == I_MOV &&
-            pn->dreg >= 0 && pn->sreg < 0 &&
-            (g_regs[pn->dreg].hi - g_regs[pn->dreg].lo) == 32 &&
-            g_regs[pn->dreg].fam != 4) {
-            long v;
-            if (try_parse_number(pn->op1, &v) &&
-                (v == -1L || (unsigned long)v == 0xFFFFFFFFUL) &&
-                flags_clear(next_code(i), F_ALL6)) {
-                strcpy(g_build, pn->prefix);
-                strcat(g_build, "or ");
-                strcat(g_build, g_regs[pn->dreg].name);
-                strcat(g_build, ", -1");
-                if (pn->comment[0] != '\0') {
-                    strcat(g_build, " ");
-                    strcat(g_build, pn->comment);
-                }
-                vlog("smartpp: line %ld: '%s' rewritten to '%s' (P35)\n",
-                    i + 1, L(i), g_build);
-                replace_line(i, g_build);
-                st[35]++;
-                continue;
-            }
-        }
-
-        /* P36: "mov sp,bp / pop bp" -> "leave" (186+, 16-bit stack) */
-        if (!g_use32 && g_curcpu >= 2 && !pn->toobig && pn->cls == I_MOV &&
-            pn->dreg >= 0 && pn->sreg >= 0 &&
-            ci_eq(g_regs[pn->dreg].name, "sp") &&
-            ci_eq(g_regs[pn->sreg].name, "bp")) {
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                struct pinfo *pj = &g_ppair;
-                parse_line(j, pj);
-                if (!pj->haslabel && !pj->toobig && pj->cls == I_POP &&
-                    pj->dreg >= 0 && ci_eq(g_regs[pj->dreg].name, "bp")) {
-                    strcpy(g_build, pn->prefix);
-                    strcat(g_build, "leave");
-                    if (pn->comment[0] != '\0') {
-                        strcat(g_build, " ");
-                        strcat(g_build, pn->comment);
-                    }
-                    vlog("smartpp: line %ld: '%s' / '%s' rewritten to 'leave' (P36)\n",
-                        i + 1, L(i), L(j));
-                    replace_line(i, g_build);
-                    DEL(j) = 1;
-                    st[36]++;
-                    continue;
-                }
-            }
-        }
-
-        /* P12: duplicate consecutive jumps to the same target:
-        *  "j<cc> L / j<same cc> L" -> second deleted (same flags);
-        *  "j<cc> L / jmp L" -> the jcc is deleted (both paths reach
-        *  L); "jmp L / <any jump> L" -> the second is unreachable */
-        if (!pi->toobig && (pi->cls == I_JCC || pi->cls == I_JMP) &&
-            pi->jtarget_ok) {
-            struct pinfo *pj = &g_ppair;
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                parse_line(j, pj);
-                if (!pj->toobig && pj->jtarget_ok &&
-                    ci_eq(pj->jtarget, pi->jtarget)) {
-                    if (pi->cls == I_JCC && pj->cls == I_JCC &&
-                        jcc_canon(pi->mnem) == jcc_canon(pj->mnem) &&
-                        !pj->haslabel) {
-                        vlog("smartpp: line %ld: deleted duplicate '%s %s' (P12)\n",
-                            j + 1, pj->mnem, pj->jtarget);
-                        DEL(j) = 1;
-                        st[12]++;
-                    }
-                    else if (pi->cls == I_JCC && pj->cls == I_JMP) {
-                        /* v1.81 bug fix: line i may carry a label
-                         *  that other jumps target; deleting the
-                         *  whole line would remove it.  Use
-                         *  delete_keep_label so the jcc is removed
-                         *  but the label (and any comment) survives
-                         *  on a label-only line; other jumps to it
-                         *  then land on the still-present bridge jmp
-                         *  at line j, which goes to L (same target
-                         *  the deleted jcc would have taken). */
-                        vlog("smartpp: line %ld: deleted '%s %s', the jmp at line %ld always reaches %s (P12)\n",
-                            i + 1, pi->mnem, pi->jtarget, j + 1, pj->jtarget);
-                        delete_keep_label(i, pi);
-                        st[12]++;
-                        continue;
-                    }
-                    else if (pi->cls == I_JMP &&
-                             (pj->cls == I_JMP || pj->cls == I_JCC) &&
-                             !pj->haslabel) {
-                        vlog("smartpp: line %ld: deleted unreachable '%s %s' (P12)\n",
-                            j + 1, pj->mnem, pj->jtarget);
-                        DEL(j) = 1;
-                        st[12]++;
-                    }
-                }
-            }
-        }
-
-        /* P13: unreachable instructions after an unconditional jmp:
-        *  delete the run of known instruction lines with no label
-        *  (a label, data definition, directive or unknown line
-        *  stops the scan) */
-        if (!pi->toobig && pi->cls == I_JMP && pi->jtarget_ok) {
-            long k2 = next_code(i);
-            int killed = 0;
-            while (k2 >= 0 && !INDEF(k2)) {
-                struct pinfo *pk = &g_plook;
-                parse_line(k2, pk);
-                if (pk->haslabel || pk->toobig || !pk->hasinstr) break;
-                if (!is_known_instr(pk->mnem)) break;
-                vlog("smartpp: line %ld: deleted unreachable '%s' (P13)\n",
-                    k2 + 1, L(k2));
-                DEL(k2) = 1;
-                st[13]++;
-                killed = 1;
-                k2 = next_code(k2);
-            }
-            if (killed) {
-                /* fall through: P6 may now drop the jmp itself */
-            }
-        }
-
-        /* P13b (v1.83): unreachable instructions after a control-flow
-         *  terminator that is NOT an unconditional jmp: ret, retf,
-         *  iret, int3 (the cheap INT 3 trap), and the explicit ud2 /
-         *  hlt.  All of these end a basic block exactly as jmp does;
-         *  any subsequent non-labeled instruction is unreachable
-         *  and may be deleted.  Same scanning discipline as P13 (stop
-         *  at a label, data definition, directive, or unknown line).
-         *  Excludes "int N" for N != 3 because INT typically returns
-         *  (the handler does IRET), so the following code IS
-         *  reachable.  int3 is the conventional "trap to debugger"
-         *  that does not return.  Research: GCC i386.md
-         *  `unreachable` notes; LLVM `UnreachableElimination`. */
-        if (!pi->toobig && pi->cls == I_OTHER && pi->nops == 0 &&
-            (ci_eq(pi->mnem, "ret") || ci_eq(pi->mnem, "retf") ||
-             ci_eq(pi->mnem, "iret") || ci_eq(pi->mnem, "hlt") ||
-             ci_eq(pi->mnem, "ud2") || ci_eq(pi->mnem, "int3"))) {
-            long k2 = next_code(i);
-            int killed = 0;
-            while (k2 >= 0 && !INDEF(k2)) {
-                struct pinfo *pk = &g_plook;
-                parse_line(k2, pk);
-                if (pk->haslabel || pk->toobig || !pk->hasinstr) break;
-                if (!is_known_instr(pk->mnem)) break;
-                vlog("smartpp: line %ld: deleted unreachable '%s' (P13b)\n",
-                    k2 + 1, L(k2));
-                DEL(k2) = 1;
-                st[13]++;
-                killed = 1;
-                k2 = next_code(k2);
-            }
-            (void)killed;
-        }
-
-        /* P68 (v1.82): "xchg R, S" with one operand provably dead after
-         *  the swap -> "mov <alive>, <dead>" (or the symmetric form),
-         *  which is 1 byte shorter on x86 for non-AX registers and
-         *  same-size for the AX short form.  An operand is "dead"
-         *  when the next instruction that mentions its register family
-         *  fully overwrites it (mov/lea/movzx/pop to a covering
-         *  destination) WITHOUT reading it first -- the discipline
-         *  shared with P2's dead-store test, refactored here into the
-         *  reg_dead_after() helper.  xchg writes neither memory nor
-         *  flags, so the rewrite is exact on both.  Memory operands
-         *  excluded (no register to be "dead"); SP excluded because
-         *  moving to SP changes the stack pointer between interrupts
-         *  differently than an xchg would (xchg momentarily has
-         *  SP==other-reg, which is observable to an interrupting
-         *  handler if the other-reg value happens to be a bad stack
-         *  pointer).  Research: GCC i386.md peephole2 #9 and #10
-         *  ("Convert xchg with a REG_UNUSED note to a mov"). */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_XCHG &&
-            pi->dreg >= 0 && pi->sreg >= 0 &&
-            pi->dreg != pi->sreg &&
-            g_regs[pi->dreg].fam != 4 && g_regs[pi->sreg].fam != 4) {
-            int rd68 = pi->dreg, rs68 = pi->sreg;
-            int same_w =
-                (g_regs[rd68].hi - g_regs[rd68].lo) ==
-                (g_regs[rs68].hi - g_regs[rs68].lo);
-            /* Same width is required: a partial swap like
-             *  `xchg ax, al` is not a single mov. */
-            if (same_w) {
-                int dead_d = reg_dead_after(i, rd68);
-                int dead_s = reg_dead_after(i, rs68);
-                if (dead_d || dead_s) {
-                    /* If R is dead: rewrite to "mov S, R" -- in Intel
-                     *  syntax "mov S, R" means S := R's old value,
-                     *  which is exactly what xchg produced for S (R
-                     *  itself is dead, no one cares what it holds).
-                     *  Similarly if S is dead: "mov R, S" sets
-                     *  R := S's old value.  In short: dst (alive) is
-                     *  the destination of the mov, src (dead) is the
-                     *  source. */
-                    int dead_is_d = dead_d;
-                    int dead = dead_is_d ? rd68 : rs68;  /* dead reg */
-                    int alive = dead_is_d ? rs68 : rd68;  /* alive reg */
+                if (dst41 >= 0 && pair41 && reg_width(src41) == w41 &&
+                    g_regs[src41].fam != 4 &&
+                    flags_clear(next_code(i), F_ALL6)) {
                     strcpy(g_build, pi->prefix);
-                    strcat(g_build, "mov ");
-                    if (g_att) strcat(g_build, "%");
-                    /* Intel: "mov dst, src" = "mov alive, dead".
-                     *  AT&T:  "mov src, dst" = "mov dead, alive". */
-                    if (g_att) {
-                        strcat(g_build, g_regs[dead].name);
-                        strcat(g_build, ", %");
-                        strcat(g_build, g_regs[alive].name);
-                    } else {
-                        strcat(g_build, g_regs[alive].name);
-                        strcat(g_build, ", ");
-                        strcat(g_build, g_regs[dead].name);
-                    }
-                    if (pi->comment[0] != '\0') {
+                    strcat(g_build, "add ");
+                    strcat(g_build, pi->op0);
+                    strcat(g_build, ", ");
+                    strcat(g_build, g_regs[src41].name);
+                    if (pi->comment[0] != 0) {
                         strcat(g_build, " ");
                         strcat(g_build, pi->comment);
                     }
-                    vlog("smartpp: line %ld: 'xchg %s, %s' rewritten to 'mov %s, %s' (P68, %s dead)\n",
-                        i + 1, pi->op0, pi->op1,
-                        g_regs[alive].name, g_regs[dead].name,
-                        dead_is_d ? pi->op0 : pi->op1);
+                    vlog("smartpp: line %ld: 'lea %s, %s' rewritten to '%s' (P41)\n",
+                        i + 1, pi->op0, pi->op1, g_build);
                     replace_line(i, g_build);
-                    st[68]++;
+                    st[41]++;
                     continue;
                 }
             }
         }
 
-        /* P14: "xchg R,S / xchg R,S" (same pair, either order) ->
-        *  both deleted: two swaps restore everything, flags untouched.
-        *  v1.81 bug fix: if line i carries a label, use
-        *  delete_keep_label so the label survives on a label-only
-        *  line (line j is still deleted because the rule already
-        *  requires !pj->haslabel).  Without this, deleting line i
-        *  would also remove a label that other code jumps to. */
-        if (!pi->toobig && pi->cls == I_XCHG &&
-            pi->dreg >= 0 && pi->sreg >= 0) {
-            struct pinfo *pj = &g_ppair;
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                parse_line(j, pj);
-                if (!pj->haslabel && !pj->toobig && pj->cls == I_XCHG &&
-                    pj->dreg >= 0 && pj->sreg >= 0 &&
-                    ((ci_eq(pi->op0, pj->op0) && ci_eq(pi->op1, pj->op1)) ||
-                     (ci_eq(pi->op0, pj->op1) && ci_eq(pi->op1, pj->op0)))) {
-                    vlog("smartpp: line %ld: deleted double '%s %s, %s' (P14)\n",
-                        i + 1, pi->mnem, pi->op0, pi->op1);
-                    delete_keep_label(i, pi);
-                    DEL(j) = 1;
-                    st[14]++;
-                    continue;
-                }
-            }
-        }
-
-        /* P15: "mov R,S / mov S,R" -> the second is dead: it writes
-        *  S with S's own value (R was just set to it) */
-        if (!pi->toobig && pi->cls == I_MOV && pi->dreg >= 0 &&
-            pi->sreg >= 0) {
-            struct pinfo *pj = &g_ppair;
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                parse_line(j, pj);
-                if (!pj->haslabel && !pj->toobig && pj->cls == I_MOV &&
-                    pj->dreg >= 0 && pj->sreg >= 0 &&
-                    ci_eq(pi->op1, pj->op0) && ci_eq(pi->op0, pj->op1)) {
-                    vlog("smartpp: line %ld: deleted '%s %s, %s' (writes %s with its own value, P15)\n",
-                        j + 1, pj->mnem, pj->op0, pj->op1, pj->op0);
-                    DEL(j) = 1;
-                    st[15]++;
-                }
-            }
-        }
-
-        /* P18: "add R,0" / "sub R,0" -> deleted when the scan proves
-        *  all six status flags are dead (they are the only effect) */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER && pi->nops == 2 &&
-            (ci_eq(pi->mnem, "add") || ci_eq(pi->mnem, "sub")) &&
-            find_reg(pi->op0) >= 0) {
-            long v;
-            if (try_parse_number(pi->op1, &v) && v == 0 &&
-                flags_clear(next_code(i), F_ALL6)) {
-                vlog("smartpp: line %ld: deleted '%s %s, 0' (P18)\n",
-                    i + 1, pi->mnem, pi->op0);
-                DEL(i) = 1;
-                st[18]++;
-                continue;
-            }
-        }
-
-        /* P16: merge "add R,c1 / add R,c2" (or sub) into one when the
-        *  scan proves OF is dead (all other flags and the result are
-        *  identical; only OF can differ).  FPC's constant folding.
-        *  If the folded sum is 0 and F_ALL6 are dead, delete the
-        *  whole run instead of emitting a useless "add R,0" (the
-        *  multi-pass loop would eventually catch it via P18, but
-        *  this avoids a wasted pass).
-        *
-        *  v1.83 BUG FIX: the bound was hardcoded to ±32767 (imm16)
-        *  for every width, which both (a) refused legitimate 32-bit
-        *  folds (e.g. add eax, 200 / add eax, 200 -> add eax, 400
-        *  was wrongly rejected) and (b) accepted illegal 8-bit folds
-        *  (add al, 200 / add al, 200 -> add al, 400, which the
-        *  assembler cannot encode).  Use width_imm_limit(w) so the
-        *  bound matches the destination register's immediate range. */
-        if (!pi->toobig && pi->cls == I_OTHER && pi->nops == 2 &&
-            (ci_eq(pi->mnem, "add") || ci_eq(pi->mnem, "sub")) &&
-            find_reg(pi->op0) >= 0) {
-            int r16 = find_reg(pi->op0);
-            int w16 = g_regs[r16].hi - g_regs[r16].lo;
-            long imm_lim = width_imm_limit(w16);
-            long v, total, last = i;
-            if (try_parse_number(pi->op1, &v) && v != 0) {
-                total = v;
-                for (;;) {
+        /* P47 (v1.80; implemented v2.15): "mov R,S / add R,imm"
+         *  (R != S, equal widths) -> "lea R,[S+imm]" (all six flags
+         *  dead).  Inverse of P17.  386+ accepts any same-width pair;
+         *  pre-386 only the 16-bit bases BX/BP/SI/DI.  Intel-only
+         *  (matching P42/P46/P50). */
+        if (!pi->toobig && !pi->haslabel && !g_att &&
+            pi->cls == I_MOV && pi->dreg >= 0 && pi->sreg >= 0 &&
+            pi->dreg != pi->sreg &&
+            g_regs[pi->dreg].fam != 4) {
+            int w47 = reg_width(pi->dreg);
+            if (reg_width(pi->sreg) == w47 &&
+                (w47 == 32 ? g_curcpu >= 8
+                           : (w47 == 16 &&
+                              (g_regs[pi->sreg].fam == 3 ||
+                               g_regs[pi->sreg].fam == 5 ||
+                               g_regs[pi->sreg].fam == 6 ||
+                               g_regs[pi->sreg].fam == 7)))) {
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
                     struct pinfo *pj = &g_ppair;
-                    long v2;
-                    j = next_code(last);
-                    if (j < 0) break;
+                    long imm47;
                     parse_line(j, pj);
-                    if (pj->haslabel || pj->toobig || pj->cls != I_OTHER ||
-                        pj->nops != 2 || !ci_eq(pj->mnem, pi->mnem) ||
-                        !ci_eq(pj->op0, pi->op0)) break;
-                    if (!try_parse_number(pj->op1, &v2) || v2 == 0) break;
-                    if (total + v2 > imm_lim || total + v2 < -imm_lim) break;
-                    total += v2;
-                    last = j;
-                }
-                if (last != i &&
-                    flags_clear(next_code(last),
-                                (total == 0) ? F_ALL6 : F_OF)) {
-                    long k2;
-                    for (k2 = i + 1; k2 <= last; k2++) {
-                        if (!DEL(k2)) {
-                            struct pinfo *pk = &g_plook;
-                            parse_line(k2, pk);
-                            if (pk->hasinstr && !pk->haslabel) {
-                                vlog("smartpp: line %ld: merged '%s' into line %ld (P16)\n",
-                                    k2 + 1, L(k2), i + 1);
-                                DEL(k2) = 1;
-                                st[16]++;
-                            }
+                    if (!pj->haslabel && !pj->toobig &&
+                        pj->cls == I_OTHER && pj->nops == 2 &&
+                        ci_eq(pj->mnem, "add") &&
+                        find_reg(pj->op0) == pi->dreg &&
+                        try_parse_number(pj->op1, &imm47) && imm47 != 0 &&
+                        flags_clear(next_code(j), F_ALL6)) {
+                        char opnd[MAXTOK];
+                        emit_lea_disp(opnd, pi->sreg, imm47);
+                        strcpy(g_build, pj->prefix);
+                        strcat(g_build, "lea ");
+                        strcat(g_build, pj->op0);
+                        strcat(g_build, ", ");
+                        strcat(g_build, opnd);
+                        if (pj->comment[0] != 0) {
+                            strcat(g_build, " ");
+                            strcat(g_build, pj->comment);
                         }
-                    }
-                    if (total == 0) {
-                        /* v1.81 bug fix: use delete_keep_label so a
-                         *  label carried by line i survives on a
-                         *  label-only line.  The scan above already
-                         *  proved F_ALL6 dead, so the add/sub R, 0
-                         *  really has no observable effect and the
-                         *  instruction part can be removed; the label
-                         *  (and any comment) is preserved. */
-                        vlog("smartpp: line %ld: deleted '%s' (folded to 0, P16)\n",
-                            i + 1, L(i));
-                        delete_keep_label(i, pi);
-                        st[16]++;
+                        vlog("smartpp: line %ld: 'mov %s, %s' / 'add %s, %s' rewritten to 'lea %s, %s' (P47)\n",
+                            i + 1, pi->op0, pi->op1,
+                            pj->op0, pj->op1, pj->op0, opnd);
+                        replace_line(j, g_build);
+                        DEL(i) = 1;
+                        st[47]++;
                         continue;
                     }
-                    {
-                        char num[32];
-                        strcpy(g_build, pi->prefix);
-                        strcat(g_build, pi->mnem);
-                        if (g_att) {
-                            strcat(g_build, " $");
-                            sprintf(num, "%ld", total);
-                            strcat(g_build, num);
-                            strcat(g_build, ", ");
-                            strcat(g_build, pi->op0);
-                        } else {
-                            strcat(g_build, " ");
-                            strcat(g_build, pi->op0);
-                            strcat(g_build, ", ");
-                            sprintf(num, "%ld", total);
-                            strcat(g_build, num);
-                        }
-                        if (pi->comment[0] != '\0') {
-                            strcat(g_build, " ");
-                            strcat(g_build, pi->comment);
-                        }
-                        vlog("smartpp: line %ld: folded constants into '%s %s, %ld' (P16)\n",
-                            i + 1, pi->mnem, pi->op0, total);
-                        replace_line(i, g_build);
-                    }
                 }
             }
         }
 
-        /* P56 (v1.81): "add R, c1 / sub R, c2" or "sub R, c1 /
-         *  add R, c2" (mixed, c1 != 0 or c2 != 0, two instructions
-         *  only) -> a single "add R, c1 - c2" or "sub R, c2 - c1".
-         *  Net effect on R is the same as the two-step original;
-         *  the final flags of the original come from the second
-         *  instruction, the final flags of the rewrite come from the
-         *  single add/sub.  CF and AF (and OF) can all differ
-         *  between the two forms -- the two-step path computes an
-         *  intermediate R0 +/- c1 that has its own carry/borrow, and
-         *  the second op then derives the final carry/borrow from
-         *  that intermediate, not from R0 directly.  The single op
-         *  computes carry/borrow directly from R0.  So all six
-         *  status flags must be proven dead.
-         *
-         *  Two-instruction only (no chaining): P16 already chains
-         *  same-mnemonic add/add and sub/sub; mixed chains are
-         *  reduced step-by-step through the multi-pass loop.  R
-         *  must not be SP: an interrupt during the one-instruction
-         *  window of `add R, c1` would push at R0 +/- c1 which is
-         *  potentially misaligned, but the original has the same
-         *  problem; the rewrite removes the window entirely, so
-         *  SP exclusion is for parity with P22/P27/P39 (which all
-         *  exclude SP for the misalignment-pushing-during-window
-         *  reason).  Constant cousin of P39 but allows different
-         *  magnitudes.  FPC folds `add +1 / sub +2` this way. */
+        /* P56 (v1.81; implemented v2.15): "add R,c1 / sub R,c2" (or
+         *  reverse, mixed, net != 0) -> a single "add R,c1-c2" (or
+         *  "sub R,c2-c1").  The intermediate carry/borrow can differ
+         *  from the single-op form, so all six flags must be proven
+         *  dead.  R must not be SP (parity with P22/P24/P27/P39).  The
+         *  net == 0 case is P39's, which runs earlier; the
+         *  same-mnemonic case is P16's.  Two-instruction only; mixed
+         *  chains reduce step-by-step via the multi-pass loop. */
         if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
             pi->nops == 2 &&
             (ci_eq(pi->mnem, "add") || ci_eq(pi->mnem, "sub"))) {
@@ -7117,108 +11668,51 @@ static long run_pass(void)
                     parse_line(j, pj);
                     if (!pj->haslabel && !pj->toobig &&
                         pj->cls == I_OTHER && pj->nops == 2 &&
-                        ((ci_eq(pi->mnem, "add") &&
-                          ci_eq(pj->mnem, "sub")) ||
-                         (ci_eq(pi->mnem, "sub") &&
-                          ci_eq(pj->mnem, "add"))) &&
+                        ((ci_eq(pi->mnem, "add") && ci_eq(pj->mnem, "sub")) ||
+                         (ci_eq(pi->mnem, "sub") && ci_eq(pj->mnem, "add"))) &&
                         find_reg(pj->op0) == r56 &&
-                        try_parse_number(pj->op1, &c2) &&
-                        /* skip exact-equal pair (P39 handles that) */
-                        c2 != c1 &&
-                        flags_clear(next_code(j), F_ALL6)) {
-                        long diff = (ci_eq(pi->mnem, "add"))
-                                       ? (c1 - c2) : (c2 - c1);
-                        const char *op = (diff >= 0) ? "add" : "sub";
-                        long mag = (diff >= 0) ? diff : -diff;
-                        char num[32];
-                        int w56 = g_regs[r56].hi - g_regs[r56].lo;
-                        /* v1.83: width-aware bound.  Previously
-                         *  hardcoded to 0x7FFF (imm16), which both
-                         *  rejected legitimate 32-bit folds and
-                         *  accepted illegal 8-bit folds the
-                         *  assembler cannot encode. */
-                        if (mag <= width_imm_limit(w56)) {
-                            strcpy(g_build, pi->prefix);
-                            strcat(g_build, op);
-                            if (g_att) {
-                                strcat(g_build, " $");
-                                sprintf(num, "%ld", mag);
-                                strcat(g_build, num);
-                                strcat(g_build, ", ");
-                                strcat(g_build, pi->op0);
-                            } else {
-                                strcat(g_build, " ");
-                                strcat(g_build, pi->op0);
-                                strcat(g_build, ", ");
-                                sprintf(num, "%ld", mag);
-                                strcat(g_build, num);
-                            }
-                            if (pi->comment[0] != '\0') {
-                                strcat(g_build, " ");
-                                strcat(g_build, pi->comment);
-                            }
-                            vlog("smartpp: line %ld: '%s' / '%s' folded to '%s %s, %ld' (P56)\n",
-                                i + 1, L(i), L(j), op, pi->op0, mag);
-                            replace_line(i, g_build);
-                            DEL(j) = 1;
-                            st[56]++;
-                            continue;
+                        try_parse_number(pj->op1, &c2)) {
+                        long net;
+                        int ovf = 0;
+                        if (ci_eq(pi->mnem, "add")) {
+                            if (c1 > 0 && c2 < 0 && c1 - c2 < c1) ovf = 1;
+                            net = c1 - c2;
+                        } else {
+                            if (c2 > 0 && c1 < 0 && c2 - c1 < c2) ovf = 1;
+                            net = c2 - c1;
                         }
-                    }
-                }
-            }
-        }
-
-        /* P78 (v1.83): "lea R, [R + off1] / lea R, [R + off2]"
-         *  (same dest, same source base R, no scan needed) -> a
-         *  single "lea R, [R + (off1 + off2)]"; the first LEA is
-         *  deleted.  Both LEAs are flag-free and define R
-         *  identically (R := R + off), so the second exactly over-
-         *  writes the first's R write and there are no flags to
-         *  preserve.  This is the simpler same-dest cousin of P70
-         *  (which handles a different destination D and requires
-         *  R dead).  Range-check the sum so we don't emit an
-         *  assembler error on overflow.  Intel-only.
-         *  Research: FPC OptPass1LEA "LeaLea2Lea" same-dest case. */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_LEA &&
-            pi->dreg >= 0 && !g_att) {
-            int br1;
-            long off1;
-            if (lea_bracket(pi->op1, &br1, &off1) && br1 == pi->dreg) {
-                j = next_code(i);
-                if (j >= 0 && !INDEF(j)) {
-                    struct pinfo *pj = &g_ppair;
-                    parse_line(j, pj);
-                    if (!pj->haslabel && !pj->toobig &&
-                        pj->cls == I_LEA && pj->dreg == pi->dreg) {
-                        int br2;
-                        long off2;
-                        if (lea_bracket(pj->op1, &br2, &off2) &&
-                            br2 == pi->dreg) {
-                            long sum = off1 + off2;
-                            int dw = g_regs[pi->dreg].hi -
-                                     g_regs[pi->dreg].lo;
-                            long lim = (dw == 16) ? 0x7FFF : 0x7FFFFFFFL;
-                            if (sum >= -lim && sum <= lim) {
-                                char operand[MAXTOK];
-                                emit_lea_disp(operand, br1, sum);
-                                strcpy(g_build, pj->prefix);
-                                strcat(g_build, "lea ");
-                                strcat(g_build, pj->op0);
-                                strcat(g_build, ", ");
-                                strcat(g_build, operand);
-                                if (pj->comment[0] != '\0') {
-                                    strcat(g_build, " ");
-                                    strcat(g_build, pj->comment);
+                        /* net > 0 -> "add R,net"; net < 0 -> "sub R,-net" */
+                        if (!ovf && net != 0) {
+                            long mag56 = (net > 0) ? net : -net;
+                            if (mag56 <= width_imm_limit(reg_width(r56)) &&
+                                flags_clear(next_code(j), F_ALL6)) {
+                                char num[32];
+                                strcpy(g_build, pi->prefix);
+                                if (g_att) {
+                                    strcat(g_build,
+                                        (net > 0) ? "add $" : "sub $");
+                                    sprintf(num, "%ld", mag56);
+                                    strcat(g_build, num);
+                                    strcat(g_build, ", ");
+                                    strcat(g_build, pi->op0);
+                                } else {
+                                    strcat(g_build,
+                                        (net > 0) ? "add " : "sub ");
+                                    strcat(g_build, pi->op0);
+                                    strcat(g_build, ", ");
+                                    sprintf(num, "%ld", mag56);
+                                    strcat(g_build, num);
                                 }
-                                vlog("smartpp: line %ld: fused 'lea %s, [%s%+ld]' / 'lea %s, [%s%+ld]' to 'lea %s, [%s%+ld]' (P78)\n",
-                                    i + 1,
-                                    pi->op0, g_regs[br1].name, off1,
-                                    pj->op0, g_regs[br2].name, off2,
-                                    pj->op0, g_regs[br1].name, sum);
-                                DEL(i) = 1;
-                                replace_line(j, g_build);
-                                st[78]++;
+                                if (pi->comment[0] != 0) {
+                                    strcat(g_build, " ");
+                                    strcat(g_build, pi->comment);
+                                }
+                                vlog("smartpp: line %ld: '%s %s, %ld' / '%s %s, %ld' folded to '%s' (P56)\n",
+                                    i + 1, pi->mnem, pi->op0, c1,
+                                    pj->mnem, pj->op0, c2, g_build);
+                                replace_line(i, g_build);
+                                DEL(j) = 1;
+                                st[56]++;
                                 continue;
                             }
                         }
@@ -7227,106 +11721,837 @@ static long run_pass(void)
             }
         }
 
-        /* P70 (v1.82): "lea R, [S + off1] / lea D, [R + off2]" with R
-         *  provably dead after the second LEA -> a single
-         *  "lea D, [S + (off1 + off2)]"; the first LEA is deleted.
-         *  Both LEAs are flag-free, so the rewrite is exact on
-         *  flags; only the intermediate value (R := S + off1) is
-         *  observed by the second LEA, and the final result is
-         *  D := (S + off1) + off2 = S + off1 + off2.  R must be
-         *  dead between the two LEAs and after the second, which
-         *  reg_dead_after(j, R) checks (it walks forward from j
-         *  looking for a clean kill of R before any read).  Both
-         *  LEAs must use the single-base form parseable by
-         *  lea_bracket (one register term, optional constant);
-         *  scaled/index forms need extra parser work and are left
-         *  for a future pass.  Width must match (lea is width-
-         *  preserving on its base).  Research: FPC OptPass1LEA
-         *  "LeaLea2Lea" simple sub-case (aoptx86.pas ~7056). */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_LEA &&
-            pi->dreg >= 0) {
-            int br1;
-            long off1;
-            if (lea_bracket(pi->op1, &br1, &off1) && br1 >= 0 &&
-                br1 != pi->dreg &&
-                (g_regs[br1].hi - g_regs[br1].lo) ==
-                (g_regs[pi->dreg].hi - g_regs[pi->dreg].lo)) {
+        /* P63 (v1.82; implemented v2.15): "lea R,[R*K]" (K in {2,4,8};
+         *  386+ -- the SIB byte was added with the 386; AT&T form
+         *  "(,%R,K)" accepted) -> "shl R, log2 K" (all six flags
+         *  dead: lea defines none, shl defines all six).  Generalizes
+         *  P57's [R+R] form, which the v2.21 rule P365 first
+         *  canonicalizes to [R*2].  ESP/RSP cannot be the index (SIB
+         *  index field 4 means "no index"). */
+        if (!pi->toobig && pi->cls == I_LEA && pi->nops == 2 &&
+            pi->dreg >= 0 && g_curcpu >= 8) {
+            int w63 = reg_width(pi->dreg);
+            if (w63 == 32 || (w63 == 64 && g_curcpu >= 128)) {
+                int s63, sc63;
+                if (lea_scaled_single(pi->op1, &s63, &sc63) &&
+                    s63 == pi->dreg && g_regs[s63].fam != 4 &&
+                    flags_clear(next_code(i), F_ALL6)) {
+                    int k63 = (sc63 == 2) ? 1 : (sc63 == 4) ? 2 : 3;
+                    char num[32];
+                    strcpy(g_build, pi->prefix);
+                    if (g_att) {
+                        strcat(g_build, "shl $");
+                        sprintf(num, "%d", k63);
+                        strcat(g_build, num);
+                        strcat(g_build, ", ");
+                        strcat(g_build, pi->op0);
+                    } else {
+                        strcat(g_build, "shl ");
+                        strcat(g_build, pi->op0);
+                        strcat(g_build, ", ");
+                        sprintf(num, "%d", k63);
+                        strcat(g_build, num);
+                    }
+                    if (pi->comment[0] != 0) {
+                        strcat(g_build, " ");
+                        strcat(g_build, pi->comment);
+                    }
+                    vlog("smartpp: line %ld: 'lea %s, %s' rewritten to '%s' (P63)\n",
+                        i + 1, pi->op0, pi->op1, g_build);
+                    replace_line(i, g_build);
+                    st[63]++;
+                    continue;
+                }
+            }
+        }
+
+        /* P68 (v1.82; implemented v2.15): "xchg R,S" (equal-width
+         *  registers) with one operand provably dead after the swap ->
+         *  "mov <alive>, <dead>".  The dead operand's OLD value is
+         *  what the live one receives, so the mov keeps the live
+         *  register's new value exact.  xchg and mov are both
+         *  flag-neutral: no scan beyond the liveness proof.  The
+         *  1-byte "xchg eax,r" short forms and 64-bit xchg (2 bytes
+         *  vs mov's 3) are refused, so the rewrite never grows the
+         *  code.  SP excluded: a mov to SP changes observable
+         *  stack-pointer behaviour between interrupts differently
+         *  than xchg would.
+         *  [GCC i386.md peephole2 #9/#10 REG_UNUSED xchg -> mov] */
+        if (!pi->toobig && pi->cls == I_XCHG && pi->nops == 2 &&
+            pi->dreg >= 0 && pi->sreg >= 0 && pi->dreg != pi->sreg &&
+            g_regs[pi->dreg].fam != 4 && g_regs[pi->sreg].fam != 4) {
+            int w68 = reg_width(pi->dreg);
+            if (w68 == reg_width(pi->sreg) &&
+                (w68 == 8 || w68 == 16 ||
+                 (w68 == 32 && g_regs[pi->dreg].fam != 0 &&
+                  g_regs[pi->sreg].fam != 0))) {
+                int dead68 = -1;
+                if (reg_dead_cf(next_code(i), pi->sreg))
+                    dead68 = pi->sreg;
+                else if (reg_dead_cf(next_code(i), pi->dreg))
+                    dead68 = pi->dreg;
+                if (dead68 >= 0) {
+                    strcpy(g_build, pi->prefix);
+                    strcat(g_build, "mov ");
+                    if (dead68 == pi->sreg) {
+                        /* mov <live R>, <dead S> */
+                        if (g_att) {
+                            strcat(g_build, pi->op1);
+                            strcat(g_build, ", ");
+                            strcat(g_build, pi->op0);
+                        } else {
+                            strcat(g_build, pi->op0);
+                            strcat(g_build, ", ");
+                            strcat(g_build, pi->op1);
+                        }
+                    } else {
+                        /* mov <live S>, <dead R> */
+                        if (g_att) {
+                            strcat(g_build, pi->op0);
+                            strcat(g_build, ", ");
+                            strcat(g_build, pi->op1);
+                        } else {
+                            strcat(g_build, pi->op1);
+                            strcat(g_build, ", ");
+                            strcat(g_build, pi->op0);
+                        }
+                    }
+                    if (pi->comment[0] != 0) {
+                        strcat(g_build, " ");
+                        strcat(g_build, pi->comment);
+                    }
+                    vlog("smartpp: line %ld: 'xchg %s, %s' rewritten to '%s' (P68)\n",
+                        i + 1, pi->op0, pi->op1, g_build);
+                    replace_line(i, g_build);
+                    st[68]++;
+                    continue;
+                }
+            }
+        }
+
+        /* P70 (v1.82; implemented v2.15): "lea R,[S+off1] /
+         *  lea D,[R+off2]" (R dead after the second LEA) -> single
+         *  "lea D,[S+off1+off2]"; the first LEA is deleted.  Both
+         *  LEAs are flag-free; only the intermediate R is observable,
+         *  and R is dead.  Simple base+displacement forms only (the
+         *  scaled/index form needs extra parser work).  Intel-only,
+         *  matching the sibling rule P382.
+         *  [FPC OptPass1LEA "LeaLea2Lea" simple sub-case] */
+        if (!pi->toobig && !pi->haslabel && !g_att &&
+            pi->cls == I_LEA && pi->nops == 2 && pi->dreg >= 0) {
+            int w70 = reg_width(pi->dreg);
+            int s70, b70;
+            long o70a, o70b;
+            if ((w70 == 16 || w70 == 32) &&
+                lea_bracket(pi->op1, &s70, &o70a) && s70 >= 0 &&
+                o70a >= -0x7FFFFFFFL &&
+                lea_base_ok(s70, w70)) {
+                long j70 = next_code(i);
+                if (j70 >= 0 && !INDEF(j70)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j70, pj);
+                    if (!pj->haslabel && !pj->toobig &&
+                        pj->cls == I_LEA && pj->nops == 2 &&
+                        pj->dreg >= 0 &&
+                        reg_width(pj->dreg) == w70 &&
+                        lea_bracket(pj->op1, &b70, &o70b) &&
+                        b70 == pi->dreg &&
+                        o70b >= -0x7FFFFFFFL &&
+                        reg_dead_cf(next_code(j70), pi->dreg)) {
+                        char opnd[MAXTOK];
+                        emit_lea_disp(opnd, s70, o70a + o70b);
+                        strcpy(g_build, pj->prefix);
+                        strcat(g_build, "lea ");
+                        strcat(g_build, pj->op0);
+                        strcat(g_build, ", ");
+                        strcat(g_build, opnd);
+                        if (pj->comment[0] != 0) {
+                            strcat(g_build, " ");
+                            strcat(g_build, pj->comment);
+                        }
+                        vlog("smartpp: line %ld: fused 'lea %s, %s' / '%s' into 'lea %s, %s' (P70)\n",
+                            i + 1, pi->op0, pi->op1, L(j70),
+                            pj->op0, opnd);
+                        replace_line(j70, g_build);
+                        DEL(i) = 1;
+                        st[70]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* P80 (v1.83; implemented v2.15): "push R / <writer> / pop R"
+         *  (adjacent; the writer fully overwrites R without reading
+         *  it, without touching the stack or reading memory) ->
+         *  all three deleted.  The pop restores the pushed value, so
+         *  the writer's store is dead; with the pop gone, the push's
+         *  save is dead too.  Flag-neutral writers need no scan; an
+         *  "xor R,R" writer defines all six flags, so those must be
+         *  dead.  16/32/64-bit only; SP excluded (parity with
+         *  P22/P27/P39/P49/P58/P71). */
+        if (!pi->haslabel && !pi->toobig &&
+            pi->cls == I_PUSH && pi->dreg >= 0 &&
+            g_regs[pi->dreg].fam != 4) {
+            int w80 = reg_width(pi->dreg);
+            if (w80 == 16 || w80 == 32 || w80 == 64) {
+                long j80 = next_code(i);
+                if (j80 >= 0 && !INDEF(j80)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j80, pj);
+                    if (!pj->haslabel && !pj->toobig && pj->hasinstr &&
+                        p80_writer_ok(pj, pi->dreg, 0)) {
+                        long k80 = next_code(j80);
+                        if (k80 >= 0 && !INDEF(k80)) {
+                            struct pinfo *pk = &g_plook;
+                            parse_line(k80, pk);
+                            if (!pk->haslabel && !pk->toobig &&
+                                pk->cls == I_POP &&
+                                pk->dreg == pi->dreg &&
+                                (pj->cls != I_XORRR ||
+                                 flags_clear(next_code(k80), F_ALL6))) {
+                                vlog("smartpp: line %ld: deleted push '%s' / '%s' / pop '%s' (P80)\n",
+                                    i + 1, L(i), L(j80), L(k80));
+                                DEL(i) = 1;
+                                DEL(j80) = 1;
+                                DEL(k80) = 1;
+                                st[80]++;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P82 (v1.84 SMART.INC port; implemented v2.15): "lea r16, var"
+         *  -> "mov r16, OFFSET var" in a USE16 segment with a 16-bit
+         *  destination and a bare symbol source (3 bytes vs 4).
+         *  Exact: LEA computes the offset and so does MOV with the
+         *  OFFSET operator; neither touches flags or memory.  Items 8
+         *  and 10/11 of SMART.INC were already covered by P1 and by
+         *  the assembler's own near/short pick on 386+. */
+        if (!pi->toobig && !g_att && !g_use32 &&
+            pi->cls == I_LEA && pi->nops == 2 && pi->dreg >= 0 &&
+            reg_width(pi->dreg) == 16 &&
+            pi->op1[0] != '\0' &&
+            is_ident_start((unsigned char)pi->op1[0])) {
+            int ok82 = 1;
+            size_t q82;
+            for (q82 = 0; pi->op1[q82] != '\0'; q82++)
+                if (!is_ident_char((unsigned char)pi->op1[q82])) {
+                    ok82 = 0;
+                    break;
+                }
+            if (ok82 && find_reg(pi->op1) < 0) {
+                strcpy(g_build, pi->prefix);
+                strcat(g_build, "mov ");
+                strcat(g_build, pi->op0);
+                strcat(g_build, ", OFFSET ");
+                strcat(g_build, pi->op1);
+                if (pi->comment[0] != 0) {
+                    strcat(g_build, " ");
+                    strcat(g_build, pi->comment);
+                }
+                vlog("smartpp: line %ld: 'lea %s, %s' rewritten to '%s' (P82)\n",
+                    i + 1, pi->op0, pi->op1, g_build);
+                replace_line(i, g_build);
+                st[82]++;
+                continue;
+            }
+        }
+
+        /* P85/P86 (v1.84; implemented v2.15): "mov R,K / cmp R,K" (or
+         *  "mov R,K / test R,K") with the same plain constant K, R
+         *  dead after the pair AND all six status flags dead ->
+         *  both deleted.  cmp/test read R, so the mov is not dead on
+         *  its own; only the PAIR is dead when both R and the flags
+         *  die together (reg_dead_cf + flags_clear). */
+        if (!pi->haslabel && !pi->toobig &&
+            pi->cls == I_MOV && pi->dreg >= 0 && pi->srcimm &&
+            g_regs[pi->dreg].fam != 4) {
+            long v85;
+            if (try_parse_number(pi->op1, &v85)) {
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    long v85b;
+                    int rule86 = 0;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig &&
+                        pj->cls == I_OTHER && pj->nops == 2)
+                        rule86 = ci_eq(pj->mnem, "cmp")  ? 85 :
+                                 ci_eq(pj->mnem, "test") ? 86 : 0;
+                    if (rule86 != 0 &&
+                        find_reg(pj->op0) == pi->dreg &&
+                        try_parse_number(pj->op1, &v85b) &&
+                        v85b == v85 &&
+                        reg_dead_cf(next_code(j), pi->dreg) &&
+                        flags_clear(next_code(j), F_ALL6)) {
+                        vlog("smartpp: line %ld: deleted '%s' / '%s' pair (P%d)\n",
+                            i + 1, L(i), L(j), rule86);
+                        DEL(i) = 1;
+                        DEL(j) = 1;
+                        st[rule86]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* P79 (v1.83; implemented v2.15): "mov R,imm / push R" with
+         *  the instruction right after the push already killing R ->
+         *  single "push imm".  Both sides are flag-neutral: no scan.
+         *  P87 (v1.84; implemented v2.15): the same fold under the
+         *  general control-flow-aware dead scan (reg_dead_cf), which
+         *  also fires when a conditional jump separates the push from
+         *  its kill -- the case the linear P79 had to refuse.  SP
+         *  excluded; 64-bit pushes need the immediate to fit a
+         *  sign-extended imm32. */
+        if (!pi->haslabel && !pi->toobig &&
+            pi->cls == I_MOV && pi->dreg >= 0 && pi->srcimm &&
+            g_regs[pi->dreg].fam != 4) {
+            long v79;
+            if (try_parse_number(pi->op1, &v79)) {
+                int w79 = reg_width(pi->dreg);
+                int fits79 = 0;
+                if (w79 == 16)
+                    fits79 = (v79 >= -0x8000L && v79 <= 0xFFFFL);
+                else if (w79 == 32)
+                    /* v2.17: v79 is a signed long (32-bit on every
+                     *  SMARTPP target), so the old bounds check
+                     *  (v79 >= INT32_MIN && v79 <= 0xFFFFFFFF) was
+                     *  tautological and tripped W124 -- the upper
+                     *  bound promotes v79 to unsigned long.  Any
+                     *  32-bit long value encodes in a 32-bit reg. */
+                    fits79 = 1;
+                else if (w79 == 64 && g_curcpu >= 128)
+                    /* v2.17: same -- a 32-bit long always sign-extends
+                     *  to 64 bits. */
+                    fits79 = 1;
+                if (fits79) {
+                    j = next_code(i);
+                    if (j >= 0 && !INDEF(j)) {
+                        struct pinfo *pj = &g_ppair;
+                        parse_line(j, pj);
+                        if (!pj->haslabel && !pj->toobig &&
+                            pj->cls == I_PUSH &&
+                            find_reg(pj->op0) == pi->dreg) {
+                            int rule79 = 0;
+                            long k79 = next_code(j);
+                            if (k79 >= 0 && !INDEF(k79)) {
+                                struct pinfo *pk = &g_plook;
+                                parse_line(k79, pk);
+                                if (!pk->toobig && pk->hasinstr &&
+                                    p80_writer_ok(pk, pi->dreg, 1))
+                                    rule79 = 79;
+                            }
+                            if (rule79 == 0 &&
+                                reg_dead_cf(next_code(j), pi->dreg))
+                                rule79 = 87;
+                            if (rule79 != 0) {
+                                char num[32];
+                                strcpy(g_build, pj->prefix);
+                                strcat(g_build, "push ");
+                                if (g_att) strcat(g_build, "$");
+                                sprintf(num, "%ld", v79);
+                                strcat(g_build, num);
+                                if (pj->comment[0] != 0) {
+                                    strcat(g_build, " ");
+                                    strcat(g_build, pj->comment);
+                                }
+                                vlog("smartpp: line %ld: 'mov %s, %s' / 'push %s' rewritten to 'push %ld' (P%ld)\n",
+                                    i + 1, pi->op0, pi->op1,
+                                    pj->op0, v79, (long)rule79);
+                                replace_line(j, g_build);
+                                DEL(i) = 1;
+                                st[rule79]++;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P88 (v1.84; implemented v2.15, CORRECTED): the canonical
+         *  486 byte-swap idiom is
+         *      "xchg al,ah / rol eax,16 / xchg al,ah" -> "bswap eax"
+         *  (swap the low-byte pair, rotate the words, swap again).
+         *  The form previously documented here ("rol eax,16 / xchg
+         *  al,ah / rol eax,16") is NOT an identity for bswap -- it
+         *  swaps only the two HIGH bytes (verified exhaustively) --
+         *  so the rule fires on the corrected order.  The two xchg
+         *  are flag-neutral; each rol writes CF (OF undefined for
+         *  count 16) while bswap writes no flags, so CF and OF must
+         *  be dead.  Intel-only, 32-bit register, 486+. */
+        if (!pi->toobig && !g_att && g_curcpu >= 16 &&
+            pi->cls == I_XCHG && pi->nops == 2 &&
+            pi->dreg >= 0 && pi->sreg >= 0 &&
+            reg_width(pi->dreg) == 8 && reg_width(pi->sreg) == 8 &&
+            g_regs[pi->dreg].fam == g_regs[pi->sreg].fam &&
+            g_regs[pi->dreg].fam <= 3 &&
+            ((g_regs[pi->dreg].lo == 0 && g_regs[pi->sreg].lo == 8) ||
+             (g_regs[pi->dreg].lo == 8 && g_regs[pi->sreg].lo == 0))) {
+            int fam88 = g_regs[pi->dreg].fam;
+            int r32_88 = reg_by_bits(fam88, 0, 32);
+            long j88 = next_code(i);
+            if (r32_88 >= 0 && j88 >= 0 && !INDEF(j88)) {
+                struct pinfo *pj = &g_ppair;
+                long v88;
+                parse_line(j88, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    pj->cls == I_SHIFT && pj->nops == 2 &&
+                    ci_eq(pj->mnem, "rol") &&
+                    find_reg(pj->op0) == r32_88 &&
+                    try_parse_number(pj->op1, &v88) && v88 == 16) {
+                    long k88 = next_code(j88);
+                    if (k88 >= 0 && !INDEF(k88)) {
+                        struct pinfo *pk = &g_plook;
+                        parse_line(k88, pk);
+                        if (!pk->haslabel && !pk->toobig &&
+                            pk->cls == I_XCHG && pk->nops == 2 &&
+                            ((pk->dreg == pi->dreg &&
+                              pk->sreg == pi->sreg) ||
+                             (pk->dreg == pi->sreg &&
+                              pk->sreg == pi->dreg)) &&
+                            flags_clear(next_code(k88), F_CFOF)) {
+                            strcpy(g_build, pi->prefix);
+                            strcat(g_build, "bswap ");
+                            strcat(g_build, g_regs[r32_88].name);
+                            if (pi->comment[0] != 0) {
+                                strcat(g_build, " ");
+                                strcat(g_build, pi->comment);
+                            }
+                            vlog("smartpp: line %ld: 'xchg %s, %s' / 'rol %s, 16' / 'xchg %s, %s' rewritten to 'bswap %s' (P88)\n",
+                                i + 1, pi->op0, pi->op1,
+                                g_regs[r32_88].name,
+                                pi->op0, pi->op1,
+                                g_regs[r32_88].name);
+                            replace_line(i, g_build);
+                            DEL(j88) = 1;
+                            DEL(k88) = 1;
+                            st[88]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P89 (v1.84; implemented v2.15): "mov R,0 / setcc R8" (386+)
+         *  with R dead after the setcc -> the mov is deleted.  setcc
+         *  writes only the low byte and reads only the flags, so the
+         *  mov's zero is unobservable when R is dead.  No flag scan
+         *  (neither mov nor setcc writes the status flags).
+         *  [GCC zero_extendqisi2_qi + setcc; FPC OptPass2MOVZX.] */
+        if (!pi->haslabel && !pi->toobig && g_curcpu >= 8 &&
+            pi->cls == I_MOV && pi->dreg >= 0 && pi->srcimm &&
+            g_regs[pi->dreg].fam != 4) {
+            long v89;
+            if (try_parse_number(pi->op1, &v89) && v89 == 0) {
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig && pj->nops == 1 &&
+                        ci_eq_n(pj->mnem, "set", 3) &&
+                        pj->mnem[3] != '\0') {
+                        char jm[MAXNAME + 2];
+                        int d89;
+                        jm[0] = 'j';
+                        strncpy(jm + 1, pj->mnem + 3, MAXNAME);
+                        jm[MAXNAME + 1] = '\0';
+                        if (is_jcc_mnem(jm) &&
+                            (d89 = find_reg(pj->op0)) >= 0 &&
+                            reg_width(d89) == 8 &&
+                            g_regs[d89].fam == g_regs[pi->dreg].fam &&
+                            reg_dead_cf(next_code(j), pi->dreg)) {
+                            vlog("smartpp: line %ld: deleted '%s' before setcc (P89)\n",
+                                i + 1, L(i));
+                            DEL(i) = 1;
+                            st[89]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* ===== v2.21: NEW OPTIMIZATIONS from GCC/LLVM/FPC research ===== */
+
+        /* P410 (v2.22): "mov [mem], 0" -> "and [mem], 0" (flags dead).
+         *  Size win: and [mem],0 is 3 bytes vs mov [mem],0 is 10 bytes.
+         *  v2.22: gated to stack memory only ([bp/ebp/rbp±N]) — the
+         *  rewrite converts a pure store to read-modify-write, which
+         *  is unsafe for MMIO.  Also requires !g_att (Intel syntax).
+         *  GCC i386.md peephole2 #5 uses optimize_insn_for_size_p. */
+        if (!pi->haslabel && !pi->toobig && !g_att &&
+            pi->cls == I_OTHER && pi->nops == 2 &&
+            ci_eq(pi->mnem, "mov") && find_reg(pi->op0) < 0) {
+            long v410;
+            if (find_reg(pi->op0) < 0 &&
+                is_stack_mem_operand(pi->op0) && /* v2.22: stack mem only */
+                try_parse_number(pi->op1, &v410) &&
+                (v410 == 0 || v410 == -1) &&
+                flags_clear(next_code(i), F_ALL6)) {
+                strcpy(g_build, pi->prefix);
+                strcat(g_build, (v410 == 0) ? "and " : "or ");
+                strcat(g_build, pi->op0);
+                strcat(g_build, ", ");
+                strcat(g_build, pi->op1);
+                if (pi->comment[0] != 0) { strcat(g_build, " "); strcat(g_build, pi->comment); }
+                vlog("smartpp: line %ld: 'mov %s, %ld' -> '%s' (P410)\n",
+                    i + 1, pi->op0, v410, g_build);
+                replace_line(i, g_build);
+                st[410]++;
+                continue;
+            }
+        }
+
+        /* P411 (v2.22 REMOVED): "or R, 80000000h -> stc / rcl R, 1" was
+         *  mathematically WRONG.  or sets only the MSB; rcl rotates ALL
+         *  bits left through carry — the results share no bits in common
+         *  for most inputs (e.g. R=0x40000000: or→0xC0000000,
+         *  rcl→0x80000001).  Neither rcl nor rol can set a single bit
+         *  without disturbing the others.  rname[411] kept as doc. */
+
+        /* P412 (v2.21): "add R, S / add R, imm" -> "lea R, [R+S+imm]"
+         *  (386+, flags dead, Intel).  GCC i386.md #25-28.  Very common
+         *  in address arithmetic.  Saves one instruction, flag-free. */
+        if (!pi->haslabel && !pi->toobig && !g_att &&
+            pi->cls == I_OTHER && pi->nops == 2 &&
+            ci_eq(pi->mnem, "add")) {
+            int r412 = find_reg(pi->op0);
+            int s412 = find_reg(pi->op1);
+            if (r412 >= 0 && s412 >= 0 && r412 != s412 &&
+                g_regs[r412].fam != 4 && g_regs[s412].fam != 4 &&
+                (g_regs[r412].hi - g_regs[r412].lo) == 32 &&
+                g_curcpu >= 8) {
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    long imm412;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig &&
+                        pj->cls == I_OTHER && pj->nops == 2 &&
+                        ci_eq(pj->mnem, "add") &&
+                        find_reg(pj->op0) == r412 &&
+                        find_reg(pj->op1) < 0 &&
+                        try_parse_number(pj->op1, &imm412) &&
+                        imm412 != 0 &&
+                        flags_clear(next_code(j), F_ALL6)) {
+                        char opnd[MAXTOK];
+                        emit_lea_sib(opnd, r412, s412, 1, imm412);
+                        strcpy(g_build, pj->prefix);
+                        strcat(g_build, "lea ");
+                        strcat(g_build, pj->op0);
+                        strcat(g_build, ", ");
+                        strcat(g_build, opnd);
+                        vlog("smartpp: line %ld: 'add %s,%s' / 'add %s,%ld' -> 'lea %s, %s' (P412)\n",
+                            i + 1, pi->op0, pi->op1, pj->op0, imm412, pj->op0, opnd);
+                        replace_line(j, g_build);
+                        DEL(i) = 1;
+                        st[412]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* P413 (v2.21): "shl R, N / add R, S" -> "lea R, [R+S*2^N]"
+         *  (386+, flags dead, Intel).  FPC ShlAddLeaSubIncDec2Lea;
+         *  LLVM X86OptimizeLEAs.  Array-index pattern.  N must be
+         *  1, 2, or 3 (SIB scales 2, 4, 8). */
+        if (!pi->haslabel && !pi->toobig && !g_att &&
+            g_curcpu >= 8 && pi->cls == I_SHIFT && pi->nops == 2 &&
+            (ci_eq(pi->mnem, "shl") || ci_eq(pi->mnem, "sal"))) {
+            int r413 = find_reg(pi->op0);
+            if (r413 >= 0 && g_regs[r413].fam != 4 &&
+                (g_regs[r413].hi - g_regs[r413].lo) == 32 &&
+                pi->shiftcount >= 1 && pi->shiftcount <= 3) {
                 j = next_code(i);
                 if (j >= 0 && !INDEF(j)) {
                     struct pinfo *pj = &g_ppair;
                     parse_line(j, pj);
                     if (!pj->haslabel && !pj->toobig &&
-                        pj->cls == I_LEA && pj->dreg >= 0 &&
-                        pj->dreg != pi->dreg) {
-                        int br2;
-                        long off2;
-                        if (lea_bracket(pj->op1, &br2, &off2) &&
-                            br2 == pi->dreg &&
-                            (g_regs[br2].hi - g_regs[br2].lo) ==
-                            (g_regs[pj->dreg].hi - g_regs[pj->dreg].lo)) {
-                            /* Intermediate R must be dead after the
-                             *  second LEA.  The second LEA reads R
-                             *  (as br2), but the *result* of the
-                             *  second LEA goes to D, not R, so R is
-                             *  a "read at line j" but must be killed
-                             *  before any subsequent read.  Use
-                             *  reg_dead_after(j, R). */
-                            if (reg_dead_after(j, pi->dreg)) {
-                                long sum = off1 + off2;
-                                /* Range-check: a 32-bit LEA
-                                 *  displacement can be any signed 32;
-                                 *  a 16-bit LEA's displacement is
-                                 *  limited to signed 16 (no SIB on
-                                 *  16-bit code).  Skip if it
-                                 *  overflows so we don't emit an
-                                 *  assembler error. */
-                                int dw = g_regs[br1].hi -
-                                         g_regs[br1].lo;
-                                long lim = (dw == 16) ? 0x7FFF :
-                                                        0x7FFFFFFFL;
-                                if (sum >= -lim && sum <= lim) {
+                        pj->cls == I_OTHER && pj->nops == 2 &&
+                        ci_eq(pj->mnem, "add") &&
+                        find_reg(pj->op0) == r413) {
+                        int s413 = find_reg(pj->op1);
+                        if (s413 >= 0 && s413 != r413 &&
+                            g_regs[s413].fam != 4 &&
+                            (g_regs[s413].hi - g_regs[s413].lo) == 32 &&
+                            flags_clear(next_code(j), F_ALL6)) {
+                            int scale = 1 << pi->shiftcount;
+                            char opnd[MAXTOK];
+                            emit_lea_sib(opnd, r413, s413, scale, 0);
+                            strcpy(g_build, pj->prefix);
+                            strcat(g_build, "lea ");
+                            strcat(g_build, pj->op0);
+                            strcat(g_build, ", ");
+                            strcat(g_build, opnd);
+                            vlog("smartpp: line %ld: 'shl %s,%ld' / 'add %s,%s' -> 'lea %s, %s' (P413)\n",
+                                i + 1, pi->op0, pi->shiftcount,
+                                pj->op0, pj->op1, pj->op0, opnd);
+                            replace_line(j, g_build);
+                            DEL(i) = 1;
+                            st[413]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P414 (v2.21): "sar EAX, 31" -> "cdq" (386+, flags dead).
+         *  FPC MovSar2Cltd.  sar EAX,31 sign-extends bit 31 to all of
+         *  EAX (the sign mask).  cdq sign-extends EAX into EDX:EAX,
+         3  putting the same mask in EDX.  If the user then moves EAX
+         *  to another register, we replace with cdq + mov from EDX.
+         *  Here we handle the simplest case: sar eax,31 / mov reg, eax
+         *  -> cdq / mov reg, edx (flags dead). */
+        if (!pi->haslabel && !pi->toobig && !g_att &&
+            g_curcpu >= 8 && pi->cls == I_SHIFT && pi->nops == 2 &&
+            ci_eq(pi->mnem, "sar") && pi->shiftcount == 31) {
+            int r414 = find_reg(pi->op0);
+            if (r414 >= 0 && g_regs[r414].fam == 0 &&
+                (g_regs[r414].hi - g_regs[r414].lo) == 32 &&
+                flags_clear(next_code(i), F_ALL6)) {
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig &&
+                        pj->cls == I_MOV && pj->nops == 2 &&
+                        find_reg(pj->op1) == r414) {
+                        int dst414 = find_reg(pj->op0);
+                        if (dst414 >= 0 && dst414 != r414 &&
+                            (g_regs[dst414].hi - g_regs[dst414].lo) == 32 &&
+                            /* v2.22: eax must be dead after the mov
+                             * (sar overwrites eax with sign mask;
+                             * cdq leaves eax unchanged → eax differs) */
+                            reg_dead_cf(next_code(j), r414)) {
+                            /* sar eax,31 / mov reg, eax -> cdq / mov reg, edx */
+                            char movbuf[MAXLINE];
+                            strcpy(g_build, pi->prefix);
+                            strcat(g_build, "cdq");
+                            sprintf(movbuf, "%smov %s, edx", pj->prefix, pj->op0);
+                            vlog("smartpp: line %ld: 'sar eax,31' / 'mov %s,eax' -> 'cdq' / 'mov %s,edx' (P414)\n",
+                                i + 1, pj->op0, pj->op0);
+                            replace_line(i, g_build);
+                            replace_line(j, movbuf);
+                            st[414]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P415 (v2.21): "bts/btr/btc R, N" -> "or/and/xor R, (1<<N)"
+         *  (flags dead, N constant 0..31).  GCC i386.md #62-64.
+         *  BT-family is microcoded on some CPUs; the AND/OR/XOR form
+         *  is faster and the same size or shorter.  Value-equivalent
+         *  (same bits written to R); flags differ (bt sets CF from
+         *  old bit, or/and/xor set SZP), so needs flags dead. */
+        if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
+            pi->nops == 2 &&
+            (ci_eq(pi->mnem, "bts") || ci_eq(pi->mnem, "btr") ||
+             ci_eq(pi->mnem, "btc"))) {
+            int r415 = find_reg(pi->op0);
+            long n415;
+            if (r415 >= 0 && g_regs[r415].fam != 4 &&
+                try_parse_number(pi->op1, &n415) && n415 >= 0 && n415 < 32) {
+                int w415 = g_regs[r415].hi - g_regs[r415].lo;
+                unsigned long mask415 = 1UL << n415;
+                if (w415 == 32 || (w415 == 16 && n415 < 16) ||
+                    (w415 == 8 && n415 < 8)) {
+                    if (flags_clear(next_code(i), F_ALL6)) {
+                        char num[32];
+                        const char *op415;
+                        if (ci_eq(pi->mnem, "bts")) { op415 = "or "; mask415 &= (w415==8)?0xFFUL:(w415==16)?0xFFFFUL:0xFFFFFFFFUL; }
+                        else if (ci_eq(pi->mnem, "btr")) { op415 = "and "; mask415 = ~(1UL << n415) & ((w415==8)?0xFFUL:(w415==16)?0xFFFFUL:0xFFFFFFFFUL); }
+                        else { op415 = "xor "; mask415 &= (w415==8)?0xFFUL:(w415==16)?0xFFFFUL:0xFFFFFFFFUL; }
+                        strcpy(g_build, pi->prefix);
+                        strcat(g_build, op415);
+                        strcat(g_build, pi->op0);
+                        strcat(g_build, ", ");
+                        sprintf(num, "%lu", mask415);
+                        strcat(g_build, num);
+                        vlog("smartpp: line %ld: '%s %s, %ld' -> '%s %s, %lu' (P415)\n",
+                            i + 1, pi->mnem, pi->op0, n415,
+                            op415, pi->op0, mask415);
+                        replace_line(i, g_build);
+                        st[415]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* P416 (v2.21): setcc + movzx fusion.
+         *  "setcc R8 / movzx R32, R8" -> "xor R32, R32 / setcc R8"
+         *  (386+).  LLVM X86FixupSetCC; GCC peephole2 #66.
+         *  Avoids partial-register stall on P5/PPro.  The xor must
+         *  go BEFORE the flag-defining instruction (xor clobbers
+         *  flags).  We walk backward to find it. */
+        if (!pi->haslabel && !pi->toobig && !g_att &&
+            g_curcpu >= 8 && pi->cls == I_OTHER && pi->nops == 1 &&
+            ci_eq_n(pi->mnem, "set", 3) && pi->mnem[3] != '\0') {
+            int r416 = find_reg(pi->op0);
+            if (r416 >= 0 && (g_regs[r416].hi - g_regs[r416].lo) == 8) {
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig &&
+                        pj->cls == I_MOVZX && pj->nops == 2 &&
+                        ci_eq(pj->mnem, "movzx") &&
+                        find_reg(pj->op1) == r416 &&
+                        g_regs[pj->dreg].fam == g_regs[r416].fam &&
+                        (g_regs[pj->dreg].hi - g_regs[pj->dreg].lo) == 32) {
+                        int r32_416 = pj->dreg;
+                        /* walk backward to find the flag-defining instr */
+                        long b;
+                        int found_flagdef = 0;
+                        for (b = i - 1; b >= 0; b--) {
+                            struct pinfo *pb = &g_plook;
+                            int rd, wr, div;
+                            if (DEL(b) || INDEF(b)) continue;
+                            parse_line(b, pb);
+                            if (pb->haslabel) break;
+                            if (!pb->hasinstr) continue;
+                            if (pb->toobig) break;
+                            /* check if this instruction reads/writes flags */
+                            if (flag_sets(pb, &rd, &wr, &div) != 0) break;
+                            if (wr != 0) { found_flagdef = 1; break; }
+                            if (div) break;
+                        }
+                        if (found_flagdef) {
+                            char xorbuf[MAXLINE];
+                            /* v2.22 fix: insert xor BEFORE the flag-defining
+                             * instruction (b), not after it.  insert_line_after(b-1)
+                             * places it between b-1 and b.  If b==0, we can't
+                             * insert before — skip the rule.
+                             * The xor clobbers all flags, so it MUST go before
+                             * the cmp/add/sub/etc that sets the flags the setcc
+                             * reads.  Inserting after would make setcc read
+                             * xor's flags (always ZF=1) instead. */
+                            if (b <= 0) continue;
+                            DEL(j) = 1;  /* delete movzx first (no index shift) */
+                            sprintf(xorbuf, "%sxor %s, %s",
+                                g_plook.prefix, g_regs[r32_416].name,
+                                g_regs[r32_416].name);
+                            vlog("smartpp: line %ld: 'setcc %s' / 'movzx %s, %s' -> insert 'xor %s, %s' before line %ld + delete movzx (P416)\n",
+                                i + 1, pi->op0, pj->op0, pi->op0,
+                                g_regs[r32_416].name, g_regs[r32_416].name,
+                                b + 1);
+                            insert_line_after(b - 1, xorbuf);
+                            st[416]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P417 (v2.22): "mov R, [mem] / op R, S / mov [mem], R"
+         *  -> "op [mem], S" (R dead, RMW fold, stack mem only).
+         *  v2.22: gated to stack memory — RMW on arbitrary mem is
+         *  unsafe for MMIO (read side effect).  GCC i386.md #29-47. */
+        if (!pi->haslabel && !pi->toobig && !g_att &&
+            pi->cls == I_MOV && pi->nops == 2 && pi->dreg >= 0 &&
+            pi->sreg < 0 && !pi->srcimm &&
+            is_stack_mem_operand(pi->op1)) { /* v2.22: stack mem */
+            /* op0 is a register (dest), op1 is memory (source) */
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    pj->cls == I_OTHER && pj->nops == 2 &&
+                    find_reg(pj->op0) == pi->dreg &&
+                    (ci_eq(pj->mnem, "add") || ci_eq(pj->mnem, "sub") ||
+                     ci_eq(pj->mnem, "or") || ci_eq(pj->mnem, "and") ||
+                     ci_eq(pj->mnem, "xor") || ci_eq(pj->mnem, "adc") ||
+                     ci_eq(pj->mnem, "sbb"))) {
+                    long k417 = next_code(j);
+                    if (k417 >= 0 && !INDEF(k417)) {
+                        struct pinfo *pk = &g_plook;
+                        parse_line(k417, pk);
+                        if (!pk->haslabel && !pk->toobig &&
+                            pk->cls == I_MOV && pk->nops == 2 &&
+                            find_reg(pk->op1) == pi->dreg &&
+                            ci_eq(pk->op0, pi->op1) &&
+                            reg_dead_cf(next_code(k417), pi->dreg)) {
+                            /* Fold: op [mem], S */
+                            strcpy(g_build, pj->prefix);
+                            strcat(g_build, pj->mnem);
+                            strcat(g_build, " ");
+                            strcat(g_build, pi->op1);  /* mem dest */
+                            strcat(g_build, ", ");
+                            strcat(g_build, pj->op1);  /* source */
+                            vlog("smartpp: line %ld: RMW fold 'mov %s,%s' / '%s %s,%s' / 'mov %s,%s' -> '%s' (P417)\n",
+                                i + 1, pi->op0, pi->op1,
+                                pj->mnem, pj->op0, pj->op1,
+                                pk->op0, pk->op1, g_build);
+                            replace_line(i, g_build);
+                            DEL(j) = 1;
+                            DEL(k417) = 1;
+                            st[417]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* ===== v2.25: EASY optimizations from the 10-item list ===== */
+
+        /* P42 (v2.25): "push bp / mov bp, sp / sub sp, N" -> "enter N, 0"
+         *  (186+, 16-bit only, !g_att, flags dead).  enter preserves
+         *  flags; sub sp,N defines them.  Size win: 6..7 -> 4 bytes.
+         *  FPC; documented since v1.70 but never implemented. */
+        if (!pi->haslabel && !pi->toobig && !g_att && !g_use32 &&
+            g_curcpu >= 2 && pi->cls == I_PUSH && pi->nops == 1) {
+            int r42 = find_reg(pi->op0);
+            if (r42 >= 0 && g_regs[r42].fam == 5) {  /* push bp */
+                long j42a = next_code(i);
+                if (j42a >= 0 && !INDEF(j42a)) {
+                    struct pinfo *pa = &g_ppair;
+                    parse_line(j42a, pa);
+                    if (!pa->haslabel && !pa->toobig &&
+                        pa->cls == I_MOV && pa->nops == 2 &&
+                        pa->dreg >= 0 && g_regs[pa->dreg].fam == 5 &&
+                        pa->sreg >= 0 && g_regs[pa->sreg].fam == 4) {
+                        /* mov bp, sp */
+                        long j42b = next_code(j42a);
+                        if (j42b >= 0 && !INDEF(j42b)) {
+                            struct pinfo *pb = &g_plook;
+                            parse_line(j42b, pb);
+                            if (!pb->haslabel && !pb->toobig &&
+                                pb->cls == I_OTHER && pb->nops == 2 &&
+                                ci_eq(pb->mnem, "sub") &&
+                                find_reg(pb->op0) >= 0 &&
+                                g_regs[find_reg(pb->op0)].fam == 4) {
+                                /* sub sp, N */
+                                long n42;
+                                if (try_parse_number(pb->op1, &n42) &&
+                                    n42 >= 0 && n42 <= 0xFFFF &&
+                                    flags_clear(next_code(j42b), F_ALL6)) {
                                     char num[32];
-                                    strcpy(g_build, pj->prefix);
-                                    strcat(g_build, "lea ");
-                                    if (g_att) {
-                                        if (sum == 0) {
-                                            sprintf(g_build + strlen(g_build),
-                                                "(%%%s)", g_regs[br1].name);
-                                        } else {
-                                            sprintf(num, "%ld", sum);
-                                            sprintf(g_build + strlen(g_build),
-                                                "%s(%%%s)", num,
-                                                g_regs[br1].name);
-                                        }
-                                        strcat(g_build, ", %");
-                                        strcat(g_build, g_regs[pj->dreg].name);
-                                    } else {
-                                        strcat(g_build,
-                                               g_regs[pj->dreg].name);
-                                        strcat(g_build, ", [");
-                                        strcat(g_build,
-                                               g_regs[br1].name);
-                                        if (sum > 0) {
-                                            sprintf(num, "+%ld", sum);
-                                            strcat(g_build, num);
-                                        } else if (sum < 0) {
-                                            sprintf(num, "-%ld", -sum);
-                                            strcat(g_build, num);
-                                        }
-                                        strcat(g_build, "]");
-                                    }
-                                    if (pj->comment[0] != '\0') {
-                                        strcat(g_build, " ");
-                                        strcat(g_build, pj->comment);
-                                    }
-                                    vlog("smartpp: line %ld: fused 'lea %s, [%s%+ld]' / 'lea %s, [%s%+ld]' to 'lea %s, [%s%+ld]' (P70)\n",
-                                        i + 1,
-                                        pi->op0, g_regs[br1].name, off1,
-                                        pj->op0, g_regs[pi->dreg].name, off2,
-                                        pj->op0, g_regs[br1].name, sum);
-                                    DEL(i) = 1;
-                                    replace_line(j, g_build);
-                                    st[70]++;
+                                    strcpy(g_build, pi->prefix);
+                                    strcat(g_build, "enter ");
+                                    sprintf(num, "%ld", n42);
+                                    strcat(g_build, num);
+                                    strcat(g_build, ", 0");
+                                    vlog("smartpp: line %ld: 'push bp'/'mov bp,sp'/'sub sp,%ld' -> '%s' (P42)\n",
+                                        i + 1, n42, g_build);
+                                    replace_line(i, g_build);
+                                    DEL(j42a) = 1;
+                                    DEL(j42b) = 1;
+                                    st[42]++;
                                     continue;
                                 }
                             }
@@ -7336,1222 +12561,112 @@ static long run_pass(void)
             }
         }
 
-        /* P17: "lea R,[R+const]" -> "add/sub/inc/dec R" (FPC's LEA
-        *  conversion; lea touches no flags, so the scan must prove
-        *  the ones the replacement defines are dead; CF survives
-        *  inc/dec, matching lea).  Two exact cousins need no scan:
-        *  "lea R,[const]" -> "mov R,const" and, at equal width,
-        *  "lea R,[S]" -> "mov R,S" (lea computes the offset only,
-        *  no segment is involved; mixed widths would zero-extend
-        *  and mov would not, so they are left alone). */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_LEA && pi->dreg >= 0) {
-            int br;
-            long off;
-            if (lea_bracket(pi->op1, &br, &off)) {
-                if (br < 0) {
-                    char num[32];
-                    strcpy(g_build, pi->prefix);
-                    strcat(g_build, "mov ");
-                    if (g_att) {
-                        strcat(g_build, "$");
-                        sprintf(num, "%ld", off);
-                        strcat(g_build, num);
-                        strcat(g_build, ", ");
-                        strcat(g_build, pi->op0);
-                    } else {
-                        strcat(g_build, pi->op0);
-                        strcat(g_build, ", ");
-                        sprintf(num, "%ld", off);
-                        strcat(g_build, num);
-                    }
-                    if (pi->comment[0] != '\0') {
-                        strcat(g_build, " ");
-                        strcat(g_build, pi->comment);
-                    }
-                    vlog("smartpp: line %ld: '%s' rewritten to '%s' (P17)\n",
-                        i + 1, L(i), g_build);
-                    replace_line(i, g_build);
-                    st[17]++;
-                    continue;
-                }
-                else if (br != pi->dreg && off == 0 &&
-                         (g_regs[br].hi - g_regs[br].lo) ==
-                         (g_regs[pi->dreg].hi - g_regs[pi->dreg].lo)) {
-                    strcpy(g_build, pi->prefix);
-                    strcat(g_build, "mov ");
-                    if (g_att) {
-                        strcat(g_build, "%");
-                        strcat(g_build, g_regs[br].name);
-                        strcat(g_build, ", ");
-                        strcat(g_build, pi->op0);
-                    } else {
-                        strcat(g_build, pi->op0);
-                        strcat(g_build, ", ");
-                        strcat(g_build, g_regs[br].name);
-                    }
-                    if (pi->comment[0] != '\0') {
-                        strcat(g_build, " ");
-                        strcat(g_build, pi->comment);
-                    }
-                    vlog("smartpp: line %ld: '%s' rewritten to '%s' (P17)\n",
-                        i + 1, L(i), g_build);
-                    replace_line(i, g_build);
-                    st[17]++;
-                    continue;
-                }
-                else if (br == pi->dreg) {
-                    int dw = g_regs[pi->dreg].hi - g_regs[pi->dreg].lo;
-                    /* Range-check the displacement: lea silently
-                    *  truncates; the rewrite should match (or be
-                    *  left alone).  Allow the same range the add/sub
-                    *  immediate encoding accepts (signed 16-bit for
-                    *  a 16-bit register, signed 32-bit for a 32-bit
-                    *  register, signed 8-bit for an 8-bit register
-                    *  -- the assembler does not have an 8-bit lea,
-                    *  so this only guards 16/32-bit). */
-                    long lim = (dw == 16) ? 0x7FFF :
-                               (dw == 32) ? 0x7FFFFFFFL : 0x7F;
-                    if (off > lim || off < -(lim + 1)) {
-                        /* skip; the lea wraps the constant but the
-                        *  emitted add/sub R, big would look wrong */
-                    }
-                    else if (off == 0) {
-                        vlog("smartpp: line %ld: deleted '%s' (identity, P17)\n",
-                            i + 1, L(i));
-                        DEL(i) = 1;
-                        st[17]++;
-                        continue;
-                    }
-                    else if (flags_clear(next_code(i),
-                             (off == 1 || off == -1) ? (F_ALL6 & ~F_CF) : F_ALL6)) {
-                        char num[32];
-                        strcpy(g_build, pi->prefix);
-                        if (off == 1) strcat(g_build, "inc ");
-                        else if (off == -1) strcat(g_build, "dec ");
-                        else if (off > 0) strcat(g_build, "add ");
-                        else strcat(g_build, "sub ");
-                        if (off == 1 || off == -1) {
-                            strcat(g_build, pi->op0);
-                        }
-                        else if (g_att) {
-                            strcat(g_build, "$");
-                            sprintf(num, "%ld", off > 0 ? off : -off);
-                            strcat(g_build, num);
-                            strcat(g_build, ", ");
-                            strcat(g_build, pi->op0);
-                        }
-                        else {
-                            strcat(g_build, pi->op0);
-                            strcat(g_build, ", ");
-                            sprintf(num, "%ld", off > 0 ? off : -off);
-                            strcat(g_build, num);
-                        }
-                        if (pi->comment[0] != '\0') {
-                            strcat(g_build, " ");
-                            strcat(g_build, pi->comment);
-                        }
-                        vlog("smartpp: line %ld: '%s' rewritten to '%s' (P17)\n",
-                            i + 1, L(i), g_build);
-                        replace_line(i, g_build);
-                        st[17]++;
-                    }
-                }
-            }
-        }
-
-        /* P41 (v1.80): "lea R, [R + S]" (R != S, same width) ->
-        *  "add R, S".  lea computes R := R + S without touching flags
-        *  or memory; add computes R := R + S and defines all six
-        *  flags.  Same result; only flags differ, scan must prove
-        *  them dead.  Two-register cousin of P17.  On 8086/186/286
-        *  the only legal [base+index] forms for LEA are [BX+SI],
-        *  [BX+DI], [BP+SI], [BP+DI]; restrict to those when not on
-        *  386+.  On 386+ any general pair works. */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_LEA &&
-            pi->dreg >= 0) {
-            int a, b;
-            long off;
-            if (lea_two_regs(pi->op1, &a, &b, &off) && off == 0) {
-                int sreg = -1;
-                int dw = g_regs[pi->dreg].hi - g_regs[pi->dreg].lo;
-                if (a == pi->dreg && b != pi->dreg) sreg = b;
-                else if (b == pi->dreg && a != pi->dreg) sreg = a;
-                /* Same width as destination (lea d, [a+b] requires
-                *  both address regs to be the same width as the
-                *  destination on 386+, and on pre-386 the legal
-                *  16-bit pairs all have width 16). */
-                if (sreg >= 0 &&
-                    (g_regs[sreg].hi - g_regs[sreg].lo) == dw) {
-                    int legal = 1;
-                    if (g_curcpu < 8) {
-                        /* pre-386: only [BX+SI], [BX+DI], [BP+SI],
-                        *  [BP+DI] are legal; both address regs must
-                        *  be 16-bit; destination must be 16-bit too */
-                        if (dw != 16) legal = 0;
-                        else {
-                            int af = g_regs[a].fam, bf = g_regs[b].fam;
-                            int aa = g_regs[a].hi == 16;
-                            int bb = g_regs[b].hi == 16;
-                            if (!aa || !bb) legal = 0;
-                            else if (!((af == 3 && bf == 6) ||
-                                       (af == 3 && bf == 7) ||
-                                       (af == 5 && bf == 6) ||
-                                       (af == 5 && bf == 7) ||
-                                       (bf == 3 && af == 6) ||
-                                       (bf == 3 && af == 7) ||
-                                       (bf == 5 && af == 6) ||
-                                       (bf == 5 && af == 7)))
-                                legal = 0;
-                        }
-                    }
-                    if (legal && flags_clear(next_code(i), F_ALL6)) {
-                        strcpy(g_build, pi->prefix);
-                        strcat(g_build, "add ");
-                        strcat(g_build, pi->op0);          /* Intel: dst, src */
-                        strcat(g_build, ", ");
-                        strcat(g_build, g_regs[sreg].name);
-                        if (pi->comment[0] != '\0') {
-                            strcat(g_build, " ");
-                            strcat(g_build, pi->comment);
-                        }
-                        vlog("smartpp: line %ld: '%s' rewritten to '%s' (P41)\n",
-                            i + 1, L(i), g_build);
-                        replace_line(i, g_build);
-                        st[41]++;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        /* P63 (v1.82): "lea R, [R * K]" (K in {2, 4, 8}, 386+, no
-         *  base, no displacement) -> "shl R, log2(K)".  Generalizes
-         *  P57 (which is the K=2 case written as `[R + R]`).  The
-         *  SIB byte was introduced with the 386, so this rule is
-         *  gated on g_curcpu >= 8 (386+).  Both instructions compute
-         *  R := R * K = R << log2(K); lea defines no flags, shl
-         *  defines all six, so the scan must prove all six dead.
-         *  AT&T output uses the single-% convention.  Memory
-         *  operands excluded by the parser (lea_scaled_single
-         *  accepts only the [R*K] form).  Research: FPC OptPass2Lea
-         *  "Lea2Shl" (aoptx86.pas ~16904, scalefactor in [2,4,8]). */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_LEA &&
-            pi->dreg >= 0 && g_curcpu >= 8) {
-            int r63;
-            int scale63;
-            if (lea_scaled_single(pi->op1, &r63, &scale63) &&
-                r63 == pi->dreg &&
-                flags_clear(next_code(i), F_ALL6)) {
-                int shft = (scale63 == 2) ? 1 :
-                           (scale63 == 4) ? 2 : 3;
-                char num[32];
-                strcpy(g_build, pi->prefix);
-                strcat(g_build, "shl ");
-                if (g_att) {
-                    sprintf(num, "$%d", shft);
-                    strcat(g_build, num);
-                    strcat(g_build, ", ");
-                    strcat(g_build, pi->op0);
-                } else {
-                    strcat(g_build, pi->op0);
-                    strcat(g_build, ", ");
-                    sprintf(num, "%d", shft);
-                    strcat(g_build, num);
-                }
-                if (pi->comment[0] != '\0') {
-                    strcat(g_build, " ");
-                    strcat(g_build, pi->comment);
-                }
-                vlog("smartpp: line %ld: 'lea %s, [%s*%d]' rewritten to 'shl %s, %d' (P63)\n",
-                    i + 1, pi->op0, g_regs[r63].name, scale63,
-                    pi->op0, shft);
-                replace_line(i, g_build);
-                st[63]++;
-                continue;
-            }
-        }
-
-        /* P57 (v1.81): "lea R, [R + R]" -> "shl R, 1".  When both
-         *  source registers of the LEA are the destination register
-         *  itself and there is no displacement, the LEA computes
-         *  R := 2*R, which is exactly what `shl R, 1` produces.
-         *  386+ only (the [R + R] form needs the SIB byte; pre-386
-         *  16-bit LEA only accepts [BX+SI], [BX+DI], [BP+SI],
-         *  [BP+DI], so a source-level [R + R] on pre-386 is not a
-         *  legal operand and we wouldn't see it).  All six flags
-         *  must be dead: lea defines none, shl defines all six.
-         *  Saves 1 byte (3 -> 2).  Intel-only: AT&T two-register
-         *  forms have an index/scale we don't parse (lea_two_regs
-         *  returns 0 for g_att).  Massalin-Stone doubling idiom. */
-        if (!g_att && !pi->haslabel && !pi->toobig &&
-            pi->cls == I_LEA && pi->dreg >= 0 && g_curcpu >= 8) {
-            int a, b;
-            long off;
-            if (lea_two_regs(pi->op1, &a, &b, &off) && off == 0 &&
-                a == pi->dreg && b == pi->dreg &&
-                flags_clear(next_code(i), F_ALL6)) {
-                strcpy(g_build, pi->prefix);
-                strcat(g_build, "shl ");
-                strcat(g_build, pi->op0);
-                strcat(g_build, ", 1");
-                if (pi->comment[0] != '\0') {
-                    strcat(g_build, " ");
-                    strcat(g_build, pi->comment);
-                }
-                vlog("smartpp: line %ld: '%s' rewritten to '%s' (P57)\n",
-                    i + 1, L(i), g_build);
-                replace_line(i, g_build);
-                st[57]++;
-                continue;
-            }
-        }
-
-        /* P47 (v1.80): "mov R, S / add R, imm" (R != S) ->
-        *  "lea R, [S + imm]" (or [S - imm] for sub).  mov sets R = S
-        *  and no flags; add sets R = S + imm and all six flags.  lea
-        *  sets R = S + imm and no flags.  Same result; only flags
-        *  differ.  Scan must prove all six dead.  Inverse of P17.
-        *  386+ general (any S); 8086+ restricted (S must be a legal
-        *  16-bit LEA base, i.e. BX/BP/SI/DI).  Intel-only.
-        *
-        *  v1.83 BUG FIX: the 386+ branch accepted any S of any
-        *  width, but a 16-bit base is invalid in 32-bit addressing
-        *  (e.g. `lea eax, [cx+4]` doesn't assemble) and a 32-bit
-        *  base is invalid in 16-bit addressing (e.g. `lea ax,
-        *  [ecx+4]` doesn't assemble either).  Require the source
-        *  width to equal the destination width on the 386+ path, and
-        *  (already present) require 16-bit S in the BX/BP/SI/DI
-        *  family on the pre-386 path. */
-        if (!g_att && !pi->haslabel && !pi->toobig &&
-            pi->cls == I_MOV && pi->dreg >= 0 && pi->sreg >= 0 &&
-            pi->dreg != pi->sreg &&
-            (g_regs[pi->dreg].hi - g_regs[pi->dreg].lo) >= 16) {
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                struct pinfo *pj = &g_ppair;
-                parse_line(j, pj);
-                if (!pj->haslabel && !pj->toobig &&
-                    pj->cls == I_OTHER && pj->nops == 2 &&
-                    (ci_eq(pj->mnem, "add") || ci_eq(pj->mnem, "sub")) &&
-                    find_reg(pj->op0) == pi->dreg) {
-                    long imm;
-                    if (try_parse_number(pj->op1, &imm)) {
-                        long disp = (ci_eq(pj->mnem, "add")) ? imm : -imm;
-                        int sreg = pi->sreg;
-                        int sw = g_regs[sreg].hi - g_regs[sreg].lo;
-                        int dw = g_regs[pi->dreg].hi - g_regs[pi->dreg].lo;
-                        /* range check: lea disp must fit (signed 16-bit
-                        *  for 16-bit, signed 32-bit for 32-bit); the
-                        *  assembler will choose disp8 or disp16/32 */
-                        long lim = (sw == 16) ? 0x7FFF : 0x7FFFFFFFL;
-                        int legal = 1;
-                        if (g_curcpu < 8) {
-                            /* pre-386: S must be a 16-bit base reg
-                            *  (BX, BP, SI, DI) and the destination
-                            *  must be 16-bit too */
-                            if (sw != 16 || dw != 16 ||
-                                (g_regs[sreg].fam != 3 &&
-                                 g_regs[sreg].fam != 5 &&
-                                 g_regs[sreg].fam != 6 &&
-                                 g_regs[sreg].fam != 7))
-                                legal = 0;
-                        }
-                        else {
-                            /* v1.83: 386+ -- the destination and the
-                             *  source must have the same width; a
-                             *  16-bit base in 32-bit addressing mode
-                             *  is illegal, and so is a 32-bit base
-                             *  in 16-bit addressing mode. */
-                            if (sw != dw) legal = 0;
-                        }
-                        if (legal && disp <= lim && disp >= -(lim + 1) &&
-                            flags_clear(next_code(j), F_ALL6)) {
-                            char operand[MAXTOK];
-                            emit_lea_disp(operand, sreg, disp);
-                            strcpy(g_build, pi->prefix);
-                            strcat(g_build, "lea ");
-                            strcat(g_build, pi->op0);
-                            strcat(g_build, ", ");
-                            strcat(g_build, operand);
-                            if (pi->comment[0] != '\0') {
-                                strcat(g_build, " ");
-                                strcat(g_build, pi->comment);
-                            }
-                            vlog("smartpp: line %ld: '%s' / '%s' rewritten to '%s' (P47)\n",
-                                i + 1, L(i), L(j), g_build);
-                            replace_line(i, g_build);
-                            DEL(j) = 1;
-                            st[47]++;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-
-        /* P6: jump whose target introduces the very next instruction
-        *  line is redundant (taken or not, execution reaches the
-        *  same instruction; jmp/jcc touch no flags).  v1.80: skip
-        *  pure-label lines so "jmp L1 / L1: / mov" also fires
-        *  (previously only "jmp L1 / L1: mov" did). */
-        if ((pi->cls == I_JMP || pi->cls == I_JCC) &&
-            pi->jtarget_ok && !pi->toobig && !pi->haslabel) {
-            long d = resolve_jtarget(i, pi->jtarget, &dup6);
-            if (d >= 0 && !dup6) {
-                long k = instr_after_label(d);
-                long ii = instr_after_label(i + 1);
-                if (k > i && k == ii) {
-                    vlog("smartpp: line %ld: deleted redundant '%s %s' (P6)\n",
-                        i + 1, pi->mnem, pi->jtarget);
-                    DEL(i) = 1;
-                    st[6]++;
-                    continue;
-                }
-            }
-        }
-
-        /* P7: invert a conditional jump over a bridge jump:
-        *  "j<cc> L1 / jmp L2 / L1:"  ->  "j<not cc> L2" and the
-        *  bridge jmp is deleted.  The bridge must carry no label
-        *  (nothing else may reach it) and L1's code must start
-        *  right after the bridge.  Then: cc -> falls into L1's
-        *  code exactly as before; not cc -> L2 exactly as the
-        *  bridge did.  Flags untouched. */
-        if (pi->cls == I_JCC && pi->jtarget_ok && !pi->toobig) {
-            long d, k, m;
-            int dup = 0;
-            struct pinfo *pj = &g_ppair;
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                parse_line(j, pj);
-                if (pj->cls == I_JMP && pj->jtarget_ok && !pj->toobig &&
-                    !pj->haslabel) {
-                    d = resolve_jtarget(i, pi->jtarget, &dup);
-                    if (d >= 0 && !dup) {
-                        k = instr_after_label(d);
-                        m = next_code(j);
-                        if (k > j && k == m) {
-                            const char *inv = jcc_inverse(pi->mnem);
-                            if (inv != NULL) {
-                                strcpy(g_build, pi->prefix);
-                                strcat(g_build, inv);
-                                strcat(g_build, " ");
-                                strcat(g_build, pj->jtarget);
-                                if (pi->comment[0] != '\0') {
-                                    strcat(g_build, " ");
-                                    strcat(g_build, pi->comment);
-                                }
-                                vlog("smartpp: line %ld: '%s %s' inverted to '%s %s', bridge jmp at line %ld deleted (P7)\n",
-                                    i + 1, pi->mnem, pi->jtarget,
-                                    inv, pj->jtarget, j + 1);
-                                replace_line(i, g_build);
-                                DEL(j) = 1;
-                                st[7]++;
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        /* P5: jump threading */
-        if ((pi->cls == I_JMP || pi->cls == I_JCC) &&
-            pi->jtarget_ok && !pi->toobig) {
-            char cur[MAXTOK];
-            char seen[8][64];
-            long base = i;
-            int nseen = 0, hops = 0;
-            strcpy(cur, pi->jtarget);
-            while (hops < 8) {
-                long d, k;
-                int dup = 0, cyc = 0, si;
-                struct pinfo *pk = &g_plook;
-                for (si = 0; si < nseen; si++)
-                    if (ci_eq(seen[si], cur)) { cyc = 1; break; }
-                if (cyc) break;
-                if (nseen < 8 && strlen(cur) < 64) {
-                    strcpy(seen[nseen], cur);
-                    nseen++;
-                }
-                d = resolve_jtarget(base, cur, &dup);
-                if (d < 0 || dup) break;
-                k = instr_after_label(d);
-                if (k < 0) break;
-                parse_line(k, pk);
-                if (pk->toobig || !pk->jtarget_ok) break;
-                if (pk->cls == I_JMP) {
-                    /* unconditional: every path follows it */
-                }
-                else if (pk->cls == I_JCC && pi->cls == I_JCC &&
-                         jcc_canon(pk->mnem) >= 0 &&
-                         jcc_canon(pk->mnem) == jcc_canon(pi->mnem)) {
-                    /* same canonical condition: taken paths reach
-                    *  the same target and not-taken paths fall
-                    *  into the unchanged intermediate jcc, which
-                    *  branches identically on the same flags */
-                }
-                else break;
-                if (ci_eq(pk->jtarget, cur)) break;
-                strcpy(cur, pk->jtarget);
-                base = k;
-                hops++;
-            }
-            if (hops > 0 && !ci_eq(cur, pi->jtarget)) {
-                vlog("smartpp: line %ld: '%s %s' threaded to '%s' (P5)\n",
-                    i + 1, pi->mnem, pi->jtarget, cur);
-                retarget_line(i, pi, cur);
-                st[5]++;
-            }
-        }
-
-        /* ============================================================
-         *  v1.84 NEW RULES
-         *  ----------------------------------------------------------
-         *  Goals (per request):
-         *   (a) port the SMART.INC v4.02 automatic optimizations that
-         *       a peephole can do safely: the "lea r16, var -> mov r16,
-         *       OFFSET var" substitution (item 9).  Items 8/10/11 of
-         *       SMART.INC (mov/xchg reg,reg delete; jcc/jcxz/loop range
-         *       extension) are ALREADY covered by P1 (delete mov/xchg
-         *       R,R) and the assembler's own near/short pick on 386+,
-         *       so we only add what is genuinely missing.
-         *   (b) 486/Pentium/PentiumPro tuning rules: BSWAP presence,
-         *       CMOV availability, MOVZX-vs-XOR+MOV cost on -nz, the
-         *       shorter "test R,R" forms, and Pentium Pro's preference
-         *       for "xor R,R; xor R,R" pairing over "mov R,0".
-         *   (c) the reg-liveness scan (reg_dead_cf) unlocks the
-         *       constant-fold family the user named: "mov R,K / cmp
-         *       R,K" (or "mov R,K / test R,K") when R is dead after
-         *       -- folds to the comparison with the constant itself,
-         *       and "mov R,K / push R" when R is dead -- folds to
-         *       "push K".  Both are exactly the cases reg_dead_after
-         *       could not prove because the next instruction may be a
-         *       conditional jump.
-         *  Every new rule keeps the v1.83 safety discipline: exact on
-         *  R and flags, no labeled-line delete, no MMIO touching.
-         * ============================================================ */
-
-        /* P82 (v1.84) [SMART.INC item 9]: "lea r16, var" -> "mov r16,
-         *  OFFSET var" -- shorter (3 vs 4 bytes on the 8086/186/286)
-         *  and flag-neutral.  Restricted to:
-         *    - 16-bit segment (@WordSize == 2): in a USE32 segment
-         *      OFFSET is a 32-bit value and "mov r16, OFFSET" truncates
-         *      it or fails to encode (the SMART.INC v3.7 fix);
-         *    - 16-bit destination register: "lea eax, var" -> "mov
-         *      eax, OFFSET var" is the SAME size (5 bytes), so we keep
-         *      the LEA (no gain, and on a 386+ LEA is one cycle vs
-         *      MOV's two for an immediate, so size-equal favours LEA);
-         *    - direct memory symbol with no index: "lea ax, [bx]" or
-         *      "lea ax, var[si]" is indexed addressing, not a plain
-         *      address, and is left alone;
-         *    - Intel-only: AT&T "lea" is op0/op1 reversed and OFFSET
-         *      is GAS-immediate syntax ($), so we keep this rule
-         *      Intel-only for parity with the rest of the LEA family.
-         *  "OFFSET var" is the MASM/TASM/ASMC syntax; the JWasm/UASM
-         *  family accepts it too.  Memory side effects: none -- LEA
-         *  never touches memory, and neither does MOV with an OFFSET
-         *  immediate. */
-        if (!g_att && !pi->haslabel && !pi->toobig && pi->cls == I_LEA &&
-            pi->dreg >= 0 &&
-            (g_regs[pi->dreg].hi - g_regs[pi->dreg].lo) == 16 &&
-            !g_use32) {
-            /* Detect "lea R, <plain symbol>" or "lea R, <symbol+disp>"
-             *  where the operand is a direct memory reference (no
-             *  brackets, no index, no scale).  The conservative test
-             *  is: op1 starts with an identifier char, contains no
-             *  '[' or '(' or '+'-after-bracket, and is not itself a
-             *  register.  We accept "var", "var+4", "var-2", "var+8"
-             *  (a plain offset expression). */
-            const char *o = pi->op1;
-            int is_direct_offset = 0;
-            if (o[0] != '\0' && (is_ident_start((unsigned char)o[0]) ||
-                                 (o[0] >= '0' && o[0] <= '9')) &&
-                !strchr(o, '[') && !strchr(o, '(') &&
-                find_reg(o) < 0) {
-                /* reject if it has a memory base/index syntax like
-                 *  "bx+si" or "ds:foo" -- but accept "var", "var+2",
-                 *  "var-2", "5", "0FFFh".  If it parses as a plain
-                 *  number we still allow it (lea ax, 5 is legal
-                 *  ASMC/JWasm and equivalent to mov ax, 5). */
-                long dummy;
-                if (try_parse_number(o, &dummy) || is_offset_expr(o)) {
-                    is_direct_offset = 1;
-                }
-                else {
-                    /* identifier or identifier+/-disp: ensure no
-                     *  register sneaks in.  We treat any token that
-                     *  find_reg would match as a register. */
-                    is_direct_offset = 1;
-                }
-            }
-            if (is_direct_offset) {
-                sprintf(g_build, "%smov %s, OFFSET %s", pi->prefix,
-                        pi->op0, pi->op1);
-                vlog("smartpp: line %ld: 'lea %s, %s' rewritten to 'mov %s, OFFSET %s' (P82)\n",
-                    i + 1, pi->op0, pi->op1, pi->op0, pi->op1);
-                replace_line_marked(i, g_build,
-                    "lea r16,var -> mov r16,OFFSET var", 82);
-                st[82]++;
-                continue;
-            }
-        }
-
-        /* P85 (v1.84): "mov R, K / cmp R, K" -> "cmp R, K" deleted
-         *  when the result of the cmp is ZF=1 (since R == K
-         *  provably).  Equivalent rewrite that is always safe and
-         *  smaller: replace the cmp with "test R, R" only if K is
-         *  known-zero.  The genuinely useful case is: R was just loaded
-         *  with K, so R == K, and the cmp sets ZF=1, SF = (K<0)?1:0,
-         *  etc.  When R is dead after the cmp (the user's named
-         *  reg-liveness case), we can replace the whole pair by a
-         *  single "cmp R, K" -- the mov is dead because R is dead
-         *  after the cmp.  We do the *exact* rewrite that requires no
-         *  flag scan:
-         *
-         *      mov R, K      ; deleted (R was a fresh constant)
-         *      cmp R, K      ; -> kept, but R==K so this sets ZF=1
-         *
-         *  Wait -- the cmp reads R (the mov's destination), so the
-         *  mov is NOT dead.  The actual fold is:
-         *
-         *      mov R, K / cmp R, K   (R dead after)
-         *   -> (the cmp would have read R = K and compared to K,
-         *       setting ZF=1 and the rest from K's sign/parity)
-         *
-         *  We cannot replace cmp+mov with a constant flags register
-         *  (no x86 opcode writes ZF from an immediate).  But we CAN
-         *  delete the mov entirely if R is dead after the cmp AND
-         *  the cmp doesn't read R ... but cmp DOES read R.  So the
-         *  only safe deletion when R is dead after the cmp is when
-         *  the cmp also is dead (its flags dead) -- then BOTH
-         *  instructions vanish.  That is the genuinely useful case:
-         *  the user wrote a load-and-test that the next instruction
-         *  ignores.  But cmp by itself (not test) reads R, so we can
-         *  only delete the mov if the cmp also goes.  We delete both
-         *  mov and cmp when:
-         *    - the constants match (cmp R, K2 vs mov R, K1 with K1 ==
-         *      K2, so the cmp will always produce ZF=1, and the rest
-         *      of the flags are a function of K only);
-         *    - R is dead after the cmp (reg_dead_cf);
-         *    - all six flags are dead after the cmp (flags_clear).
-         *  Then the pair as a whole computes nothing observable and
-         *  can be removed.  Research: FPC OptPass1CSE "dead mov+cmp"
-         *  pattern; GCC's combine pass after auto-inc-dec. */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_MOV &&
-            pi->dreg >= 0 && pi->srcimm) {
-            long k1;
-            if (try_parse_number(pi->op1, &k1)) {
-                j = next_code(i);
-                if (j >= 0 && !INDEF(j)) {
-                    struct pinfo *pj = &g_ppair;
-                    parse_line(j, pj);
-                    if (!pj->haslabel && !pj->toobig &&
-                        pj->cls == I_OTHER && pj->nops == 2 &&
-                        ci_eq(pj->mnem, "cmp") &&
-                        find_reg(pj->op0) == pi->dreg) {
-                        long k2;
-                        if (try_parse_number(pj->op1, &k2) &&
-                            k1 == k2 &&
-                            reg_dead_cf(next_code(j), pi->dreg) &&
-                            flags_clear(next_code(j), F_ALL6)) {
-                            vlog("smartpp: line %ld: deleted '%s' / '%s' (R dead, flags dead, R==K) (P85)\n",
-                                i + 1, L(i), L(j));
-                            delete_keep_label_marked(i, pi,
-                                "mov+cmp same-const dead", 85);
-                            DEL(j) = 1;
-                            st[85]++;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-
-        /* P86 (v1.84): "mov R, K / test R, K" with R dead after and
-         *  the test's flags dead after: both instructions deleted.
-         *  Same idea as P85 but for "test R, K" -- test R==K always
-         *  sets ZF=1, and when nobody reads R and nobody reads the
-         *  flags the whole pair is dead code.  (Most "test R, K"
-         *  after "mov R, K" come from compilers materializing a
-         *  comparison of a freshly loaded constant; if the next
-         *  instruction is not a jcc/setcc/cmov the flags die.) */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_MOV &&
-            pi->dreg >= 0 && pi->srcimm) {
-            long k1;
-            if (try_parse_number(pi->op1, &k1)) {
-                j = next_code(i);
-                if (j >= 0 && !INDEF(j)) {
-                    struct pinfo *pj = &g_ppair;
-                    parse_line(j, pj);
-                    if (!pj->haslabel && !pj->toobig &&
-                        pj->cls == I_OTHER && pj->nops == 2 &&
-                        ci_eq(pj->mnem, "test") &&
-                        find_reg(pj->op0) == pi->dreg) {
-                        long k2;
-                        if (try_parse_number(pj->op1, &k2) &&
-                            k1 == k2 &&
-                            reg_dead_cf(next_code(j), pi->dreg) &&
-                            flags_clear(next_code(j), F_ALL6)) {
-                            vlog("smartpp: line %ld: deleted '%s' / '%s' (R dead, flags dead, R==K) (P86)\n",
-                                i + 1, L(i), L(j));
-                            delete_keep_label_marked(i, pi,
-                                "mov+test same-const dead", 86);
-                            DEL(j) = 1;
-                            st[86]++;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-
-        /* P87 (v1.84): "mov R, K / push R" with R dead after the push
-         *  -> single "push K".  This is the *direct* direction of P79
-         *  (which already handled "mov R,K / push R" via the linear
-         *  reg_dead_after).  P87 uses reg_dead_cf so it also fires
-         *  when a conditional jump separates the push from its kill.
-         *  Examples:
-         *      mov  eax, 5
-         *      push eax           ; eax dead afterwards (or killed on
-         *                         ; both arms of an upcoming jcc)
-         *      je   L1            ; <-- reg_dead_cf follows both arms
-         *   -> push 5
-         *  Research: this is exactly the case the user named ("mov+push
-         *  sin adivinar" -- without guessing).  Older P79 refused to
-         *  fire when anything except a clean linear kill stood between
-         *  the push and the next write. */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_MOV &&
-            pi->dreg >= 0 && pi->srcimm &&
-            g_regs[pi->dreg].fam != 4) {     /* not SP/ESP */
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                struct pinfo *pj = &g_ppair;
-                parse_line(j, pj);
-                if (!pj->haslabel && !pj->toobig && pj->cls == I_PUSH &&
-                    find_reg(pj->op0) == pi->dreg &&
-                    reg_dead_cf(next_code(j), pi->dreg)) {
-                    /* Build "push <imm>".  Intel and AT&T differ on
-                     *  immediate syntax; we already support both in
-                     *  P46. */
-                    if (g_att) sprintf(g_build, "%spush $%s",
-                                       pi->prefix, pi->op1);
-                    else       sprintf(g_build, "%spush %s",
-                                       pi->prefix, pi->op1);
-                    vlog("smartpp: line %ld: '%s' / '%s' rewritten to '%s' (P87)\n",
-                        i + 1, L(i), L(j), g_build);
-                    replace_line_marked(i, g_build,
-                        "mov+push dead -> push imm", 87);
-                    DEL(j) = 1;
-                    st[87]++;
-                    continue;
-                }
-            }
-        }
-
-        /* P88 (v1.84): "bswap R" -- 486+ only; on 386 it traps.
-         *  We do NOT rewrite bswap itself (the opcode is the same on
-         *  every CPU that supports it), but we add a SAFETY GATE that
-         *  downgrades the CPU level if bswap appears in a .386 file.
-         *  Actual rewrite handled here: the inverse idiom
-         *
-         *      rol  eax, 16
-         *      xchg al, ah        ; (or: xchg ax, dx; etc.)
-         *   -> bswap eax          ; (486+)
-         *
-         *  Only the canonical "rol eax,16 / xchg al,ah / rol eax,16"
-         *  3-instruction 386 byte-swap is folded into "bswap eax",
-         *  because that is the only form whose flags-and-state
-         *  semantics exactly match a single bswap.  Other swaps
-         *  (rol-by-8 with ax/dx) are left alone.  All three ops are
-         *  flag-neutral (rol by 16 leaves CF/OF defined per the
-         *  manual but the pair has no user-visible flag effect
-         *  because xchg and the second rol overwrite neither, and
-         *  the final rol's CF/OF are unused by the next user code
-         *  in the canonical idiom -- which the v1.83 review of P4
-         *  already proved is dead in the byte-swap idiom).
-         *  Intel-only. */
-        if (!g_att && g_curcpu >= 16 && !pi->haslabel && !pi->toobig &&
-            pi->cls == I_SHIFT && ci_eq(pi->mnem, "rol") &&
-            (r88 = find_reg(pi->op0)) >= 0 &&
-            (g_regs[r88].hi - g_regs[r88].lo) == 32 &&
-            pi->shiftcount == 16) {
-            /* Find the next two non-deleted instructions and check
-             *  they are xchg + rol-16 of the same family.  Shifts do
-             *  not set dreg/sreg in parse_line, so use find_reg. */
-            long k = next_code(i);
-            long k2;
-            int r_xchg_lo, r_xchg_hi, r_rol2;
-            struct pinfo *pm;
-            struct pinfo *pn2;
-            if (k < 0 || INDEF(k)) goto p88_done;
-            pm = &g_ppair;
-            parse_line(k, pm);
-            /* xchg al, ah: pm->dreg=al (fam AX, lo 0, hi 8),
-             *            pm->sreg=ah (fam AX, lo 8, hi 16). */
-            if (pm->haslabel || pm->toobig || pm->cls != I_XCHG) goto p88_done;
-            r_xchg_lo = pm->dreg;
-            r_xchg_hi = pm->sreg;
-            if (r_xchg_lo < 0 || r_xchg_hi < 0) goto p88_done;
-            if (g_regs[r_xchg_lo].fam != g_regs[r88].fam) goto p88_done;
-            if (g_regs[r_xchg_lo].lo != 0) goto p88_done;       /* al */
-            if (g_regs[r_xchg_hi].fam != g_regs[r88].fam) goto p88_done;
-            if (g_regs[r_xchg_hi].lo != 8) goto p88_done;       /* ah */
-            if (g_regs[r_xchg_hi].hi != 16) goto p88_done;
-            k2 = next_code(k);
-            if (k2 < 0 || INDEF(k2)) goto p88_done;
-            pn2 = &g_plook;
-            parse_line(k2, pn2);
-            if (pn2->haslabel || pn2->toobig || pn2->cls != I_SHIFT) goto p88_done;
-            if (!ci_eq(pn2->mnem, "rol")) goto p88_done;
-            r_rol2 = find_reg(pn2->op0);
-            if (r_rol2 != r88) goto p88_done;
-            if (pn2->shiftcount != 16) goto p88_done;
-            /* All three instructions match.  bswap eax is one byte
-             *  shorter (3 vs 6 bytes total) and faster on every CPU
-             *  that supports it; on the 486 bswap is 1 cycle, the
-             *  3-insn sequence is 9 cycles. */
-            sprintf(g_build, "%sbswap %s", pi->prefix, pi->op0);
-            vlog("smartpp: line %ld: 'rol %s, 16' / 'xchg' / 'rol %s, 16' rewritten to '%s' (P88)\n",
-                i + 1, pi->op0, pi->op0, g_build);
-            replace_line_marked(i, g_build,
-                "rol16/xchg/rol16 -> bswap (486+)", 88);
-            DEL(k) = 1;
-            DEL(k2) = 1;
-            st[88]++;
-            continue;
-        p88_done: ;
-        }
-
-        /* P89 (v1.84): "mov R, 0 / setcc R8" with R dead after ->
-         *  "setcc R8" alone (the mov is dead because setcc only
-         *  writes the low byte and we proved R's high bits are
-         *  dead).  On 386+ setcc is a single byte opcode that
-         *  writes a 0/1 to its operand's low byte and leaves the
-         *  rest untouched; the canonical pattern is to zero the
-         *  whole register first so setcc gives a clean 0/1 value.
-         *  If the upper bits of R are dead after the setcc (proven
-         *  by reg_dead_cf on the FULL register), the mov is dead
-         *  too.  Conservative: requires 386+ (setcc is 386+),
-         *  register destination (no memory setcc), and the register
-         *  must be the same family between mov and setcc.
-         *  Research: GCC i386.md "zero_extendqisi2_qi" combined with
-         *  setcc; FPC OptPass2MOVZX. */
-        if (g_curcpu >= 8 && !pi->haslabel && !pi->toobig &&
-            pi->cls == I_MOV && pi->srcimm) {
-            long v;
-            if (try_parse_number(pi->op1, &v) && v == 0 &&
-                pi->dreg >= 0) {
-                j = next_code(i);
-                if (j >= 0 && !INDEF(j)) {
-                    struct pinfo *pj = &g_ppair;
-                    parse_line(j, pj);
-                    if (!pj->haslabel && !pj->toobig &&
-                        pj->cls == I_OTHER && pj->nops == 1 &&
-                        ci_eq_n(pj->mnem, "set", 3) &&
-                        strlen(pj->mnem) == 5 &&
-                        find_reg(pj->op0) == pi->dreg &&
-                        (g_regs[pi->dreg].hi - g_regs[pi->dreg].lo) >= 16 &&
-                        reg_dead_cf(next_code(j), pi->dreg) &&
-                        flags_clear(next_code(j), F_ALL6)) {
-                        /* The setcc reads flags (so we need flags
-                         *  alive here -- which they are, since the
-                         *  mov set none).  Just delete the mov. */
-                        vlog("smartpp: line %ld: deleted '%s' before setcc (R high bits dead) (P89)\n",
-                            i + 1, L(i));
-                        delete_keep_label_marked(i, pi,
-                            "mov0 before setcc dead", 89);
-                        st[89]++;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        /* P90 (v1.84): "and R, K / jcc target" where K is a single-bit
-         *  mask (power of two) and jcc tests ZF (je/jne/jz/jnz) ->
-         *  "test R, K / jcc target".  AND sets ZF (and SF, PF) and
-         *  clears CF/OF (and undefines AF), exactly as test does --
-         *  except AND MODIFIES R while test does not.  When R is
-         *  dead after the jcc, AND is wasteful: it writes R=K&R_old,
-         *  but only ZF is observed.  test is a strict improvement:
-         *  - same size (3 bytes for imm8 mask, 4 for imm16, 6 for
-         *    imm32 -- identical encoding);
-         *  - test is non-destructive (R preserved);
-         *  - on the Pentium and later, test is a single uop on
-         *    either pipe; and is also single-uop but on the V pipe
-         *    only when the operand is a register AND the immediate
-         *    fits imm8 -- so test is the safer pair.
-         *  We require R dead so the and's write to R is not
-         *  observable, AND we require only ZF read (the jcc reads
-         *  ZF).  Intel+AT&T both supported. */
+        /* P426 (v2.25): "cmp R, 1 / jl L" -> "test R, R / jle L"
+         *  R < 1 (signed) ⟺ R <= 0 (signed).  cmp R,1 sets flags for
+         *  R-1; jl checks SF≠OF (R<1).  test R,R sets flags for R;
+         *  jle checks ZF=1 or SF≠OF (R<=0).  Since R<1 ⟺ R<=0,
+         *  the transformation is exact.  FPC Cmp1Jl2Cmp0Jle.
+         *  Also: "cmp R, -1 / jg L" -> "test R, R / jge L"
+         *  R > -1 ⟺ R >= 0.  FPC CmpNeg1Jg2Cmp0Jge. */
         if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
-            pi->nops == 2 && ci_eq(pi->mnem, "and") &&
-            (r90 = find_reg(pi->op0)) >= 0) {
-            long v90;
-            /* srcimm is only set for mov/push by parse_line; check
-             *  the immediate locally. */
-            if (try_parse_number(pi->op1, &v90) && v90 != 0 &&
-                (v90 & (v90 - 1)) == 0) {       /* power of two */
+            pi->nops == 2 && ci_eq(pi->mnem, "cmp") &&
+            find_reg(pi->op0) >= 0) {
+            long v426;
+            if (try_parse_number(pi->op1, &v426)) {
                 j = next_code(i);
                 if (j >= 0 && !INDEF(j)) {
                     struct pinfo *pj = &g_ppair;
                     parse_line(j, pj);
                     if (!pj->haslabel && !pj->toobig &&
-                        pj->cls == I_JCC &&
-                        (jcc_read_set(pj->mnem) == F_ZF) &&
-                        reg_dead_cf(next_code(j), r90) &&
-                        flags_clear(next_code(j), F_ALL6 & ~F_ZF)) {
-                        /* jcc only reads ZF; and provides ZF, SF, PF
-                         *  and clears CF, OF.  Test does the same ZF,
-                         *  SF, PF and clears CF, OF.  AF undefined in
-                         *  both.  So the only flag difference is none
-                         *  -- but to be safe we still require the
-                         *  flags other than ZF to be dead (covers
-                         *  theoretical observers of SF from the
-                         *  'and'). */
-                        if (g_att)
-                            sprintf(g_build, "%stest %s, %s",
-                                    pi->prefix, pi->op1, pi->op0);
-                        else
-                            sprintf(g_build, "%stest %s, %s",
-                                    pi->prefix, pi->op0, pi->op1);
-                        vlog("smartpp: line %ld: 'and %s, %s' rewritten to '%s' before jcc (P90)\n",
-                            i + 1, pi->op0, pi->op1,
-                            g_build + strlen(pi->prefix));
-                        replace_line_marked(i, g_build,
-                            "and K / jcc -> test K / jcc (R dead)", 90);
-                        st[90]++;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        /* P91 (v1.84): WITHDRAWN in code review.  The original idea
-         *  was "add R, S -> lea R, [R + S]" because on the Pentium Pro
-         *  LEA dispatches to the AGU and frees the ALU pipe.  That is
-         *  true, but it directly undoes P41 ("lea R,[R+S] -> add R,S")
-         *  which is the size- and flag-positive direction: lea is 3
-         *  bytes, add is 2.  P91 would convert a 2-byte add into a
-         *  3-byte lea purely for a pairing win we cannot actually
-         *  schedule from a peephole.  GCC/FPC do this only inside their
-         *  scheduling passes, where they also know the surrounding
-         *  instruction stream.  The slot is left here as a deliberate
-         *  no-op so the rule numbering stays stable and the reasoning
-         *  is visible in the source.  Use P46/P47 (add+add->lea) and
-         *  P41 (lea->add) for the legal LEA direction. */
-        /* P92 (v1.84): "sub R, 1" before "jcc" -> "dec R" when the
-         *  jcc tests ZF/SF only (je/jne/jz/jnz/js/jns/jl/jge/jle/jg
-         *  -- all of these read either ZF or SF or both, never CF).
-         *  dec preserves CF (the 8086 decrement does not touch carry);
-         *  sub sets it.  When the only flag consumer after the sub
-         *  is a Jcc that does not read CF, dec is strictly smaller (1
-         *  byte shorter for an imm8 of 1 on the 16/32-bit form, same
-         *  size on the 8-bit form but still preserves CF which the
-         *  next instruction may want -- the canonical reason
-         *  compilers emit dec in place of sub R,1).
-         *
-         *  We require:
-         *    - sub R, 1 with R a register (NOT 1-byte; for an 8-bit
-         *      register "dec" is also single-byte, same as "sub R,1",
-         *      so the win is zero -- but the CF-preservation property
-         *      still matters if a later instruction reads CF; we let
-         *      it fire there too, conservative on the flags scan
-         *      "needs CF dead after the sub" is dropped in favor of
-         *      "the only flag reader is the jcc, and it does not
-         *      read CF");
-         *    - the next instruction is a Jcc that does not read CF
-         *      (jcc_read_set & F_CF == 0);
-         *    - the only flag reader before any other flag-setter is
-         *      that jcc (flags_clear with F_CF removed from the
-         *      "needed-dead" set, because dec preserves CF while sub
-         *      sets it -- the rewrite leaves CF unchanged, which is
-         *      fine if CF is dead before the sub and alive later,
-         *      OR if CF is alive before the sub and unchanged by it,
-         *      OR -- the only unsafe case -- CF is alive before the
-         *      sub and read after; in that case sub modifies it and
-         *      we'd be CHANGING behavior, so we still require the
-         *      usual "CF dead" of P10's variant).
-         *
-         *  To stay simple and safe: require the same flags_clear
-         *  as P10 (all six dead) PLUS the next instruction is the
-         *  Jcc that consumes the result.  This makes the rewrite
-         *  drop in for P10's existing case but with the dec form
-         *  chosen when CF would otherwise be observed (and we have
-         *  proven CF dead anyway, so the choice is size, not
-         *  semantics). */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
-            pi->nops == 2 && ci_eq(pi->mnem, "sub") &&
-            (r92 = find_reg(pi->op0)) >= 0) {
-            long v92;
-            /* srcimm is set only for mov/push; check locally. */
-            if (try_parse_number(pi->op1, &v92) && v92 == 1) {
-                j = next_code(i);
-                if (j >= 0 && !INDEF(j)) {
-                    struct pinfo *pj = &g_ppair;
-                    parse_line(j, pj);
-                    if (!pj->haslabel && !pj->toobig &&
-                        pj->cls == I_JCC &&
-                        (jcc_read_set(pj->mnem) & F_CF) == 0 &&
-                        flags_clear(next_code(i), F_CF)) {
-                        if (g_att)
-                            sprintf(g_build, "%sdec %s", pi->prefix,
-                                    pi->op0);
-                        else
-                            sprintf(g_build, "%sdec %s", pi->prefix,
-                                    pi->op0);
-                        vlog("smartpp: line %ld: 'sub %s, 1' rewritten to 'dec %s' before jcc (P92)\n",
-                            i + 1, pi->op0, pi->op0);
-                        replace_line_marked(i, g_build,
-                            "sub R,1 -> dec R (CF safe)", 92);
-                        st[92]++;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        /* P93 (v1.84): "or R, -1" / "and R, 0" already covered by
-         *  P60/P59, but the PENTIUM PRO pairable form
-         *      mov  R, 0          (5 bytes; 1 cycle on PPro, single uop)
-         *      xor  R, R          (2 bytes; 1 cycle; pairs on both pipes)
-         *  has a NEW sibling that PPro compilers prefer:
-         *      xor  R, R           (single byte: 31 C0)
-         *      mov  R, 0           (5 bytes)
-         *  is the EXACT complement of P9 (mov R,0 -> xor R,R): P9
-         *  fires when the xor form is fine (flags dead).  Here we add
-         *  the reverse: when the user wrote "xor R,R / mov R,0"
-         *  (e.g. after a macro expansion), the xor is dead (R is then
-         *  overwritten by the mov).  Delete the xor when the mov
-         *  follows and writes the same R.  Conservative: xor R,R
-         *  defines all six flags; the mov defines none, so the
-         *  rewrite's flag difference is "all six flags no longer set
-         *  by the xor" -- and the flags ARE set, just to fixed values
-         *  (CF=0, OF=0, SF=0, ZF=1, PF=1, AF=undef).  The mov leaves
-         *  every flag untouched.  So if any of those six flags is
-         *  read between the xor and the mov, we cannot delete.  There
-         *  is no instruction between them, so the scan is trivial.
-         *  Research: FPC OptPass2 "remove dead xor before mov". */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_XORRR) {
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                struct pinfo *pj = &g_ppair;
-                parse_line(j, pj);
-                if (!pj->haslabel && !pj->toobig && pj->cls == I_MOV &&
-                    pj->dreg == pi->dreg && pj->srcimm) {
-                    long v;
-                    if (try_parse_number(pj->op1, &v)) {
-                        /* Delete the xor regardless of v's value (the
-                         *  mov overwrites R, and the flags of the xor
-                         *  die in the gap between the two
-                         *  instructions, which is zero instructions).
-                         *  The trivial scan is: nothing between xor
-                         *  and mov can read the flags.  Since the mov
-                         *  is the very next instruction, this is
-                         *  always true. */
-                        (void)v;
-                        vlog("smartpp: line %ld: deleted '%s' before mov to same R (P93)\n",
-                            i + 1, L(i));
-                        delete_keep_label_marked(i, pi,
-                            "xor R,R dead before mov R,K", 93);
-                        st[93]++;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        /* P94 (v1.84): "mov R, 0 / {or|xor|add} R, K" -> "mov R, K".
-         *  Symmetric of P93: the mov is dead because the second op
-         *  overwrites R, AND the second op's result is R = 0 OP K =
-         *  K (for or/xor/add).  The second op defines all six flags;
-         *  the mov defines none; so we delete the mov only if the
-         *  flags die between (which they don't -- there are no
-         *  intervening instructions).  However, the second op READS
-         *  R, so we cannot delete the mov unless we change the second
-         *  op to NOT read R.  That is exactly what the rewrite does:
-         *  replace the second op with "mov R, K" -- K is the constant
-         *  result, no read of R.  Net effect: delete the first mov,
-         *  rewrite the second op to "mov R, K".  Two instructions
-         *  become one.  Conservative: requires the second op's
-         *  constant K to be encodable as an immediate of R's width
-         *  (use width_imm_limit, as P43 does), and the second op to
-         *  be a 2-operand arith with an immediate.
-         *  Research: GCC combine pass "mov 0/add K -> mov K";
-         *  FPC OptPass2MovAdd2Mov. */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_MOV &&
-            pi->srcimm && pi->dreg >= 0) {
-            long v0;
-            if (try_parse_number(pi->op1, &v0) && v0 == 0) {
-                j = next_code(i);
-                if (j >= 0 && !INDEF(j)) {
-                    struct pinfo *pj = &g_ppair;
-                    parse_line(j, pj);
-                    if (!pj->haslabel && !pj->toobig &&
-                        pj->cls == I_OTHER && pj->nops == 2 &&
-                        find_reg(pj->op0) == pi->dreg &&
-                        (ci_eq(pj->mnem, "or") ||
-                         ci_eq(pj->mnem, "xor") ||
-                         ci_eq(pj->mnem, "add"))) {
-                        long k;
-                        if (try_parse_number(pj->op1, &k)) {
-                            int w = g_regs[pi->dreg].hi -
-                                    g_regs[pi->dreg].lo;
-                            long lim = width_imm_limit(w);
-                            /* 0 | k = 0 ^ k = 0 + k = k */
-                            if (k >= -(lim + 1) && k <= lim) {
-                                sprintf(g_build, "%smov %s, %s",
-                                        pj->prefix, pj->op0, pj->op1);
-                                vlog("smartpp: line %ld: '%s' / '%s' folded to '%s' (P94)\n",
-                                    i + 1, L(i), L(j), g_build +
-                                    strlen(pj->prefix));
-                                delete_keep_label_marked(i, pi,
-                                    "mov 0 / or|xor|add K -> mov K", 94);
-                                replace_line_marked(j, g_build,
-                                    "OP R,K -> mov R,K (after mov 0)", 94);
-                                st[94]++;
-                                continue;
+                        pj->cls == I_JCC && pj->jtarget_ok) {
+                        const char *new_jcc = NULL;
+                        /* cmp R,1 / jl -> test R,R / jle */
+                        if (v426 == 1 &&
+                            (ci_eq(pj->mnem, "jl") || ci_eq(pj->mnem, "jnge")))
+                            new_jcc = "jle";
+                        /* cmp R,-1 / jg -> test R,R / jge */
+                        else if (v426 == -1 &&
+                                 (ci_eq(pj->mnem, "jg") || ci_eq(pj->mnem, "jnle")))
+                            new_jcc = "jge";
+                        if (new_jcc != NULL) {
+                            char testbuf[MAXLINE];
+                            char jccbuf[MAXLINE];
+                            /* rewrite cmp R,imm -> test R,R */
+                            strcpy(testbuf, pi->prefix);
+                            strcat(testbuf, "test ");
+                            strcat(testbuf, pi->op0);
+                            strcat(testbuf, ", ");
+                            strcat(testbuf, pi->op0);
+                            if (pi->comment[0] != 0) {
+                                strcat(testbuf, " ");
+                                strcat(testbuf, pi->comment);
                             }
+                            /* rewrite jcc */
+                            strcpy(jccbuf, pj->prefix);
+                            strcat(jccbuf, new_jcc);
+                            strcat(jccbuf, " ");
+                            strcat(jccbuf, pj->op0);
+                            if (pj->comment[0] != 0) {
+                                strcat(jccbuf, " ");
+                                strcat(jccbuf, pj->comment);
+                            }
+                            vlog("smartpp: line %ld: 'cmp %s,%ld'/'%s' -> 'test %s,%s'/'%s' (P426)\n",
+                                i + 1, pi->op0, v426, pj->mnem,
+                                pi->op0, pi->op0, new_jcc);
+                            replace_line(i, testbuf);
+                            replace_line(j, jccbuf);
+                            st[426]++;
+                            continue;
                         }
                     }
                 }
             }
         }
 
-        /* P95 (v1.84): "test R, R / je L" or "test R, R / jne L" with
-         *  R dead after the test AND the test's flags dead after the
-         *  jcc -> both deleted.  When R is dead and nobody reads the
-         *  test's ZF (the jcc read it, but the jcc is the only
-         *  reader), the pair computes nothing observable.  Conservative:
-         *  requires R dead after the jcc and flags_clear proves the
-         *  flags die at the jcc (the jcc is the only consumer of ZF,
-         *  and SF/PF/CF/OF/AF must die before any reader -- which
-         *  flags_clear checks because the jcc only reads ZF, so the
-         *  scan continues until all six are killed).  WAIT: this is
-         *  a NO-OP fold (deleting a test-and-branch that decides
-         *  nothing), which is only safe if the branch goes to dead
-         *  code.  In general test+jcc is a real branch decision; we
-         *  cannot delete it just because R is dead.  SKIP THIS RULE.
-         *  The above paragraph documents why a tempting fold is
-         *  UNSOUND; the rule is intentionally a no-op to make the
-         *  reasoning visible in code review. */
-
-        /* P96 (v1.84): "neg R / sbb R, R / sub R, R" or the canonical
-         *  "neg R / sbb R, R" (computes R = -1 if R was nonzero, 0
-         *  otherwise) -- the 386 "booleanize" idiom.  We do NOT fold
-         *  this 2-instruction idiom (the result depends on CF, which
-         *  is set by neg, and the rewrite would need a "setcc" or
-         *  "cmovz" replacement -- both 386+ and both already shorter
-         *  than the neg+sbb pair, so the user should not have
-         *  written neg+sbb on a 386+; we leave it for the existing
-         *  P9/P10/P11 rules to clean up if applicable). */
-
-        /* P97 (v1.84): "mov R, K / test R, R" with R dead after test,
-         *  flags dead after test -> "test R, R" deleted entirely (R
-         *  is dead, test's flags are dead, the whole pair computes
-         *  nothing observable).  Equivalent to P86 with K=K (always
-         *  true).  Actually P86 already covers this exact pattern
-         *  when K1 == K2; here the test's source is the same
-         *  register (R, R) rather than (R, K), so K1 == K2 cannot be
-         *  asked.  This is the more general pattern: any "test R, R"
-         *  after "mov R, K" with R and flags dead.  Conservative
-         *  superset of P86. */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_MOV &&
-            pi->srcimm && pi->dreg >= 0) {
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                struct pinfo *pj = &g_ppair;
-                parse_line(j, pj);
-                if (!pj->haslabel && !pj->toobig &&
-                    pj->cls == I_OTHER && pj->nops == 2 &&
-                    ci_eq(pj->mnem, "test") &&
-                    find_reg(pj->op0) == pi->dreg &&
-                    find_reg(pj->op1) == pi->dreg &&
-                    reg_dead_cf(next_code(j), pi->dreg) &&
-                    flags_clear(next_code(j), F_ALL6)) {
-                    vlog("smartpp: line %ld: deleted '%s' / '%s' (R and flags dead) (P97)\n",
-                        i + 1, L(i), L(j));
-                    delete_keep_label_marked(i, pi,
-                        "mov+test R,R dead", 97);
-                    DEL(j) = 1;
-                    st[97]++;
-                    continue;
-                }
-            }
-        }
-
-        /* P98 (v1.84): "shr R, K / mov R, 0" (or any 0-store after a
-         *  shift that destroys R's high bits) -- if R is dead after
-         *  the shift, the shift's flags die before any read, AND the
-         *  mov writes 0 to R anyway, then the shift was dead.  This
-         *  is a special case of P2 (dead store) but the existing P2
-         *  only fires when the SECOND instruction is the dead store;
-         *  here the FIRST is the dead store (its result is
-         *  immediately overwritten).  Equivalent of P93 for shifts.
-         *  The shift sets F_ALL6 (shl/shr/sal/sar), the mov sets
-         *  none; we require flags dead between (zero instructions
-         *  between, trivially true). */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_SHIFT &&
-            (r98 = find_reg(pi->op0)) >= 0 &&
-            (ci_eq(pi->mnem, "shl") || ci_eq(pi->mnem, "shr") ||
-             ci_eq(pi->mnem, "sal") || ci_eq(pi->mnem, "sar"))) {
-            j = next_code(i);
-            if (j >= 0 && !INDEF(j)) {
-                struct pinfo *pj = &g_ppair;
-                parse_line(j, pj);
-                if (!pj->haslabel && !pj->toobig && pj->cls == I_MOV &&
-                    pj->dreg == r98 && pj->srcimm) {
-                    long v;
-                    if (try_parse_number(pj->op1, &v) && v == 0) {
-                        vlog("smartpp: line %ld: deleted shift '%s' before 'mov %s, 0' (P98)\n",
-                            i + 1, L(i), pj->op0);
-                        delete_keep_label_marked(i, pi,
-                            "shift dead before mov R,0", 98);
-                        st[98]++;
+        /* P427 (v2.25): "dec cx / jnz L" -> "loop L" (8086 only, -Oz).
+         *  loop decrements CX and jumps if CX!=0; dec cx/jnz does the
+         *  same.  But loop doesn't touch flags while dec sets them,
+         *  so flags must be dead.  CX must be dead after (loop
+         *  overwrites CX).  -Oz only: loop is 2 bytes (shorter than
+         *  dec+jnz = 3-4 bytes) but slower on 386+ (11 vs 9 cycles).
+         *  GEMA note: autoalign moves addresses; this is safe. */
+        if (opt_zopt && !pi->haslabel && !pi->toobig &&
+            pi->cls == I_OTHER && pi->nops == 1 &&
+            ci_eq(pi->mnem, "dec")) {
+            int r427 = find_reg(pi->op0);
+            if (r427 >= 0 && g_regs[r427].fam == 1 &&
+                (g_regs[r427].hi - g_regs[r427].lo) == 16) {
+                /* dec cx */
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig &&
+                        pj->cls == I_JCC && pj->jtarget_ok &&
+                        (ci_eq(pj->mnem, "jnz") || ci_eq(pj->mnem, "jne")) &&
+                        flags_clear(next_code(j), F_ALL6) &&
+                        reg_dead_cf(next_code(j), r427)) {
+                        char loopbuf[MAXLINE];
+                        strcpy(loopbuf, pi->prefix);
+                        strcat(loopbuf, "loop ");
+                        strcat(loopbuf, pj->op0);
+                        if (pj->comment[0] != 0) {
+                            strcat(loopbuf, " ");
+                            strcat(loopbuf, pj->comment);
+                        }
+                        vlog("smartpp: line %ld: 'dec cx'/'jnz %s' -> 'loop %s' (P427, -Oz)\n",
+                            i + 1, pj->op0, pj->op0);
+                        replace_line(i, loopbuf);
+                        DEL(j) = 1;
+                        st[427]++;
                         continue;
                     }
                 }
             }
         }
 
-        /* P124/P125 (v1.86): "lea R, [R]" and "lea R, [R+0]" -> delete.
-         *  lea computes base+disp and writes it to R; if base==R and
-         *  disp==0, the result is R itself -- a pure identity, no flag
-         *  or memory effect (lea never touches flags or memory).  Safe
-         *  on every CPU (lea exists on the 8086).  Cycles: 1 on 386/486;
-         *  1 on P5 (frees a pipe slot); 2 on P6 (LEA goes through AGU).
-         *  NOTE: P17 (lea conv) has its own identity-deletion path and
-         *  fires FIRST on this input -- this block is a documentation/
-         *  safety net that catches any form P17 might miss.  In
-         *  practice P17's counter increments, not P124's.
-         *  Research: Agner Fog "Optimizing assembly" (lea R,[R] is a
-         *  NOP); GCC never emits it; LLVM folds it; Intel SDM LEA. */
-        if (!pi->haslabel && !pi->toobig && pi->cls == I_LEA &&
-            pi->nops == 2 && pi->dreg >= 0) {
-            int mr; long md;
-            if (lea_bracket(pi->op1, &mr, &md)) {
-                if (mr >= 0 && md == 0 &&
-                    g_regs[mr].fam == g_regs[pi->dreg].fam &&
-                    (g_regs[mr].hi - g_regs[mr].lo) ==
-                     (g_regs[pi->dreg].hi - g_regs[pi->dreg].lo)) {
-                    vlog("smartpp: line %ld: deleted 'lea %s, %s' (P124: identity lea)\n",
-                        i + 1, pi->op0, pi->op1);
-                    delete_keep_label_marked(i, pi,
-                        "lea R,[R] / lea R,[R+0] -> delete", 124);
-                    st[124]++;
-                    continue;
-                }
-            }
-        }
-
-        /* v1.85 TABLE-DRIVEN FALLBACK: if no bespoke C rule fired on
-         *  this line, consult the declarative rule table.  The table
-         *  can express single-instruction and two-instruction patterns
-         *  with a small set of preconditions (flag liveness, register
-         *  liveness, CPU level, segment size, syntax, next-is-jcc).
-         *  Each rule's actions are applied atomically. */
         if (try_table_rules(i)) continue;
+
 
     }
     {
@@ -8563,10 +12678,471 @@ static long run_pass(void)
 
 /* ---- driver ----------------------------------------------------------------*/
 
+
+/* v2.25 (S7): unified sparse rule-name map.  Replaces the
+ *  dense rname[0..216] array and the separate g_rname_ext[]
+ *  sparse extension table that rule_name() used to consult in
+ *  sequence.  Every named rule lives here now; rule_name() is
+ *  a single linear lookup followed by the g_rule_tbl[].desc
+ *  fallback for declarative-table rules.  Placeholders
+ *  ("(withdrawn)", "(removed...)", "(covered by...)",
+ *  "(handled by...)", "(reserved)") were dropped: rule_name
+ *  returns "(unnamed)" for them, which print_version's
+ *  filter already skips.  Catalogue output is unchanged. */
+static const struct rname_ext_s {
+    int no;
+    const char *name;
+} g_rname_map[] = {
+    {   1, "delete mov/xchg R,R" },
+    {   2, "dead register store" },
+    {   3, "push/pop pair" },
+    {   4, "merge shifts" },
+    {   5, "thread jmp/jcc" },
+    {   6, "redundant jump" },
+    {   7, "invert jcc" },
+    {   8, "or/and->test (ext)" },
+    {   9, "mov0->xor" },
+    {  10, "add/sub 1->inc/dec" },
+    {  11, "cmp0->test" },
+    {  12, "dup jumps" },
+    {  13, "unreachable" },
+    {  14, "double xchg" },
+    {  15, "mov R,S/mov S,R" },
+    {  16, "const fold" },
+    {  17, "lea conv" },
+    {  18, "add/sub R,0" },
+    {  19, "dup cmp/test/or/and" },
+    {  20, "shift R,0" },
+    {  21, "dup flag op" },
+    {  22, "inc/dec pair" },
+    {  23, "not pair" },
+    {  24, "neg pair" },
+    {  25, "cmc pair" },
+    {  26, "dead xor0" },
+    {  27, "add/sub pair" },
+    {  28, "dup sign-extend" },
+    {  29, "zero-ext movzx" },
+    {  30, "zero-ext imm" },
+    {  31, "movsx" },
+    {  32, "push/pop->mov" },
+    {  33, "shift pair" },
+    {  34, "and-mask" },
+    {  35, "mov-1->or" },
+    {  36, "leave" },
+    {  37, "xor R,-1->not" },
+    {  38, "imul 2^k->shl" },
+    {  39, "add/sub pair (const)" },
+    {  40, "mov+add->mov" },
+    {  41, "lea R,[R+S]->add" },
+    {  42, "push bp/mov bp,sp/sub sp,N->enter" },
+    {  43, "xor+arith->mov" },
+    {  44, "xor/inc->mov1" },
+    {  45, "xor/dec->mov-1" },
+    {  46, "push imm/pop->mov" },
+    {  47, "mov+add->lea" },
+    {  48, "xor+test->delete test" },
+    {  49, "sp add/sub pair" },
+    {  51, "imul -1->neg" },
+    {  52, "mov+shl fold" },
+    {  53, "mov+and fold" },
+    {  54, "mov+or fold" },
+    {  55, "mov+xor fold" },
+    {  56, "mixed add/sub fold" },
+    {  58, "xor/xor pair" },
+    {  59, "and R,0->mov R,0" },
+    {  60, "or R16,-1->mov R16,-1" },
+    {  61, "and+and->and" },
+    {  62, "and/or mask tighten" },
+    {  63, "lea R,[R*K]->shl" },
+    {  65, "dec/cmp -1->dec" },
+    {  68, "xchg dead->mov" },
+    {  70, "lea+lea fusion" },
+    {  71, "sub R,R->xor R,R" },
+    {  72, "mov+shr fold" },
+    {  73, "mov+sar fold" },
+    {  74, "mov+rol fold" },
+    {  75, "mov+ror fold" },
+    {  76, "xor+reg->mov" },
+    {  77, "dup mov/lea/movzx" },
+    {  78, "lea+lea same-dst" },
+    {  79, "mov+push->push imm" },
+    {  80, "push+write+pop->nothing" },
+    {  81, "mov+movzx->movzx" },
+    {  82, "lea r16,var->mov OFFSET" },
+    {  85, "mov+cmp same-const dead" },
+    {  86, "mov+test same-const dead" },
+    {  87, "mov+push->push imm (CF)" },
+    {  88, "xchg8/rol16/xchg8->bswap" },
+    {  89, "mov0 before setcc dead" },
+    {  90, "and K / jcc->test K" },
+    {  92, "sub R,1->dec R (jcc)" },
+    {  93, "xor dead before mov" },
+    {  94, "mov 0 / OP K -> mov K" },
+    {  97, "mov+test R,R dead" },
+    {  98, "shift dead before mov 0" },
+    { 111, "or R,0->del" },
+    { 112, "and R,-1->del" },
+    { 115, "xor R,0->del" },
+    { 119, "test R,K->del" },
+    { 120, "cmp R,K->del" },
+    { 123, "imul R,0->xor R,R (flags dead)" },
+    { 124, "lea R,[R]/[R+0]->del" },
+    { 127, "bswap/bswap->del one" },
+    { 128, "xor R,R/push R->push 0" },
+    { 129, "fld st/fstp st->del" },
+    { 130, "fldz/fstp st->del" },
+    { 131, "fchs/fchs->del" },
+    { 132, "fabs/fabs->fabs" },
+    { 134, "ffree/ffree->ffree" },
+    { 135, "fninit/fninit->fninit" },
+    { 136, "fwait/fwait->fwait" },
+    { 137, "fxch st,st->del" },
+    { 141, "not/inc->neg" },
+    { 142, "neg/dec->not" },
+    { 143, "add R,R->shl R,1" },
+    { 144, "mov/not->mov ~imm" },
+    { 145, "mov/neg->mov -imm" },
+    { 146, "shift R,0->del" },
+    { 147, "or/and R,R->del" },
+    { 148, "test R,R->del" },
+    { 149, "imul 2^k->shl ($Klog2)" },
+    { 150, "test R,R / test R,R" },
+    { 151, "cmp R,R->del" },
+    { 152, "push S/mov R,S/pop S" },
+    { 153, "dup mov R,S" },
+    { 154, "and R,R->del" },
+    { 155, "shl 1/1->shl 2" },
+    { 156, "shr 1/1->shr 2" },
+    { 157, "xor0 / or R,R->del or" },
+    { 158, "add R,R/add R,R->shl 2" },
+    { 159, "dup or R,K" },
+    { 160, "dup and R,K" },
+    { 161, "stc/sbb R,R->or -1" },
+    { 162, "clc/adc R,0->del" },
+    { 163, "mov/and same->del and" },
+    { 164, "sal R,1->add R,R" },
+    { 165, "imul 3->lea [R+R*2]" },
+    { 166, "imul 5->lea [R+R*4]" },
+    { 167, "imul 9->lea [R+R*8]" },
+    { 168, "mov R,S/mov S,R->del 2nd" },
+    { 169, "xor R,S twice->del" },
+    { 170, "imul 4->shl 2" },
+    { 171, "imul 8->shl 3" },
+    { 172, "add R,R x3->shl 3" },
+    { 173, "imul 2->shl 1" },
+    { 174, "imul 16->shl 4" },
+    { 175, "imul 32->shl 5" },
+    { 176, "imul 64->shl 6" },
+    { 177, "imul 128->shl 7" },
+    { 178, "imul 256->shl 8" },
+    { 180, "mov MEM/push->push MEM" },
+    { 181, "push/pop same->del" },
+    { 182, "pop/push same->del" },
+    { 183, "call/nop->del nop" },
+    { 184, "jmp/nop->del nop" },
+    { 185, "ret/nop->del nop" },
+    { 186, "mov0/push->push 0" },
+    { 187, "sub0/push->push 0" },
+    { 188, "mov R,S/push R->push S" },
+    { 189, "nop/nop->del 2nd" },
+    { 190, "and/test R,R->del test" },
+    { 191, "or/test R,R->del test" },
+    { 192, "stack-swap->xchg" },
+    { 193, "mov imm/add->add imm" },
+    { 194, "mov imm/sub->sub imm" },
+    { 195, "mov imm/and->and imm" },
+    { 196, "mov imm/or->or imm" },
+    { 197, "mov imm/xor->xor imm" },
+    { 198, "mov imm/cmp->cmp imm" },
+    { 199, "mov/add->lea [S+imm]" },
+    { 200, "stack-load fold into ALU" },
+    { 201, "lea/load fold into mem" },
+    { 202, "xor/test R,R->del test" },
+    { 203, "fchs/fabs->fabs" },
+    { 204, "fwait/fwait" },
+    { 205, "fnop/fnop" },
+    { 206, "fld1/fmulp->del" },
+    { 207, "fdecstp/fincstp" },
+    { 208, "fincstp/fdecstp" },
+    { 209, "finit/finit" },
+    { 210, "cdqe/cdqe" },
+    { 211, "cqo/cqo" },
+    { 212, "pushf/popf->del" },
+    { 213, "pushfd/popfd->del" },
+    { 214, "pushfq/popfq->del" },
+    { 215, "cld/cld" },
+    { 216, "std/std" },
+    { 217, "fabs/fchs/fabs->fabs" },
+    { 343, "xor r64 after xor r32 (x64)" },
+    { 344, "redundant const store (prop)" },
+    { 351, "clc/jnc->jmp" },
+    { 352, "stc/jc->jmp" },
+    { 353, "clc/jc->del" },
+    { 354, "stc/jnc->del" },
+    { 355, "xor0/jz->jmp" },
+    { 356, "xor0/jnz->del" },
+    { 360, "const-flags setcc->mov" },
+    { 361, "clc/setc->mov" },
+    { 362, "stc/setc->mov" },
+    { 365, "lea [S+S]->lea [S*2]" },
+    { 366, "cmov always->mov" },
+    { 367, "cmov never->del" },
+    { 370, "widen rep string (-Ox)" },
+    { 371, "not/add 1->neg" },
+    { 373, "rol/ror pair->del" },
+    { 377, "cmp R,R/jcc->jmp" },
+    { 378, "cmp R,R/jcc->del" },
+    { 380, "imul K->lea/shl (unified)" },
+    { 381, "LEA CSE->mov" },
+    { 382, "mov+lea->lea (R dead)" },
+    { 383, "call/ret->jmp tail-call" },
+    { 384, "movzx r64,r32->del (x64)" },
+    { 385, "const-ZF jcc/cmov/setcc" },
+    { 386, "const-prop ALU fold->mov" },
+    { 392, "or R8,0FFh->mov R8,0FFh" },
+    { 393, "or R16,0FFFFh->mov R16,0FFFFh" },
+    { 396, "load fold into ALU (stack mem)" },
+    { 397, "push [bp+N]/pop R->mov R,[bp+N]" },
+    { 398, "movq XMM,XMM->del" },
+    { 399, "movdqa XMM,XMM->del" },
+    { 400, "movdqu XMM,XMM->del" },
+    { 401, "por XMM,XMM->del" },
+    { 402, "pand XMM,XMM->del" },
+    { 403, "pandn XMM,XMM->pxor" },
+    { 404, "psubb XMM,XMM->pxor" },
+    { 405, "psubw XMM,XMM->pxor" },
+    { 406, "psubd XMM,XMM->pxor" },
+    { 407, "orpd XMM,XMM->del" },
+    { 408, "andpd XMM,XMM->del" },
+    { 409, "andnpd XMM,XMM->xorpd" },
+    { 410, "mov [mem],0/-1->and/or [mem]" },
+    { 411, "or R,80000000h->stc/rcl" },
+    { 412, "add+add->lea [R+S+imm]" },
+    { 413, "shl+add->lea [R+S*scale]" },
+    { 414, "sar eax,31->cdq+mov" },
+    { 415, "bts/btr/btc->or/and/xor mask" },
+    { 416, "setcc+movzx->xor+setcc" },
+    { 417, "RMW fold (mov/op/mov->op mem)" },
+    { 418, "leave/leave->leave" },
+    { 419, "xchg/xchg pair->del" },
+    { 420, "mov+xchg->del xchg" },
+    { 421, "nop->del (single, no label)" },
+    { 422, "sahf/sahf->sahf" },
+    { 424, "movzx R,R->del (same width)" },
+    { 425, "movsx R,R->del (same width)" },
+    { 426, "cmp R,1/jl->test R,R/jle" },
+    { 427, "dec cx/jnz->loop (-Oz)" },
+    { 428, "lea R,[R+R]->add R,R" },
+    { 429, "mov R,S/push R->push S" },
+    { 430, "or/and/or 3-op chain->del or1" },
+    { 431, "mov R8lo,0/mov R8hi,0->xor R16" },
+    { 432, "movzx+test R,R->test S,S" },
+    { 433, "add+add->add fold (M4)" },
+    { 434, "sub+sub->sub fold (M4)" },
+    { 435, "sub+add->sub fold (M4)" },
+    { 436, "add+sub->add fold (M4)" },
+    { 437, "or+or->or fold (M4)" },
+    { 438, "and+and->and fold (M4)" },
+    { 439, "xor+xor->xor fold (M4)" },
+    { 441, "test -1/setcc->setcc (M6)" },
+    { 443, "add 0/adc 0->del (M4)" },
+    { 0, NULL }
+};
+
+
+/* v2.25 (S7): rule_name() now consults the single g_rname_map[]
+ *  above plus the g_rule_tbl[].desc fallback.  The dense rname[]
+ *  array (216 positional slots, ~70% empty or placeholder) and the
+ *  separate g_rname_ext[] sparse table are gone -- every named rule
+ *  lives in g_rname_map[].  Placeholders ("(withdrawn)",
+ *  "(removed...)", "(covered by...)", "(handled by...)",
+ *  "(reserved)") were dropped: rule_name returns "(unnamed)" for
+ *  them, which print_version's filter already skips, so the
+ *  catalogue output is byte-identical. */
+static const char *rule_name(int k)
+{
+    const struct rname_ext_s *re;
+    if (k < 0) return "(unnamed)";
+    for (re = g_rname_map; re->name != NULL; re++)
+        if (re->no == k) return re->name;
+    /* declarative-table rules carry their own desc; consult it last
+     *  so a manually-curated entry in g_rname_map[] wins. */
+    {
+        size_t ti;
+        for (ti = 0; ti < sizeof(g_rule_tbl) / sizeof(g_rule_tbl[0]); ti++)
+            if (g_rule_tbl[ti].rule_no == k &&
+                g_rule_tbl[ti].desc != NULL && g_rule_tbl[ti].desc[0] != '\0')
+                return g_rule_tbl[ti].desc;
+    }
+    return "(unnamed)";
+}
+
+static void print_summary(long nout, long ndel)
+{
+    long total_fired = 0;
+    int k, nrules_fired = 0;
+    int use_color = color_enabled();
+
+    fprintf(stderr, "\n");
+    if (use_color) {
+        fprintf(stderr, "%s%s==========================================================%s\n",
+                C_BOLD, C_CYAN, C_RESET);
+        fprintf(stderr, "  %sSMARTPP %s%s  %s--  peephole summary%s\n",
+                C_BOLD C_CYAN, SMARTPP_VERSION, C_RESET, C_DIM, C_RESET);
+        fprintf(stderr, "  %sCopyright (c) %s%s\n", C_DIM, AUTHOR_STR, C_RESET);
+        fprintf(stderr, "%s%s==========================================================%s\n",
+                C_BOLD, C_CYAN, C_RESET);
+        fprintf(stderr, "  %sInput%s   : %s%ld%s lines\n",
+                C_BOLD, C_RESET, C_GREEN, g_nlines, C_RESET);
+        fprintf(stderr, "  %sOutput%s  : %s%ld%s lines\n",
+                C_BOLD, C_RESET, C_GREEN, nout, C_RESET);
+        fprintf(stderr, "  %sRemoved%s : %s%ld%s lines\n",
+                C_BOLD, C_RESET, ndel ? C_YELLOW : C_GREEN, ndel, C_RESET);
+        fprintf(stderr, "  %sPasses%s  : %s%d%s (max %d)\n",
+                C_BOLD, C_RESET, C_GREEN, g_passes_run, C_RESET, MAX_PASSES);
+        fprintf(stderr, "  %sCPU%s     : %s%s%s\n",
+                C_BOLD, C_RESET, C_BOLD C_GREEN, cpu_name(g_curcpu), C_RESET);
+        fprintf(stderr, "%s----------------------------------------------------------%s\n",
+                C_CYAN, C_RESET);
+        fprintf(stderr, "  %s%-6s  %-34s  %s%s\n",
+                C_BOLD, "Rule", "Optimization applied", "Hits", C_RESET);
+        fprintf(stderr, "  %-6s  %-34s  %s\n", "----",
+                "----------------------------------", "----");
+    } else {
+        fprintf(stderr, "==========================================================\n");
+        fprintf(stderr, "  SMARTPP %s  --  peephole summary\n", SMARTPP_VERSION);
+        fprintf(stderr, "  Copyright (c) %s\n", AUTHOR_STR);
+        fprintf(stderr, "==========================================================\n");
+        fprintf(stderr, "  Input   : %ld lines\n", g_nlines);
+        fprintf(stderr, "  Output  : %ld lines\n", nout);
+        fprintf(stderr, "  Removed : %ld lines\n", ndel);
+        fprintf(stderr, "  Passes  : %d (max %d)\n", g_passes_run, MAX_PASSES);
+        fprintf(stderr, "  CPU     : %s\n", cpu_name(g_curcpu));
+        fprintf(stderr, "----------------------------------------------------------\n");
+        fprintf(stderr, "  %-6s  %-34s  %s\n", "Rule", "Optimization applied", "Hits");
+        fprintf(stderr, "  %-6s  %-34s  %s\n", "----",
+                "----------------------------------", "----");
+    }
+
+    for (k = 1; k < STSZ; k++) {
+        const char *nm;
+        if (st[k] == 0) continue;
+        nm = rule_name(k);
+        fprintf(stderr, "  ");
+        if (use_color) fprintf(stderr, "%s", C_YELLOW);
+        fprintf(stderr, "P%-5d", k);
+        if (use_color) fprintf(stderr, "%s", C_RESET);
+        fprintf(stderr, "  %-34s  ", nm);
+        if (use_color) fprintf(stderr, "%s", C_GREEN);
+        fprintf(stderr, "%ld", st[k]);
+        if (use_color) fprintf(stderr, "%s", C_RESET);
+        fprintf(stderr, "\n");
+        total_fired += st[k];
+        nrules_fired++;
+    }
+
+    if (use_color) {
+        fprintf(stderr, "%s----------------------------------------------------------%s\n",
+                C_CYAN, C_RESET);
+        fprintf(stderr, "  %sTOTAL%s   %d rule%s, %s%ld%s rewrite%s\n",
+                C_BOLD, C_RESET,
+                nrules_fired, nrules_fired == 1 ? "" : "s",
+                C_BOLD C_GREEN, total_fired, C_RESET,
+                total_fired == 1 ? "" : "s");
+        if (nrules_fired == 0)
+            fprintf(stderr, "  %s(no rules fired; input already optimal)%s\n",
+                    C_DIM, C_RESET);
+        fprintf(stderr, "%s%s==========================================================%s\n",
+                C_BOLD, C_CYAN, C_RESET);
+    } else {
+        fprintf(stderr, "----------------------------------------------------------\n");
+        fprintf(stderr, "  TOTAL   %d rule%s, %ld rewrite%s\n",
+                nrules_fired, nrules_fired == 1 ? "" : "s",
+                total_fired, total_fired == 1 ? "" : "s");
+        if (nrules_fired == 0)
+            fprintf(stderr, "  (no rules fired; input already optimal)\n");
+        fprintf(stderr, "==========================================================\n");
+    }
+    fflush(stderr);
+}
+
+static void print_version(void)
+{
+    int ntable = 0;
+    int i;
+    const char *compiler = "unknown";
+    const char *platform =
+#if defined(_WIN32) || defined(_WIN64)
+        "Windows"
+#elif defined(__linux__)
+        "Linux"
+#elif defined(__APPLE__)
+        "macOS"
+#else
+        "unknown"
+#endif
+#if defined(_WIN64) || defined(__x86_64__) || defined(__amd64__)
+        " x64"
+#elif defined(_M_IX86) || defined(__i386__)
+        " x86"
+#else
+        ""
+#endif
+        ;
+
+#if defined(__WATCOMC__)
+    compiler = "Open Watcom / Watcom C";
+#elif defined(__BORLANDC__)
+    compiler = "Borland C++";
+#elif defined(_MSC_VER)
+    compiler = "Microsoft Visual C++";
+#elif defined(__clang__)
+    compiler = "Clang";
+#elif defined(__GNUC__)
+    compiler = "GCC";
+#endif
+
+    init_table_rules();
+    ntable = g_nrules;
+
+    print_banner(stdout);
+    printf("Version     : %s\n", SMARTPP_VERSION);
+    printf("Built       : %s %s\n", __DATE__, __TIME__);
+#ifdef __WATCOMC__
+    printf("Compiler    : %s (__WATCOMC__=%d)\n", compiler, __WATCOMC__);
+#elif defined(__BORLANDC__)
+    printf("Compiler    : %s (__BORLANDC__=%d)\n", compiler, __BORLANDC__);
+#elif defined(_MSC_VER)
+    printf("Compiler    : %s (_MSC_VER=%d)\n", compiler, _MSC_VER);
+#elif defined(__clang__)
+    printf("Compiler    : %s (%s)\n", compiler, __VERSION__);
+#elif defined(__GNUC__)
+    printf("Compiler    : %s %s\n", compiler, __VERSION__);
+#else
+    printf("Compiler    : %s\n", compiler);
+#endif
+    printf("Platform    : %s\n", platform);
+    printf("Table rules : %d\n", ntable);
+    printf("Max P-id    : %d (STSZ=%d)\n", STSZ - 1, STSZ);
+    printf("\nRule catalogue (active / named slots only):\n");
+    for (i = 1; i < STSZ; i++) {
+        const char *nm = rule_name(i);
+        if (nm[0] == '\0') continue;
+        if (strcmp(nm, "(unnamed)") == 0) continue;
+        if (strcmp(nm, "(withdrawn)") == 0) continue;
+        if (strcmp(nm, "(reserved)") == 0) continue;
+        if (strncmp(nm, "(handled", 8) == 0) continue;
+        printf("  P%-4d  %s\n", i, nm);
+    }
+    printf("\nTable-engine entries (%d):\n", ntable);
+    for (i = 0; i < ntable; i++) {
+        printf("  P%-4d  %s\n", g_rules[i].rule_no, g_rules[i].desc);
+    }
+}
+
 static void usage(FILE *f)
 {
-    fprintf(f, "SMARTPP %s - conservative peephole pre-processor for 8086..x86-64\n",
-            SMARTPP_VERSION);
+    print_banner(f);
     fprintf(f, "usage: smartpp [options] [in [out]]\n");
     fprintf(f, "       smartpp [options] -o out in\n");
     fprintf(f, "\n");
@@ -8574,12 +13150,16 @@ static void usage(FILE *f)
     fprintf(f, "  -m86|-m186|-m286|-m386|-m486|-m586|-m686|-m64\n");
     fprintf(f, "                  initial CPU level (default 8086; source directives override)\n");
     fprintf(f, "  -att|-intel     force AT&T or Intel syntax (default: auto-detect)\n");
-    fprintf(f, "  -nz             keep xor+mov / shift pairs (movzx slower on 486/Pentium)\n");
-    fprintf(f, "  -Oz             prefer size over speed where both forms exist\n");
+    fprintf(f, "  -Os             optimize for speed (default)\n");
+    fprintf(f, "  -Oz             optimize for size (shorter encoding preferred)\n");
+    fprintf(f, "  -Ox             maximum optimization with non-100%%-safe transforms\n");
     fprintf(f, "  -mark|-nomark   enable/disable '; SMARTPP ...(Pn)' markers (default: on)\n");
-    fprintf(f, "  -v|-nv          enable/disable per-line rule notices (default: on)\n");
-    fprintf(f, "  --ncolor        disable colored diagnostics on stderr\n");
+    fprintf(f, "  -v|-nv          enable/disable per-line rule notices (default: off)\n");
+    fprintf(f, "  -color|-ncolor  force colored diagnostics on/off (default: on)\n");
+    fprintf(f, "  -I DIR         add include search path (repeatable)\n");
+    fprintf(f, "  -noinclude     do not follow INCLUDE / include / .include\n");
     fprintf(f, "  -o FILE         output file (default stdout; '-' = stdin/stdout)\n");
+    fprintf(f, "  -V|--version    detailed version, build, rules\n");
     fprintf(f, "  -h|--help       this help\n");
     fprintf(f, "\n");
     fprintf(f, "Applies conservative peephole rewrites (dead stores, jump threading,\n");
@@ -8614,17 +13194,36 @@ int main(int argc, char *argv[])
         char *a = argv[argi];
         if (a[0] == '-' && a[1] != '\0') {
             if (strcmp(a, "-o") == 0) {
-                if (++argi >= argc) { usage(stderr); return 1; }
-                outpath = argv[argi];
+                /* v2.18: don't consume the next arg if it looks like an
+                 *  option (starts with '-') -- "-o -v file" was eating
+                 *  "-v" as the output path, silently disabling verbose
+                 *  and then erroring on "too many file arguments". */
+                if (argi + 1 >= argc || argv[argi + 1][0] == '-') {
+                    usage(stderr); return 1;
+                }
+                outpath = argv[++argi];
             }
             else if (a[1] == 'o' && a[2] != '\0') outpath = a + 2;
-            else if (strcmp(a, "-v") == 0) opt_verbose = 1;          /* enable per-line notices (default ON) */
-            else if (strcmp(a, "-nv") == 0) opt_verbose = 0;         /* disable per-line notices */
-            else if (strcmp(a, "--ncolor") == 0) opt_ncolor = 1;     /* v1.87: disable color */
-            else if (strcmp(a, "-nz") == 0) opt_nz = 1;
+            else if (strcmp(a, "-v") == 0) opt_verbose = 1;          /* enable per-line notices */
+            else if (strcmp(a, "-nv") == 0) opt_verbose = 0;         /* disable (default) */
+            else if (strcmp(a, "-color") == 0) opt_color = 1;       /* force color ON */
+            else if (strcmp(a, "-ncolor") == 0) opt_color = 0;      /* force color OFF */
+            else if (strcmp(a, "--ncolor") == 0) opt_color = 0;     /* alias */
             else if (strcmp(a, "-mark") == 0) opt_mark = 1;          /* enable rewrite markers (default ON) */
             else if (strcmp(a, "-nomark") == 0) opt_mark = 0;        /* disable rewrite markers */
-            else if (strcmp(a, "-Oz") == 0 || strcmp(a, "-oz") == 0) opt_zopt = 1;
+            else if (strcmp(a, "-Oz") == 0 || strcmp(a, "-oz") == 0) { opt_zopt = 1; opt_speed = 0; }
+            else if (strcmp(a, "-Os") == 0 || strcmp(a, "-os") == 0) { opt_zopt = 0; opt_speed = 1; }
+            else if (strcmp(a, "-Ox") == 0 || strcmp(a, "-ox") == 0) opt_aggressive = 1;
+            else if (strcmp(a, "-noinclude") == 0) opt_noinclude = 1;
+            else if (strcmp(a, "-I") == 0) {
+                if (++argi >= argc) { usage(stderr); return 1; }
+                if (g_ninc_paths < MAX_INCL_PATHS)
+                    g_inc_paths[g_ninc_paths++] = argv[argi];
+            }
+            else if (a[1] == 'I' && a[2] != '\0') {
+                if (g_ninc_paths < MAX_INCL_PATHS)
+                    g_inc_paths[g_ninc_paths++] = a + 2;
+            }
             else if (strcmp(a, "-att") == 0) {
                 g_att = 1; g_gas = 1; g_synforced = 1;
             }
@@ -8633,18 +13232,22 @@ int main(int argc, char *argv[])
             }
             else if (strcmp(a, "-h") == 0 || strcmp(a, "-?") == 0 ||
                      strcmp(a, "--help") == 0) { usage(stdout); return 0; }
-            else if (strcmp(a, "-m86") == 0 || strcmp(a, "-m8086") == 0) {
-                g_curcpu = 1;
+            else if (strcmp(a, "--version") == 0 || strcmp(a, "-V") == 0) {
+                print_version();
+                return 0;
             }
-            else if (strcmp(a, "-m186") == 0) { g_curcpu = 2; }
-            else if (strcmp(a, "-m286") == 0) { g_curcpu = 4; }
-            else if (strcmp(a, "-m386") == 0) { g_curcpu = 8; }
-            else if (strcmp(a, "-m486") == 0) { g_curcpu = 16; }
-            else if (strcmp(a, "-m586") == 0) { g_curcpu = 32; }
-            else if (strcmp(a, "-m686") == 0) { g_curcpu = 64; }
+            else if (strcmp(a, "-m86") == 0 || strcmp(a, "-m8086") == 0) {
+                g_curcpu = 1;  g_cpu_max = 1;
+            }
+            else if (strcmp(a, "-m186") == 0) { g_curcpu = 2;  g_cpu_max = 2; }
+            else if (strcmp(a, "-m286") == 0) { g_curcpu = 4;  g_cpu_max = 4; }
+            else if (strcmp(a, "-m386") == 0) { g_curcpu = 8;  g_cpu_max = 8; }
+            else if (strcmp(a, "-m486") == 0) { g_curcpu = 16; g_cpu_max = 16; }
+            else if (strcmp(a, "-m586") == 0) { g_curcpu = 32; g_cpu_max = 32; }
+            else if (strcmp(a, "-m686") == 0) { g_curcpu = 64; g_cpu_max = 64; }
             else if (strcmp(a, "-m64") == 0 ||
                      strcmp(a, "-mx64") == 0 ||
-                     strcmp(a, "-mx86-64") == 0) { g_curcpu = 128; }
+                     strcmp(a, "-mx86-64") == 0) { g_curcpu = 128; g_cpu_max = 128; }
             else {
                 fprintf(stderr, "smartpp: unknown option '%s'\n", a);
                 usage(stderr);
@@ -8669,17 +13272,32 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    in = (strcmp(inpath, "-") == 0) ? stdin : fopen(inpath, "rb");
-    if (in == NULL) {
-        fprintf(stderr, "smartpp: cannot open '%s'\n", inpath);
-        return 1;
-    }
-    read_file(in);
-    if (in != stdin) fclose(in);
+#ifdef _WIN32
+    /* CP1252 so AUTHOR_STR (é = 0xE9) matches Spanish Windows consoles */
+    SetConsoleOutputCP(1252);
+    SetConsoleCP(1252);
+#endif
+    /* Unbuffered stderr so progress + summary always appear immediately */
+    setvbuf(stderr, NULL, _IONBF, 0);
 
+    print_banner(stderr);
+    fprintf(stderr, "smartpp: loading '%s'...\n", inpath);
+    fflush(stderr);
+
+    if (strcmp(inpath, "-") == 0) {
+        in = stdin;
+        read_file(in);
+    } else {
+        read_file_path(inpath);
+        in = NULL;
+    }
+    fprintf(stderr, "smartpp: read %ld lines\n", g_nlines);
+    fflush(stderr);
     scan_indefs();
     detect_use32();
     collect_labels();
+    fprintf(stderr, "smartpp: %ld labels, CPU %s\n", g_nlab, cpu_name(g_curcpu));
+    fflush(stderr);
     init_table_rules();    /* v1.85: declarative rule engine */
     /* Fixed-point: keep running passes until no rewrite fires or
      *  MAX_PASSES is reached.  Each pass re-scans all live lines, so
@@ -8688,19 +13306,44 @@ int main(int argc, char *argv[])
     {
         int pass;
         for (pass = 0; pass < MAX_PASSES; pass++) {
-            long n = run_pass();
+            long n;
+            /* v2.25 (S1): drop the pinfo cache at start of each pass.
+             *  The previous pass may have rewritten or deleted lines;
+             *  their cached pinfo is now stale.  The cache rebuilds
+             *  lazily as parse_line is called. */
+            pi_cache_invalidate_all();
+            n = run_pass();
             g_passes_run = pass + 1;
+            fprintf(stderr, "smartpp: pass %d: %ld rewrite%s\n",
+                    g_passes_run, n, n == 1 ? "" : "s");
+            fflush(stderr);
             if (n == 0) break;
         }
     }
 
+
+    /* Count kept / deleted lines first (no I/O yet). */
+    nout = 0;
+    ndel = 0;
+    for (i = 0; i < g_nlines; i++) {
+        if (DEL(i)) ndel++;
+        else        nout++;
+    }
+
+    /* ---- SUMMARY BEFORE writing the output file -------------------
+     *  Writing a fully expanded INCLUDE of SMART.INC can take a long
+     *  time (or look hung).  Emit the table now so the user always
+     *  sees which rules fired. */
+    print_summary(nout, ndel);
+    fprintf(stderr, "smartpp: writing output...\n");
+
     out = (outpath == NULL || strcmp(outpath, "-") == 0) ? stdout : fopen(outpath, "wb");
     if (out == NULL) {
-        fprintf(stderr, "smartpp: cannot create '%s'\n", outpath);
+        fprintf(stderr, "smartpp: cannot create '%s'\n", outpath ? outpath : "(null)");
         return 1;
     }
     for (i = 0; i < g_nlines; i++) {
-        if (DEL(i)) { ndel++; continue; }
+        if (DEL(i)) continue;
         fputs(L(i), out);
         switch (TERM(i)) {
         case 1: fputc('\n', out); break;
@@ -8708,194 +13351,19 @@ int main(int argc, char *argv[])
         case 3: fputc('\r', out); break;
         default: break;
         }
-        nout++;
+    }
+    /* Append a short comment footer with the hit summary */
+    {
+        int k;
+        fprintf(out, "\n; ---- SMARTPP %s summary: %ld lines out, %ld removed, %d pass(es) ----\n",
+                SMARTPP_VERSION, nout, ndel, g_passes_run);
+        for (k = 1; k < STSZ; k++) {
+            if (st[k] == 0) continue;
+            fprintf(out, ";   P%d: %ld\n", k, st[k]);
+        }
+        fprintf(out, "; --------------------------------------------------------------------\n");
     }
     if (out != stdout) fclose(out);
-
-    /* ---- v1.86: pretty-printed summary to stderr -----------------
-     *  The per-line "rule Pn fired" messages already went to stderr
-     *  during the pass (when opt_verbose).  Here we emit a final
-     *  banner + a two-column table of the rules that fired. */
-    {
-        static const char *rname[] = {
-            "",  "delete mov/xchg R,R",      "dead register store",
-            "push/pop pair",                 "merge shifts",
-            "thread jmp/jcc",                "redundant jump",
-            "invert jcc",                    "or/and->test (ext)",
-            "mov0->xor",                      "add/sub 1->inc/dec",
-            "cmp0->test",                     "dup jumps",
-            "unreachable",                    "double xchg",
-            "mov R,S/mov S,R",               "const fold",
-            "lea conv",                       "add/sub R,0",
-            "dup cmp/test/or/and",            "shift R,0",
-            "dup flag op",                    "inc/dec pair",
-            "not pair",                        "neg pair",
-            "cmc pair",                        "dead xor0",
-            "add/sub pair",                   "dup sign-extend",
-            "zero-ext movzx",                 "zero-ext imm",
-            "movsx",                           "push/pop->mov",
-            "shift pair",                      "and-mask",
-            "mov-1->or",                      "leave",
-            "xor R,-1->not",                  "imul 2^k->shl",
-            "add/sub pair (const)",           "mov+add->mov",
-            "lea R,[R+S]->add",               "push bp/mov bp,sp/sub sp,N->enter",
-            "xor+arith->mov",                 "xor/inc->mov1",
-            "xor/dec->mov-1",                 "push imm/pop->mov",
-            "mov+add->lea",                   "xor+test->delete test",
-            "sp add/sub pair",                "imul 2^k+1->lea",
-            "imul -1->neg",                   "mov+shl fold",
-            "mov+and fold",                   "mov+or fold",
-            "mov+xor fold",                   "mixed add/sub fold",
-            "lea [R+R]->shl",                 "xor/xor pair",
-            "and R,0->mov R,0",               "or R16,-1->mov R16,-1",
-            "and+and->and",                   "and/or mask tighten",
-            "lea R,[R*K]->shl",               "",
-            "dec/cmp -1->dec",                "",
-            "",                                "xchg dead->mov",
-            "",                                "lea+lea fusion",
-            "sub R,R->xor R,R",                "mov+shr fold",  /* 72 */
-            "mov+sar fold",                    "mov+rol fold",  /* 74 */
-            "mov+ror fold",                    "xor+reg->mov",  /* 76 */
-            "dup mov/lea/movzx",               "lea+lea same-dst",  /* 78 */
-            "mov+push->push imm",              "push+write+pop->nothing",  /* 80 */
-            "mov+movzx->movzx",                "lea r16,var->mov OFFSET",  /* 81,82 */
-            "",                                "",                          /* 83,84 */
-            "mov+cmp same-const dead",        "mov+test same-const dead",  /* 85,86 */
-            "mov+push->push imm (CF)",         "rol16/xchg/rol16->bswap",   /* 87,88 */
-            "mov0 before setcc dead",          "and K / jcc->test K",       /* 89,90 */
-            "(withdrawn)",                    "sub R,1->dec R (jcc)",       /* 91,92 */
-            "xor dead before mov",             "mov 0 / OP K -> mov K",     /* 93,94 */
-            "",                                "",                          /* 95,96 */
-            "mov+test R,R dead",               "shift dead before mov 0",   /* 97,98 */
-            "(withdrawn)",                    "(withdrawn)",                /* 99,100 */
-            "(withdrawn)",                    "(withdrawn)",                /* 101,102 */
-            "(withdrawn)",                    "(withdrawn)",                /* 103,104 */
-            "sub R,R->xor (dep-chain)",       "(withdrawn)",                /* 105,106 */
-            "(withdrawn)",                    "(withdrawn)",                /* 107,108 */
-            "(withdrawn)",                    "(withdrawn)",                /* 109,110 */
-            "or R,0->del",                    "and R,-1->del",               /* 111,112 */
-            "(withdrawn)",                    "(withdrawn)",                /* 113,114 */
-            "xor R,0->del",                   "",                            /* 115,116 */
-            "",                                "",                            /* 117,118 */
-            "test R,K->del",                  "cmp R,K->del",                /* 119,120 */
-            "(withdrawn)",                                                    /* 121 */
-            /* v1.86 new rules (122..128) */
-            "imul R,1->del (flags dead)",     "imul R,0->xor R,R (flags dead)",  /* 122,123 */
-            "lea R,[R]/[R+0]->del",          "(withdrawn)",                /* 124,125 */
-            "xchg R,R->del (canonical NOP)", "bswap/bswap->del one (486+)", /* 126,127 */
-            "xor R,R/push R->push 0",                                        /* 128 */
-            /* v1.87 new x87 rules (129..137) */
-            "fld st/fstp st->del (push/pop)",  "fldz/fstp st->del",        /* 129,130 */
-            "fchs/fchs->del (double neg)",     "fabs/fabs->fabs",          /* 131,132 */
-            "(withdrawn)",                     "ffree/ffree->ffree",       /* 133,134 */
-            "fninit/fninit->fninit",           "fwait/fwait->fwait",       /* 135,136 */
-            "fxch st,st/fxch st,st->del",                                  /* 137 */
-            /* v1.87 new x64 rules (138..140) -- all withdrawn.
-             *  P138 (mov R64,0->xor R32,R32) is handled by the P9
-             *  C-rule, which detects x64 mode and emits the 32-bit
-             *  xor form; no table rule needed.
-             *  P139 (test R64,R64->test R32,R32) was WITHDRAWN: it
-             *  is unsound (ZF differs when the high 32 bits of R64
-             *  are nonzero; the 32-bit test also zero-extends EAX
-             *  into RAX, mutating RAX).
-             *  P140 (mov R64,R64->del) is handled by the P1 C-rule. */
-            "(handled by P9)",               "(withdrawn: unsound)",     /* 138,139 */
-            "(handled by P1)"                                           /* 140 */
-        };
-        const int NRNAME = (int)(sizeof(rname)/sizeof(rname[0]));
-        long total_fired = 0;
-        int k, nrules_fired = 0;
-
-        fprintf(stderr, "\n");
-        if (color_enabled()) {
-            fprintf(stderr, "%s==========================================================%s\n",
-                    C_CYAN, C_RESET);
-            fprintf(stderr, "  %sSMARTPP %s%s  --  peephole summary\n",
-                    C_BOLD C_CYAN, SMARTPP_VERSION, C_RESET);
-            fprintf(stderr, "%s==========================================================%s\n",
-                    C_CYAN, C_RESET);
-            fprintf(stderr, "  %sInput%s   : %ld lines\n",
-                    C_DIM, C_RESET, g_nlines);
-            fprintf(stderr, "  %sOutput%s  : %ld lines\n",
-                    C_DIM, C_RESET, nout);
-            fprintf(stderr, "  %sRemoved%s : %ld lines\n",
-                    C_DIM, C_RESET, ndel);
-            fprintf(stderr, "  %sPasses%s  : %d (max %d)\n",
-                    C_DIM, C_RESET, g_passes_run, MAX_PASSES);
-            fprintf(stderr, "  %sCPU%s     : %s%s%s\n",
-                    C_DIM, C_RESET,
-                    C_GREEN, cpu_name(g_curcpu), C_RESET);
-            fprintf(stderr, "%s----------------------------------------------------------%s\n",
-                    C_CYAN, C_RESET);
-            fprintf(stderr, "  %-6s  %-34s  %s\n", "Rule", "Description", "Hits");
-            fprintf(stderr, "  %-6s  %-34s  %s\n", "----",
-                    "----------------------------------", "----");
-        }
-        else {
-            fprintf(stderr, "==========================================================\n");
-            fprintf(stderr, "  SMARTPP %s  --  peephole summary\n",
-                    SMARTPP_VERSION);
-            fprintf(stderr, "==========================================================\n");
-            fprintf(stderr, "  Input   : %ld lines\n", g_nlines);
-            fprintf(stderr, "  Output  : %ld lines\n", nout);
-            fprintf(stderr, "  Removed : %ld lines\n", ndel);
-            fprintf(stderr, "  Passes  : %d (max %d)\n", g_passes_run, MAX_PASSES);
-            fprintf(stderr, "  CPU     : %s\n", cpu_name(g_curcpu));
-            fprintf(stderr, "----------------------------------------------------------\n");
-            fprintf(stderr, "  %-6s  %-34s  %s\n", "Rule", "Description", "Hits");
-            fprintf(stderr, "  %-6s  %-34s  %s\n", "----",
-                    "----------------------------------", "----");
-        }
-
-        for (k = 1; k < STSZ && k < NRNAME; k++) {
-            const char *nm;
-            if (st[k] == 0) continue;
-            nm = rname[k][0] != '\0' ? rname[k] : "(unnamed)";
-            if (color_enabled())
-                fprintf(stderr, "  %sP%-5d%s  %-34s  %s%ld%s\n",
-                        C_YELLOW, k, C_RESET, nm,
-                        C_GREEN, st[k], C_RESET);
-            else
-                fprintf(stderr, "  P%-5d  %-34s  %ld\n", k, nm, st[k]);
-            total_fired += st[k];
-            nrules_fired++;
-        }
-        /* also catch any rule that fired but has no rname slot yet */
-        for (; k < STSZ; k++) {
-            if (st[k] != 0) {
-                if (color_enabled())
-                    fprintf(stderr, "  %sP%-5d%s  %-34s  %s%ld%s\n",
-                            C_YELLOW, k, C_RESET, "(unnamed)",
-                            C_GREEN, st[k], C_RESET);
-                else
-                    fprintf(stderr, "  P%-5d  %-34s  %ld\n",
-                            k, "(unnamed)", st[k]);
-                total_fired += st[k];
-                nrules_fired++;
-            }
-        }
-        if (color_enabled()) {
-            fprintf(stderr, "%s----------------------------------------------------------%s\n",
-                    C_CYAN, C_RESET);
-            fprintf(stderr, "  %-6s  %-34s  %s%ld%s\n",
-                    C_BOLD "TOTAL" C_RESET,
-                    "(rules fired / instructions rewritten)",
-                    C_BOLD, total_fired, C_RESET);
-            if (nrules_fired == 0)
-                fprintf(stderr, "  %s(no rules fired; input already optimal)%s\n",
-                        C_DIM, C_RESET);
-            fprintf(stderr, "%s==========================================================%s\n",
-                    C_CYAN, C_RESET);
-        }
-        else {
-            fprintf(stderr, "----------------------------------------------------------\n");
-            fprintf(stderr, "  %-6s  %-34s  %ld\n",
-                    "TOTAL", "(rules fired / instructions rewritten)",
-                    total_fired);
-            if (nrules_fired == 0)
-                fprintf(stderr, "  (no rules fired; input already optimal)\n");
-            fprintf(stderr, "==========================================================\n");
-        }
-    }
+    fprintf(stderr, "smartpp: done (%ld lines written).\n", nout);
     return 0;
 }
