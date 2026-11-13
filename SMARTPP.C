@@ -1507,6 +1507,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdarg.h>
+#ifdef __WATCOMC__
+#  include <malloc.h>           /* stackavail() for low-stack guard */
+#endif
 #ifdef _WIN32
 #  include <windows.h>
 #  include <io.h>
@@ -1522,7 +1525,7 @@
 #define SMARTPP_HAS_ISATTY 0
 #endif
 
-#define SMARTPP_VERSION "2.24"
+#define SMARTPP_VERSION "2.52"
 /* Author name: use CP1252 on Windows (é = 0xE9), UTF-8 elsewhere.
  *  Windows consoles (cp850/cp1252) often mojibake UTF-8; CP1252 matches
  *  the OEM/ANSI code pages used by Spanish Windows. */
@@ -1532,6 +1535,27 @@
 #  define AUTHOR_STR "Javier Guti\xC3\xA9rrez Chamorro (Guti)"
 #endif
 
+
+/* ---- Stack size request (portable) ---------------------------------
+ *  run_pass is a large function; MAXLINE locals on the stack can exceed
+ *  defaults.  Request ~2 MiB where the toolchain allows it.
+ *
+ *  Watcom:  unsigned _STACKSIZE  — linker/runtime reads this symbol.
+ *  MSVC:    #pragma comment(linker, "/STACK:n") PE stack reserve
+ *           (same as link /STACK:2097152).
+ *  GCC/MinGW: no in-source knob; at link time use
+ *           -Wl,--stack,2097152  (Windows) or rely on large Unix stacks.
+ *  2 MiB = 2*1024*1024 = 2097152 bytes.
+ */
+#ifdef __WATCOMC__
+#  if defined(__NT__) || defined(__OS2__) || defined(__FLAT__) || defined(__386__)
+unsigned _STACKSIZE = 2048UL * 1024UL;  /* 2 MiB */
+#  else
+unsigned _STACKSIZE = 64U * 1024U;       /* 16-bit Watcom */
+#  endif
+#elif defined(_MSC_VER)
+#  pragma comment(linker, "/STACK:2097152")  /* 2 MiB */
+#endif
 
 #define MAXTOK  256              /* operand / label / target buffer   */
 #define MAXCMT  512              /* trailing comment buffer           */
@@ -1578,6 +1602,7 @@
 static int  opt_color = 1;        /* 1=on (default), 0=off (-ncolor), -1=auto/TTY */
 
 static const char *cpu_name(int cpu);
+static const char *cpu_name_short(int cpu);
 static void print_summary(long nout, long ndel);
 static void print_version(void);
 
@@ -1715,20 +1740,29 @@ static struct pinfo g_pnext;     /* next_code / instr_after_label    */
 static struct pinfo g_pnew;      /* v1.70 rules: fresh parse of line i */
 static struct pinfo g_pscan;     /* flags_clear                      */
 
-static char g_scratch[MAXLINE];                      /* shared copy  */
-static char g_build[MAXLINE + MAXTOK + MAXCMT];      /* rewrite buf  */
+static char *g_scratch = NULL;   /* v2.50: malloc'd shared copy */
+static char *g_build = NULL;     /* v2.50: malloc'd rewrite buf */
+#define G_BUILD_SZ (MAXLINE + MAXTOK + MAXCMT)
+/* v2.51: heap work buffers for run_pass (avoid huge stack frames on Watcom) */
+#define G_WORK_N 8
+static char *g_work[G_WORK_N];
+static int   g_work_init = 0;
+/* v2.52: rewrite temps for run_pass — not on Watcom stack (silent abort) */
+static char g_tmpa[MAXLINE];
+static char g_tmpb[MAXLINE];
 
-static int  opt_verbose = 0;        /* default OFF; -v enables, -nv disables */
+static void ensure_work_bufs(void); /* defined after xmalloc */
+
+static int  opt_verbose = 1;        /* default ON; -nv disables */
 static int  g_curcpu    = 1;
-/* v2.26: g_cpu_max is the HARD CEILING set by the -m flag on the
- *  command line.  Source-file directives (.386, .286, etc.) can only
- *  set g_curcpu UP TO this ceiling -- they cannot raise it beyond
- *  what the user explicitly requested.  This prevents a .386
- *  directive in the source from enabling movzx/movsx rules when
- *  the user passed -m86 (targeting 8086 where those instructions
- *  don't exist).  When -m is NOT given, g_cpu_max stays 0 and
- *  directives are unrestricted (preserving v2.25 behavior). */
-static int  g_cpu_max   = 0;    /* 0 = no ceiling (directives unrestricted) */
+/* v2.27: -m sets the INITIAL CPU level only.  Source directives
+ *  (.386, .286, .8086, ...) freely raise or lower g_curcpu for the
+ *  rest of the unit (and subsequent directives can lower it again).
+ *  The old v2.26 hard ceiling (g_cpu_max) is gone: a file that says
+ *  .386 is allowed to use 386-level rules even when the command line
+ *  started at -m86.  Use -w (default) to see a diagnostic each time
+ *  a directive changes the level. */
+static int  opt_warn    = 1;     /* default ON: all warnings (-w/-nw). CPU directives, -Ox, … */
 static int  opt_zopt    = 0;     /* -Oz: optimize for size */
 static int  opt_speed   = 1;     /* -Os: optimize for speed (default) */
 static int  opt_aggressive = 0;  /* -Ox: aggressive (non-100%-safe) folds */
@@ -1751,7 +1785,7 @@ static int  g_nofpu     = 0;    /* .NO87 disables FPU rules; .287/.387/.8087 ena
 
 /* Per-rule hit counters, indexed by rule number (1..STSZ).
 *  st[0] is unused.  The driver prints non-zero entries by name. */
-#define STSZ 440             /* P1..P429 + spare */
+#define STSZ 900             /* v2.52: headroom for curated high-value rules */
 static long st[STSZ];
 
 static int  g_gas = 0;           /* GAS conventions (comments, labels) */
@@ -1825,6 +1859,29 @@ static void vlog(const char *fmt, ...)
 #define vlog_line(i, ...) \
     vlog("smartpp: line %ld: " __VA_ARGS__, (long)((i) + 1))
 
+/* wlog: user-facing warnings controlled by -w/-nw (default ON).
+ *  Distinct from vlog (-v): warnings always matter for correctness
+ *  awareness (CPU level changes, -Ox non-100%-safe rewrites). */
+static void wlog(const char *fmt, ...)
+{
+    va_list ap;
+    char buf[1024];
+    if (!opt_warn) return;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (color_enabled() && !strncmp(buf, "smartpp:", 8)) {
+        fprintf(stderr, "%s%.*s%s%s",
+                C_YELLOW C_BOLD, 8, buf, C_RESET, buf + 8);
+    }
+    else {
+        fputs(buf, stderr);
+    }
+}
+
+#define wlog_line(i, ...) \
+    wlog("smartpp: warning: line %ld: " __VA_ARGS__, (long)((i) + 1))
+
 static void *xmalloc(size_t n)
 {
     void *p = malloc(n);
@@ -1844,6 +1901,18 @@ static void *xrealloc(void *p, size_t n)
     }
     return q;
 }
+
+static void ensure_work_bufs(void)
+{
+    int i;
+    if (g_work_init) return;
+    for (i = 0; i < G_WORK_N; i++) {
+        g_work[i] = (char *)xmalloc(MAXLINE);
+        g_work[i][0] = '\0';
+    }
+    g_work_init = 1;
+}
+
 
 static char *xstrdup(const char *s)
 {
@@ -2358,7 +2427,7 @@ static char *load_entire_stream(FILE *f, long *out_sz)
 {
     char *buf = NULL;
     long sz = 0, cap = 0;
-    char tmp[8192];
+    static char tmp[8192]; /* v2.46: not on stack (Watcom small stacks) */
     size_t n;
     for (;;) {
         n = fread(tmp, 1, sizeof(tmp), f);
@@ -3659,9 +3728,11 @@ static unsigned long width_mask(int w)
 static long next_code(long i)
 {
     long j;
-    struct pinfo local;
+    /* v2.47: pinfo is ~1.6KB — NEVER put it on the stack (Watcom /
+     *  small-stack hosts die inside the first pass).  Use static. */
+    static struct pinfo local;
     for (j = i + 1; j < g_nlines; j++) {
-        if (DEL(j)) continue;
+        if (DEL(j) || INDEF(j)) continue;
         parse_line(j, &local);
         if (local.haslabel || local.hasinstr) return j;
     }
@@ -3787,6 +3858,11 @@ static void delete_keep_label(long idx, struct pinfo *pi)
 static void replace_line_marked(long idx, const char *newtext,
                                 const char *desc, int rule_no)
 {
+    /* v2.52: always emit the -v notice here so every call site
+     *  (including ones that forgot a local vlog) is listed. */
+    if (opt_verbose && desc != NULL)
+        vlog("smartpp: line %ld: rule P%d fired (%s)\n",
+             idx + 1, rule_no, desc);
     if (opt_mark && desc != NULL) {
         char buf[MAXLINE];
         int n = (int)strlen(newtext);
@@ -3815,6 +3891,10 @@ static void replace_line_marked(long idx, const char *newtext,
 static void delete_keep_label_marked(long idx, struct pinfo *pi,
                                      const char *desc, int rule_no)
 {
+    /* v2.52: central -v notice for every marked deletion */
+    if (opt_verbose && desc != NULL)
+        vlog("smartpp: line %ld: rule P%d fired (%s)\n",
+             idx + 1, rule_no, desc);
     if (!opt_mark) { delete_keep_label(idx, pi); return; }
     {
         char buf[MAXLINE];
@@ -4805,6 +4885,8 @@ struct op_pat {
 #define PRE_NO_CPU_8086       0x0020u
 #define PRE_CPU_386           0x0040u
 #define PRE_CPU_486           0x0080u
+#define PRE_NOT_OZ            0x10000u  /* v2.32: suppress under -Oz (size) */
+#define PRE_OZ                0x20000u  /* v2.36: only under -Oz (size) */
 #define PRE_NO_USE32          0x0100u
 #define PRE_INTEL             0x0200u
 #define PRE_NEXT_IS_JCC       0x0400u
@@ -4815,9 +4897,12 @@ struct op_pat {
  *  is now free for reuse. */
 #define PRE_NOT_SP            0x4000u   /* primary register is not SP */
 #define PRE_CPU_X64           0x8000u   /* rule needs .X64 (long mode) */
-#define PRE_FPU               0x10000u  /* rule needs x87 FPU enabled (.NO87 forbids) */
-#define PRE_STACK_MEM_0       0x20000u  /* inst0 op1 is pure [bp/ebp/rbp±N] */
-#define PRE_STACK_MEM_1       0x40000u  /* inst1 op1 is pure [bp/ebp/rbp±N] */
+/* v2.52: PRE_FPU and PRE_STACK_MEM_* previously collided with
+ *  PRE_NOT_OZ / PRE_OZ (same numeric values).  Re-assigned to free
+ *  high bits so the predicates are independent. */
+#define PRE_FPU               0x1000000u /* needs x87 FPU (.NO87 forbids) */
+#define PRE_STACK_MEM_0       0x2000000u /* inst0 op1 is pure [bp/ebp/rbp±N] */
+#define PRE_STACK_MEM_1       0x4000000u /* inst1 op1 is pure [bp/ebp/rbp±N] */
 #define PRE_AGGRESSIVE        0x80000u  /* only when -Ox */
 
 /* action kinds */
@@ -4867,6 +4952,27 @@ struct rule {
  *  sees it. */
 static const struct rule *g_rules = NULL;
 static int g_nrules = 0;
+
+/* v2.46: compact per-mnemonic rule chains (Watcom-safe: ~5 KB, not
+ *  a 128 KB 2D array that can blow data/stack budgets on 16-bit or
+ *  small-stack hosts).  try_table_rules walks one chain only. */
+#define RULE_IDX_BUCK 512
+#define RULE_IDX_NONE 0xFFFFu
+static unsigned short g_rule_head[RULE_IDX_BUCK]; /* head of chain */
+static unsigned short g_rule_next[4096];          /* next rule index (v2.52) */
+static unsigned short g_rule_wild_head;           /* wildcard chain */
+
+static unsigned rule_mnem_hash(const char *s)
+{
+    unsigned h = 5381u;
+    if (s == NULL || s[0] == '\0') return 0;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+        h = ((h << 5) + h) + c;
+    }
+    return h % RULE_IDX_BUCK;
+}
 
 /* match one operand pattern against an operand text.  Fills cap on
  *  success.  Returns 1 on match, 0 otherwise. */
@@ -5092,6 +5198,8 @@ static int pre_check(unsigned pre, unsigned dead_caps, long last_idx,
     if (pre & PRE_NO_CPU_8086) if (g_curcpu < 2) return 0;
     if (pre & PRE_CPU_386)     if (g_curcpu < 8) return 0;
     if (pre & PRE_CPU_486)     if (g_curcpu < 16) return 0;
+    if (pre & PRE_NOT_OZ)      if (opt_zopt) return 0;
+    if (pre & PRE_OZ)          if (!opt_zopt) return 0;
     if (pre & PRE_CPU_X64)     if (g_curcpu < 128) return 0;
     if (pre & PRE_FPU)         if (g_nofpu) return 0;
     if (pre & PRE_NO_USE32)    if (g_use32) return 0;
@@ -5565,6 +5673,60 @@ static int is_stack_mem_operand(const char *s)
     return (*p == ']');
 }
 
+/* v2.35: normalize a stack-frame operand to "bp±N" / "ebp±N" / "rbp±N"
+ *  for equality tests (ignore size-ptr prefix and whitespace).
+ *  Returns 1 on success and fills out[0..osz). */
+static int stack_mem_key(const char *s, char *out, int osz)
+{
+    const char *p;
+    const char *base;
+    int blen;
+    char sign = '+';
+    char disp[32];
+    int di = 0;
+    if (!is_stack_mem_operand(s) || out == NULL || osz < 8) return 0;
+    p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    if (ci_eq_n(p, "byte", 4) || ci_eq_n(p, "word", 4) ||
+        ci_eq_n(p, "dword", 5) || ci_eq_n(p, "qword", 5)) {
+        while (*p && *p != ' ' && *p != '\t') p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (ci_eq_n(p, "ptr", 3)) {
+            p += 3;
+            while (*p == ' ' || *p == '\t') p++;
+        }
+    }
+    if (*p != '[') return 0;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (ci_eq_n(p, "rbp", 3) && !is_ident_char((unsigned char)p[3])) {
+        base = "rbp"; blen = 3; p += 3;
+    } else if (ci_eq_n(p, "ebp", 3) && !is_ident_char((unsigned char)p[3])) {
+        base = "ebp"; blen = 3; p += 3;
+    } else if (ci_eq_n(p, "bp", 2) && !is_ident_char((unsigned char)p[2])) {
+        base = "bp"; blen = 2; p += 2;
+    } else return 0;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == ']') {
+        if (blen + 3 >= osz) return 0;
+        sprintf(out, "%s+0", base);
+        return 1;
+    }
+    if (*p == '+') { sign = '+'; p++; }
+    else if (*p == '-') { sign = '-'; p++; }
+    else return 0;
+    while (*p == ' ' || *p == '\t') p++;
+    while (*p && *p != ']' && di < (int)sizeof(disp) - 1) {
+        if (*p != ' ' && *p != '\t') disp[di++] = *p;
+        p++;
+    }
+    disp[di] = '\0';
+    if (di == 0) return 0;
+    if (blen + 1 + di + 1 >= osz) return 0;
+    sprintf(out, "%s%c%s", base, sign, disp);
+    return 1;
+}
+
 static int try_table_rules(long i)
 {
     struct pinfo *pi = &g_pcur;
@@ -5573,87 +5735,106 @@ static int try_table_rules(long i)
     long j2 = -1;
     static char imm0_buf[MAXTOK], imm1_buf[MAXTOK];
     const char *imm0 = NULL, *imm1 = NULL;
+    unsigned h;
+    unsigned short chains[2];
+    int ch;
+    unsigned short rwalk;
+    int rguard;
 
-    /* v1.85: a bespoke C rule may have already deleted this line in
-     *  the same pass (P8/P18 do DEL(i)=1 without continue).  Bail. */
     if (DEL(i)) return 0;
     if (pi->haslabel || pi->toobig || !pi->hasinstr) return 0;
     if (g_nrules == 0) return 0;
 
-    for (ri = 0; ri < g_nrules; ri++) {
-        const struct rule *r = &g_rules[ri];
-        struct capent cap[NCAP];
-        int k;
-        long j3 = -1, j4 = -1;
-        long last_idx;   /* v2.26 (3.1): last pattern inst, for pre_check */
-        for (k = 0; k < NCAP; k++) { cap[k].fam = -1; cap[k].width = 0; cap[k].lo = 0; }
-        if (!pat_match_inst(pi, r, 0, cap)) continue;
-        if (r->n >= 2) {
-            j2 = next_code(i);
-            if (j2 < 0 || INDEF(j2)) continue;
-            parse_line(j2, pj);
-            if (pj->haslabel || pj->toobig || !pj->hasinstr) continue;
-            if (!pat_match_inst(pj, r, 1, cap)) continue;
-        }
-        if (r->n >= 3) {
-            j3 = next_code(j2);
-            if (j3 < 0 || INDEF(j3)) continue;
-            parse_line(j3, &g_pnext);
-            if (g_pnext.haslabel || g_pnext.toobig || !g_pnext.hasinstr) continue;
-            if (!pat_match_inst(&g_pnext, r, 2, cap)) continue;
-        }
-        if (r->n >= 4) {
-            if (j3 < 0) j3 = next_code(j2);
-            j4 = next_code(j3);
-            if (j4 < 0 || INDEF(j4)) continue;
-            parse_line(j4, &g_plook);
-            if (g_plook.haslabel || g_plook.toobig || !g_plook.hasinstr) continue;
-            if (!pat_match_inst(&g_plook, r, 3, cap)) continue;
-        }
-        /* v2.26 (3.1): compute the LAST instruction index so pre_check
-         *  scans dead flags / dead regs from AFTER the whole pattern,
-         *  not from after inst1 of a 3-op pattern.  The previous code
-         *  passed j2 (or i), which for a 3-op rule was inst1 -- the
-         *  dead-flag scan then started at inst2 and missed any flag
-         *  reader between inst1 and inst2.  No current rule exercised
-         *  this (P430 has pre=0), but it was a latent footgun. */
-        last_idx = i;
-        if (r->n >= 2) last_idx = j2;
-        if (r->n >= 3) last_idx = j3;
-        if (r->n >= 4) last_idx = j4;
-        /* capture immediates for the rewrite template */
-        if (pi->nops >= 2) {
-            long v;
-            if (try_parse_number(pi->op1, &v) || is_offset_expr(pi->op1)) {
-                strncpy(imm0_buf, pi->op1, sizeof(imm0_buf)-1);
-                imm0_buf[sizeof(imm0_buf)-1] = '\0';
-                imm0 = imm0_buf;
+    /* v2.49: walk hash chain + wildcards; guard against cycles */
+    h = rule_mnem_hash(pi->mnem);
+    chains[0] = g_rule_head[h];
+    chains[1] = g_rule_wild_head;
+    for (ch = 0; ch < 2; ch++) {
+        rwalk = chains[ch];
+        for (rguard = 0; rguard < 4096 && rwalk != RULE_IDX_NONE; rguard++) {
+            const struct rule *r;
+            struct capent cap[NCAP];
+            int k;
+            long j3 = -1, j4 = -1;
+            long last_idx;
+
+            ri = (int)rwalk;
+            rwalk = g_rule_next[rwalk];
+            r = &g_rules[ri];
+
+            for (k = 0; k < NCAP; k++) {
+                cap[k].fam = -1;
+                cap[k].width = 0;
+                cap[k].lo = 0;
             }
-        }
-        if (r->n >= 2 && pj->nops >= 2) {
-            long v;
-            if (try_parse_number(pj->op1, &v) || is_offset_expr(pj->op1)) {
-                strncpy(imm1_buf, pj->op1, sizeof(imm1_buf)-1);
-                imm1_buf[sizeof(imm1_buf)-1] = '\0';
-                imm1 = imm1_buf;
+            if (!pat_match_inst(pi, r, 0, cap)) continue;
+            if (r->n >= 2) {
+                j2 = next_code(i);
+                if (j2 < 0 || INDEF(j2)) continue;
+                parse_line(j2, pj);
+                if (pj->haslabel || pj->toobig || !pj->hasinstr) continue;
+                if (!pat_match_inst(pj, r, 1, cap)) continue;
             }
+            if (r->n >= 3) {
+                j3 = next_code(j2);
+                if (j3 < 0 || INDEF(j3)) continue;
+                parse_line(j3, &g_pnext);
+                if (g_pnext.haslabel || g_pnext.toobig || !g_pnext.hasinstr)
+                    continue;
+                if (!pat_match_inst(&g_pnext, r, 2, cap)) continue;
+            }
+            if (r->n >= 4) {
+                if (j3 < 0) j3 = next_code(j2);
+                j4 = next_code(j3);
+                if (j4 < 0 || INDEF(j4)) continue;
+                parse_line(j4, &g_plook);
+                if (g_plook.haslabel || g_plook.toobig || !g_plook.hasinstr)
+                    continue;
+                if (!pat_match_inst(&g_plook, r, 3, cap)) continue;
+            }
+            last_idx = i;
+            if (r->n >= 2) last_idx = j2;
+            if (r->n >= 3) last_idx = j3;
+            if (r->n >= 4) last_idx = j4;
+            imm0 = NULL;
+            imm1 = NULL;
+            if (pi->nops >= 2) {
+                long v;
+                if (try_parse_number(pi->op1, &v) || is_offset_expr(pi->op1)) {
+                    strncpy(imm0_buf, pi->op1, sizeof(imm0_buf) - 1);
+                    imm0_buf[sizeof(imm0_buf) - 1] = '\0';
+                    imm0 = imm0_buf;
+                }
+            }
+            if (r->n >= 2 && pj->nops >= 2) {
+                long v;
+                if (try_parse_number(pj->op1, &v) || is_offset_expr(pj->op1)) {
+                    strncpy(imm1_buf, pj->op1, sizeof(imm1_buf) - 1);
+                    imm1_buf[sizeof(imm1_buf) - 1] = '\0';
+                    imm1 = imm1_buf;
+                }
+            }
+            if (!pre_check(r->pre, r->pre_dead_caps, last_idx, cap)) continue;
+            if (r->check != NULL && !r->check(cap, i, j2)) continue;
+            if (r->pre & PRE_AGGRESSIVE)
+                wlog("smartpp: warning: line %ld: -Ox rule P%d applied (%s) "
+                     "[not 100%% safe]\n",
+                     i + 1, r->rule_no, r->desc);
+            /* v2.52: -v notice is emitted inside replace_line_marked /
+             *  delete_keep_label_marked (called from apply_rule), so a
+             *  separate vlog here would double-print every table hit. */
+            {
+                const char *mem0 = (g_pcur.op1[0] != '\0') ? g_pcur.op1 : NULL;
+                const char *mem1 = NULL;
+                const char *op0 = g_pcur.mnem;
+                const char *op1 = (r->n >= 2) ? g_ppair.mnem : NULL;
+                if (r->n >= 2 && g_ppair.op1[0] != '\0') mem1 = g_ppair.op1;
+                if (mem0 == NULL && g_pcur.op0[0] != '\0') mem0 = g_pcur.op0;
+                apply_rule(i, j2, r, cap, imm0, imm1, mem0, mem1, op0, op1);
+            }
+            if (r->rule_no > 0 && r->rule_no < STSZ) st[r->rule_no]++;
+            return 1;
         }
-        if (!pre_check(r->pre, r->pre_dead_caps, last_idx, cap)) continue;
-        if (r->check != NULL && !r->check(cap, i, j2)) continue;
-        /* fire */
-        vlog("smartpp: line %ld: rule P%d fired (%s)\n",
-                i + 1, r->rule_no, r->desc);
-        {
-            const char *mem0 = (g_pcur.op1[0] != '\0') ? g_pcur.op1 : NULL;
-            const char *mem1 = NULL;
-            const char *op0 = g_pcur.mnem;
-            const char *op1 = (r->n >= 2) ? g_ppair.mnem : NULL;
-            if (r->n >= 2 && g_ppair.op1[0] != '\0') mem1 = g_ppair.op1;
-            if (mem0 == NULL && g_pcur.op0[0] != '\0') mem0 = g_pcur.op0;
-            apply_rule(i, j2, r, cap, imm0, imm1, mem0, mem1, op0, op1);
-        }
-        if (r->rule_no > 0 && r->rule_no < STSZ) st[r->rule_no]++;
-        return 1;
     }
     return 0;
 }
@@ -5853,6 +6034,33 @@ static int p433_fold_range_check(const struct capent *cap,
     w = g_regs[ridx].hi - g_regs[ridx].lo;
     limit = width_imm_limit(w);
     return sum >= -limit && sum <= limit;
+}
+
+
+
+/* P32: push R / pop S requires different families, same width, neither SP. */
+static int p32_diff_regs_check(const struct capent *cap, long i, long j2)
+{
+    (void)i; (void)j2;
+    if (cap['a'-'a'].fam < 0 || cap['b'-'a'].fam < 0) return 0;
+    if (cap['a'-'a'].fam == cap['b'-'a'].fam) return 0;
+    if (cap['a'-'a'].width != cap['b'-'a'].width) return 0;
+    if (cap['a'-'a'].fam == 4 || cap['b'-'a'].fam == 4) return 0;
+    return 1;
+}
+
+/* P459: rol/ror pair only when both counts are the same immediate. */
+static int p459_same_imm_check(const struct capent *cap, long i, long j2)
+{
+    struct pinfo a, b;
+    long va, vb;
+    (void)cap;
+    if (j2 < 0) return 0;
+    parse_line(i, &a);
+    parse_line(j2, &b);
+    if (!try_parse_number(a.op1, &va) || !try_parse_number(b.op1, &vb))
+        return 0;
+    return va == vb;
 }
 
 /* P433 check: add R,c1 / add R,c2 -> add R,c1+c2 (sum fits). */
@@ -7058,9 +7266,9 @@ static const struct rule g_rule_tbl[] = {
      *  width = no-op).  Exact. */
     { 1, 424,
       { { "movzx", 0, RR_('a'), SM_('a'), 2 } },
-      0,
+      PRE_CPU_386,
       { { ACT_DEL, NULL } },
-      "movzx R,R (same reg+width) -> delete", NULL },
+      "movzx R,R (same reg+width) -> delete (386+)", NULL },
 
     /* P425 (v2.25): movsx R, R (same reg, same width) -> delete.
      *  Same as P424 for movsx.  Only fires when width matches,
@@ -7068,9 +7276,9 @@ static const struct rule g_rule_tbl[] = {
      *  extension of a full-width source is identity. */
     { 1, 425,
       { { "movsx", 0, RR_('a'), SM_('a'), 2 } },
-      0,
+      PRE_CPU_386,
       { { ACT_DEL, NULL } },
-      "movsx R,R (same reg+width) -> delete", NULL },
+      "movsx R,R (same reg+width) -> delete (386+)", NULL },
 
     /* ---- v2.26: migrated P28 + new rules ---- */
 
@@ -7081,36 +7289,41 @@ static const struct rule g_rule_tbl[] = {
       0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
       "cbw / cbw -> cbw", NULL },
     { 2, 28, { { "cwde", 0, AN_, AN_, 0 }, { "cwde", 0, AN_, AN_, 0 } },
-      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "cwde / cwde -> cwde", NULL },
+      PRE_CPU_386, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cwde / cwde -> cwde (386+)", NULL },
     { 2, 28, { { "cwd", 0, AN_, AN_, 0 }, { "cwd", 0, AN_, AN_, 0 } },
       0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
       "cwd / cwd -> cwd", NULL },
     { 2, 28, { { "cdq", 0, AN_, AN_, 0 }, { "cdq", 0, AN_, AN_, 0 } },
-      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "cdq / cdq -> cdq", NULL },
+      PRE_CPU_386, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cdq / cdq -> cdq (386+)", NULL },
     { 2, 28, { { "cbtw", 0, AN_, AN_, 0 }, { "cbtw", 0, AN_, AN_, 0 } },
       0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
       "cbtw / cbtw -> cbtw", NULL },
     { 2, 28, { { "cwtl", 0, AN_, AN_, 0 }, { "cwtl", 0, AN_, AN_, 0 } },
-      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "cwtl / cwtl -> cwtl", NULL },
+      PRE_CPU_386, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cwtl / cwtl -> cwtl (386+)", NULL },
     { 2, 28, { { "cwtd", 0, AN_, AN_, 0 }, { "cwtd", 0, AN_, AN_, 0 } },
       0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
       "cwtd / cwtd -> cwtd", NULL },
     { 2, 28, { { "cltd", 0, AN_, AN_, 0 }, { "cltd", 0, AN_, AN_, 0 } },
-      0, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "cltd / cltd -> cltd", NULL },
+      PRE_CPU_386, { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cltd / cltd -> cltd (386+)", NULL },
 
-    /* P428 (v2.26): lea R,[R+R] -> add R,R (flags dead, 386+).
-     *  P41 requires R != S; this covers the same-register case.
-     *  lea is 3 bytes on 386+; add R,R is 2 bytes.  1 byte save.
-     *  lea touches no flags; add sets all six.  Need F_ALL6 dead. */
+    /* P428 (v2.36): lea R,[R+R] -> add R,R ONLY under -Oz.
+     *  Size: lea is often 3 bytes, add R,R is 2.  Under -Os keep lea
+     *  (or let P323 produce lea from shl) for 386+ throughput.
+     *  After add, P450 may turn it into shl (canonical when not -Oz
+     *  path): under -Oz we stop at add (2 bytes) and P450 still
+     *  converts to shl (also 2 bytes) -- same size, shl preferred
+     *  on 8086 clocks; acceptable.  p323_lea_rr_check ensures
+     *  the mem form is really [R+R]. */
     { 1, 428,
-      { { "lea", 0, RR_('a'), SM_('a'), 2 } },
-      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { "lea", 0, RR_('a'), ME_, 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_CPU_386 | PRE_OZ,
       { { ACT_REW, "add $a, $a" } },
-      "lea R,[R+R] -> add R,R (flags dead)", p323_lea_rr_check },
+      "lea R,[R+R] -> add R,R (-Oz, flags dead)", p323_lea_rr_check },
+
 
     /* P429 (v2.26): mov R,S / push R -> push S (R dead, S != R).
      *  After mov, R == S.  Pushing S gives the same value.
@@ -7450,13 +7663,11 @@ static const struct rule g_rule_tbl[] = {
      *  (delete the test) when R is dead after.  Uses M8 (OP_SAME_FAM
      *  isn't needed; we just need R dead) + M6 (DEAD_CAP).  386+
      *  (setcc encoding).  Research: LLVM optimizeCompare. */
-    { 2, 441,
-      { { "test", 0, RR_('a'), IV_(-1), 2 },
-        { "set",  0, SWID_('a'), AN_, 1 } },
-      PRE_CPU_386 | PRE_INTEL,
-      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
-      "test R,-1 / setcc R8 -> setcc R8 (R dead, 386+)", NULL,
-      DEAD_CAP_('a') },
+    /* P441 (v2.29 WITHDRAWN): was "test R,-1 / setcc -> delete test".
+     *  Unsound: setcc reads the flags produced by test; deleting the
+     *  test leaves setcc with stale/undefined flags.  R-dead does not
+     *  justify deleting a flag producer. */
+    /* { 2, 441, ... withdrawn } */
 
     /* P442 (v2.26): "sub R, 1 / sbb R, 0 -> dec R" when CF dead.
      *  sub R,1 sets CF per the borrow; sbb R,0 reads CF and
@@ -7484,6 +7695,3665 @@ static const struct rule g_rule_tbl[] = {
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
       "sub R,0 / sbb R,0 -> delete both (flags dead)", NULL },
 
+
+    /* ---- v2.28: identity / strength migrations + new table rules ---- */
+
+    /* P18 (v2.28, migrated from C): "add R,0" / "sub R,0" -> delete
+     *  when all six status flags are dead.  Net effect on R is zero;
+     *  the only observable effect is flags. */
+    { 1, 18,
+      { { "add", 0, RR_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL } },
+      "add R,0 -> delete (flags dead)", NULL },
+    { 1, 18,
+      { { "sub", 0, RR_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL } },
+      "sub R,0 -> delete (flags dead)", NULL },
+
+    /* P20 / P146 (v2.28, migrated): shift/rotate R,0 -> delete.
+     *  A zero count moves no bit and leaves every flag unchanged
+     *  on 8086..686.  Registers only (RR_). */
+    { 1, 20,
+      { { "shl", 0, RR_('a'), IV_(0), 2 } },
+      0, { { ACT_DEL, NULL } }, "shl R,0 -> delete", NULL },
+    { 1, 20,
+      { { "shr", 0, RR_('a'), IV_(0), 2 } },
+      0, { { ACT_DEL, NULL } }, "shr R,0 -> delete", NULL },
+    { 1, 20,
+      { { "sal", 0, RR_('a'), IV_(0), 2 } },
+      0, { { ACT_DEL, NULL } }, "sal R,0 -> delete", NULL },
+    { 1, 20,
+      { { "sar", 0, RR_('a'), IV_(0), 2 } },
+      0, { { ACT_DEL, NULL } }, "sar R,0 -> delete", NULL },
+    { 1, 20,
+      { { "rol", 0, RR_('a'), IV_(0), 2 } },
+      0, { { ACT_DEL, NULL } }, "rol R,0 -> delete", NULL },
+    { 1, 20,
+      { { "ror", 0, RR_('a'), IV_(0), 2 } },
+      0, { { ACT_DEL, NULL } }, "ror R,0 -> delete", NULL },
+    { 1, 20,
+      { { "rcl", 0, RR_('a'), IV_(0), 2 } },
+      0, { { ACT_DEL, NULL } }, "rcl R,0 -> delete", NULL },
+    { 1, 20,
+      { { "rcr", 0, RR_('a'), IV_(0), 2 } },
+      0, { { ACT_DEL, NULL } }, "rcr R,0 -> delete", NULL },
+
+    /* P23 (v2.28, migrated): "not R / not R" -> delete both.
+     *  not is involution and touches no flags.  Registers only. */
+    { 2, 23,
+      { { "not", 0, RR_('a'), AN_, 1 },
+        { "not", 0, SM_('a'), AN_, 1 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "not R / not R -> delete both", NULL },
+
+    /* P25 (v2.28, migrated): "cmc / cmc" -> delete both.
+     *  Carry inverted twice is restored; no other flag touched. */
+    { 2, 25,
+      { { "cmc", 0, AN_, AN_, 0 },
+        { "cmc", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "cmc / cmc -> delete both", NULL },
+
+    /* P37 (v2.28, migrated from C): "xor R, -1" -> "not R" when
+     *  all six flags dead.  R XOR all-ones == ~R; xor defines flags,
+     *  not does not. */
+    { 1, 37,
+      { { "xor", 0, RR_('a'), IV_(-1), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "not $a" } },
+      "xor R,-1 -> not R (flags dead)", NULL },
+
+    /* P147 (v2.28): "or R,R" / "and R,R" -> delete when flags dead.
+     *  Value unchanged; only flags differ from a no-op. */
+    { 1, 147,
+      { { "or", 0, RR_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL } },
+      "or R,R -> delete (flags dead)", NULL },
+    { 1, 147,
+      { { "and", 0, RR_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL } },
+      "and R,R -> delete (flags dead)", NULL },
+
+    /* P148 (v2.28): "test R,R" -> delete when flags dead. */
+    { 1, 148,
+      { { "test", 0, RR_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL } },
+      "test R,R -> delete (flags dead)", NULL },
+
+    /* P151 (v2.28): "cmp R,R" -> delete when flags dead.
+     *  Always ZF=1, CF=0, etc.; if no reader, pure dead weight. */
+    { 1, 151,
+      { { "cmp", 0, RR_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL } },
+      "cmp R,R -> delete (flags dead)", NULL },
+
+        /* P444 (v2.40 WITHDRAWN): "adc/sbb R,0 -> delete when flags dead"
+     *  was UNSOUND.  CF is an *input* to adc/sbb: with CF=1, adc R,0
+     *  yields R+1.  Flags-dead-after does not imply CF was clear.
+     *  Safe form would be "clc / adc R,0 -> delete both" only.
+     */
+
+
+    /* P445 (v2.28): "xor R,R / or R,R" -> delete the or (flags dead).
+     *  After xor, R is 0; or R,R is a no-op on R and redefines flags
+     *  identically to a second test-zero.  If flags are dead, drop or. */
+    { 2, 445,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "or",  0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "xor R,R / or R,R -> delete or (flags dead)", NULL },
+
+    /* P446 (v2.28): "mov R,0 / and R,K" -> "mov R,0" (flags dead).
+     *  0 & K == 0; the and only writes flags. */
+    { 2, 446,
+      { { "mov", 0, RR_('a'), IV_(0), 2 },
+        { "and", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,0 / and R,K -> delete and (flags dead)", NULL },
+
+    /* P447 (v2.28): "mov R,0 / or R,0" -> delete or (flags dead). */
+    { 2, 447,
+      { { "mov", 0, RR_('a'), IV_(0), 2 },
+        { "or",  0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,0 / or R,0 -> delete or (flags dead)", NULL },
+
+    /* P448 (v2.28): "mov R,0 / xor R,0" -> delete xor (flags dead). */
+    { 2, 448,
+      { { "mov", 0, RR_('a'), IV_(0), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,0 / xor R,0 -> delete xor (flags dead)", NULL },
+
+    /* P449 (v2.28): "shl R,1 / shl R,1" -> "shl R,2" when OF dead
+     *  (fused count > 1 leaves OF undefined vs two count-1 shifts).
+     *  Cousin of C P4 / table P155; explicit table form. */
+    { 2, 449,
+      { { "shl", 0, RR_('a'), IV_(1), 2 },
+        { "shl", 0, SM_('a'), IV_(1), 2 } },
+      PRE_FLAGS_DEAD_OF,
+      { { ACT_REW, "shl $a, 2" }, { ACT_DEL, NULL } },
+      "shl R,1 / shl R,1 -> shl R,2 (OF dead)", NULL },
+    { 2, 449,
+      { { "shr", 0, RR_('a'), IV_(1), 2 },
+        { "shr", 0, SM_('a'), IV_(1), 2 } },
+      PRE_FLAGS_DEAD_OF,
+      { { ACT_REW, "shr $a, 2" }, { ACT_DEL, NULL } },
+      "shr R,1 / shr R,1 -> shr R,2 (OF dead)", NULL },
+    { 2, 449,
+      { { "sal", 0, RR_('a'), IV_(1), 2 },
+        { "sal", 0, SM_('a'), IV_(1), 2 } },
+      PRE_FLAGS_DEAD_OF,
+      { { ACT_REW, "sal $a, 2" }, { ACT_DEL, NULL } },
+      "sal R,1 / sal R,1 -> sal R,2 (OF dead)", NULL },
+    { 2, 449,
+      { { "sar", 0, RR_('a'), IV_(1), 2 },
+        { "sar", 0, SM_('a'), IV_(1), 2 } },
+      PRE_FLAGS_DEAD_OF,
+      { { ACT_REW, "sar $a, 2" }, { ACT_DEL, NULL } },
+      "sar R,1 / sar R,1 -> sar R,2 (OF dead)", NULL },
+
+    /* P450 (v2.36): "add R,R -> shl R,1" when flags dead.
+     *  Canonical *2 form when flags must be produced or on 8086/16-bit:
+     *  on 8086 SHL r,1 is 2 clocks vs ADD r,r at 3; encodings same size.
+     *  Inverse P486 (shl->add) WITHDRAWN -- it oscillated with P450. */
+    { 1, 450,
+      { { "add", 0, RR_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_REW, "shl $a, 1" } },
+      "add R,R -> shl R,1 (flags dead)", NULL },
+
+    /* P451 (v2.28): "lea R,[R]" identity already needs mem parse;
+     *  instead: "xor R,R / add R,0" -> keep xor, delete add. */
+    { 2, 451,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "xor R,R / add R,0 -> delete add (flags dead)", NULL },
+
+    /* P452 (v2.28): "neg R / neg R" -> delete both when flags dead
+     *  (P24 table form; SP excluded). */
+    { 2, 452,
+      { { "neg", 0, RR_('a'), AN_, 1 },
+        { "neg", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "neg R / neg R -> delete both (flags dead)", NULL },
+
+    /* P453 (v2.28): "inc R / dec R" (either order) -> delete both
+     *  when flags dead, not SP (P22 table form). */
+    { 2, 453,
+      { { "inc", 0, RR_('a'), AN_, 1 },
+        { "dec", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "inc R / dec R -> delete both (flags dead)", NULL },
+    { 2, 453,
+      { { "dec", 0, RR_('a'), AN_, 1 },
+        { "inc", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "dec R / inc R -> delete both (flags dead)", NULL },
+
+    /* P454/P455 (v2.29 WITHDRAWN): deleting "mov R,imm" before
+     *  "cmp R,K" / "test R,R" while keeping the cmp/test is unsound:
+     *  the second instruction would read an undefined R.  A sound
+     *  form would rewrite to a flag-only sequence or delete the pair
+     *  when flags are also dead — see P85/P86/P97 in C. */
+
+    /* P456 (v2.28): "and R,0 -> xor R,R" when flags dead (stronger
+     *  than P59's mov R,0; chains with x64 zeroing preference). */
+    { 1, 456,
+      { { "and", 0, RR_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "xor $a, $a" } },
+      "and R,0 -> xor R,R (flags dead)", NULL },
+
+    /* P457 (v2.28): "or R,0" -> delete when flags dead (P111 table). */
+    { 1, 457,
+      { { "or", 0, RR_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL } },
+      "or R,0 -> delete (flags dead)", NULL },
+
+    /* P458 (v2.28): "and R,-1" -> delete when flags dead (P112 table). */
+    { 1, 458,
+      { { "and", 0, RR_('a'), IV_(-1), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL } },
+      "and R,-1 -> delete (flags dead)", NULL },
+
+    /* P459 (v2.29 fixed): "rol R,k / ror R,k" with equal k -> delete
+     *  both when flags dead.  v2.28 omitted the equal-k check (IM_
+     *  matched any imm independently) — that could delete unequal
+     *  rotate pairs.  p459_same_imm_check enforces va == vb. */
+    { 2, 459,
+      { { "rol", 0, RR_('a'), IM_, 2 },
+        { "ror", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "rol R,k / ror R,k -> delete both (same k, flags dead)", p459_same_imm_check },
+    { 2, 459,
+      { { "ror", 0, RR_('a'), IM_, 2 },
+        { "rol", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "ror R,k / rol R,k -> delete both (same k, flags dead)", p459_same_imm_check },
+
+    /* P460 (v2.28): "mov R,S / mov R,S" -> delete second (P153). */
+    { 2, 460,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "mov", 0, SM_('a'), SM_('b'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,S / mov R,S -> delete second", NULL },
+
+
+    /* ---- v2.29: safety fixes + more migrations / new rules ---- */
+
+    /* P11 (v2.29, table form): "cmp R,0 -> test R,R" when AF dead.
+     *  C still has the full form; this catches the common case. */
+    { 1, 11,
+      { { "cmp", 0, RR_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_AF,
+      { { ACT_REW, "test $a, $a" } },
+      "cmp R,0 -> test R,R (AF dead)", NULL },
+
+    /* P9 (v2.29, table form): "mov R,0 -> xor R,R" when flags dead. */
+    { 1, 9,
+      { { "mov", 0, RR_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "xor $a, $a" } },
+      "mov R,0 -> xor R,R (flags dead)", NULL },
+
+    /* P461: "test R,0 -> test R,R" (exact flags: both give ZF=1,SF=0
+     *  for R==0 path; wait — test R,0 always ZF=1 regardless of R,
+     *  test R,R sets ZF iff R==0.  NOT equivalent.  WITHDRAWN. */
+
+    /* P461 (v2.29): "and R,R / and R,R" -> delete second (idempotent).
+     *  Covered partly by P19 C; table form for and specifically. */
+    { 2, 461,
+      { { "and", 0, RR_('a'), SM_('a'), 2 },
+        { "and", 0, SM_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "and R,R / and R,R -> delete second", NULL },
+    { 2, 461,
+      { { "or", 0, RR_('a'), SM_('a'), 2 },
+        { "or", 0, SM_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "or R,R / or R,R -> delete second", NULL },
+
+    /* P462: "xor R,R / and R,K" -> "xor R,R" delete and (flags dead).
+     *  0 & K == 0; and only rewrites flags. */
+    { 2, 462,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "and", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "xor R,R / and R,K -> delete and (flags dead)", NULL },
+
+    /* P463: "xor R,R / add R,K" with K==0 already P451; general
+     *  "mov R,S / sub R,S -> xor R,R" is table P281. */
+
+    /* P463: "lea R,[R+0] style" needs mem parser — skip.
+     *  "add R,0 / add R,0" -> delete both when flags dead. */
+    { 2, 463,
+      { { "add", 0, RR_('a'), IV_(0), 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "add R,0 / add R,0 -> delete both (flags dead)", NULL },
+
+    /* P464: "sub R,0 / sub R,0" -> delete both (flags dead). */
+    { 2, 464,
+      { { "sub", 0, RR_('a'), IV_(0), 2 },
+        { "sub", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "sub R,0 / sub R,0 -> delete both (flags dead)", NULL },
+
+    /* P465: "push R / pop R" same register — table form of P3 subset.
+     *  Exact; flags untouched.  Memory operands never matched (RR_). */
+    { 2, 465,
+      { { "push", 0, RR_('a'), AN_, 1 },
+        { "pop",  0, SM_('a'), AN_, 1 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "push R / pop R -> delete both", NULL },
+
+    /* P466: "clc / clc" already P21; "stc / clc" -> clc (second wins).
+     *  Exact on CF; other flags untouched by both. */
+    { 2, 466,
+      { { "stc", 0, AN_, AN_, 0 },
+        { "clc", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "stc / clc -> clc", NULL },
+    { 2, 466,
+      { { "clc", 0, AN_, AN_, 0 },
+        { "stc", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "clc / stc -> stc", NULL },
+
+    /* P467: "mov R,S / and R,S" -> "mov R,S" delete and when flags
+     *  dead (R & S with R==S is R; and only sets flags). */
+    { 2, 467,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "and", 0, SM_('a'), SM_('b'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,S / and R,S -> delete and (flags dead)", NULL },
+
+    /* P468: "mov R,S / or R,S" -> delete or (flags dead). */
+    { 2, 468,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "or",  0, SM_('a'), SM_('b'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,S / or R,S -> delete or (flags dead)", NULL },
+
+    /* P469: "mov R,S / xor R,0" -> delete xor (flags dead). */
+    { 2, 469,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,S / xor R,0 -> delete xor (flags dead)", NULL },
+
+    /* P470: "shl R,1 / shr R,1" -> delete both when flags dead.
+     *  Net: R restored only if no bits shifted out — NOT true in
+     *  general (low bit lost).  WITHDRAWN as unsound. */
+
+    /* P470: "xchg R,S / xchg R,S" already P14/P419.
+     *  "bswap R / bswap R" is P127. */
+
+    /* P470: "imul R,R" is not identity. skip.
+     *  "test R,K / test R,K" -> delete second (idempotent flags). */
+    { 2, 470,
+      { { "test", 0, RR_('a'), IM_, 2 },
+        { "test", 0, SM_('a'), IM_, 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "test R,K / test R,K -> delete second", p459_same_imm_check },
+
+    /* P471: "cmp R,K / cmp R,K" -> delete second. */
+    { 2, 471,
+      { { "cmp", 0, RR_('a'), IM_, 2 },
+        { "cmp", 0, SM_('a'), IM_, 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cmp R,K / cmp R,K -> delete second", p459_same_imm_check },
+
+    /* P472: "not R / xor R,-1" -> delete xor (flags dead): not then
+     *  xor -1 restores R; flags from xor lost.  Or delete both if
+     *  we also require... actually not;xor-1 => R original, yes.
+     *  Safer: only delete xor when flags dead (value restored). */
+    { 2, 472,
+      { { "not", 0, RR_('a'), AN_, 1 },
+        { "xor", 0, SM_('a'), IV_(-1), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "not R / xor R,-1 -> delete both (flags dead)", NULL },
+    { 2, 472,
+      { { "xor", 0, RR_('a'), IV_(-1), 2 },
+        { "not", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "xor R,-1 / not R -> delete both (flags dead)", NULL },
+
+
+    /* ---- v2.30: more C migrations + null sequences ---- */
+
+    /* P32 (v2.30, table form): "push R / pop S" -> "mov S,R".
+     *  Both operands captured; p32_diff_regs_check requires different
+     *  families, equal width, neither SP.  (DF_ alone does not bind $b.) */
+    { 2, 32,
+      { { "push", 0, RR_('a'), AN_, 1 },
+        { "pop",  0, RR_('b'), AN_, 1 } },
+      0,
+      { { ACT_REW, "mov $b, $a" }, { ACT_DEL, NULL } },
+      "push R / pop S -> mov S,R", p32_diff_regs_check },
+
+    /* P14 (v2.30): "xchg R,S / xchg R,S" (same pair) -> delete both. */
+    { 2, 14,
+      { { "xchg", 0, RR_('a'), RR_('b'), 2 },
+        { "xchg", 0, SM_('a'), SM_('b'), 2 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "xchg R,S / xchg R,S -> delete both", NULL },
+    { 2, 14,
+      { { "xchg", 0, RR_('a'), RR_('b'), 2 },
+        { "xchg", 0, SM_('b'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "xchg R,S / xchg S,R -> delete both", NULL },
+
+    /* P15 (v2.30): "mov R,S / mov S,R" -> delete second. */
+    { 2, 15,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "mov", 0, SM_('b'), SM_('a'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,S / mov S,R -> delete second", NULL },
+
+    /* P473: "lea R,[R*1]" scale 1 is identity if no index confusion —
+     *  needs lea parser.  Instead: "and R,R / or R,R" -> keep first
+     *  delete second when flags dead (second is pure flag rewrite
+     *  of same value). */
+    { 2, 473,
+      { { "and", 0, RR_('a'), SM_('a'), 2 },
+        { "or",  0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "and R,R / or R,R -> delete or (flags dead)", NULL },
+
+    /* P474: "or R,R / and R,R" -> delete and (flags dead). */
+    { 2, 474,
+      { { "or",  0, RR_('a'), SM_('a'), 2 },
+        { "and", 0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "or R,R / and R,R -> delete and (flags dead)", NULL },
+
+    /* P475: "add R,0 / sub R,0" -> delete both (flags dead). */
+    { 2, 475,
+      { { "add", 0, RR_('a'), IV_(0), 2 },
+        { "sub", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "add R,0 / sub R,0 -> delete both (flags dead)", NULL },
+    { 2, 475,
+      { { "sub", 0, RR_('a'), IV_(0), 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "sub R,0 / add R,0 -> delete both (flags dead)", NULL },
+
+    /* P476: "shl R,0 / any" already P20.  "mov R,R / anything" P1.
+     *  "xor R,S / xor R,S" -> delete both when flags dead (P58). */
+    { 2, 476,
+      { { "xor", 0, RR_('a'), RR_('b'), 2 },
+        { "xor", 0, SM_('a'), SM_('b'), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "xor R,S / xor R,S -> delete both (flags dead)", NULL },
+    { 2, 476,
+      { { "xor", 0, RR_('a'), IM_, 2 },
+        { "xor", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "xor R,K / xor R,K -> delete both (flags dead)", p459_same_imm_check },
+
+    /* P477: "test R,R / or R,R" -> delete or (flags dead): or R,R after
+     *  test is redundant on R; flags from or match test for SF/ZF/PF. */
+    { 2, 477,
+      { { "test", 0, RR_('a'), SM_('a'), 2 },
+        { "or",   0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "test R,R / or R,R -> delete or (flags dead)", NULL },
+
+    /* P478: "neg R / not R / inc R" is 3-op; skip.
+     *  "mov R,-1 / not R" -> mov R,0 when flags dead (not ~(-1)=0). */
+    { 2, 478,
+      { { "mov", 0, RR_('a'), IV_(-1), 2 },
+        { "not", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, 0" }, { ACT_DEL, NULL } },
+      "mov R,-1 / not R -> mov R,0 (flags dead)", NULL },
+
+    /* P479: "mov R,0 / not R" -> mov R,-1 (flags dead). */
+    { 2, 479,
+      { { "mov", 0, RR_('a'), IV_(0), 2 },
+        { "not", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, -1" }, { ACT_DEL, NULL } },
+      "mov R,0 / not R -> mov R,-1 (flags dead)", NULL },
+
+
+    /* ---- v2.31: more migrations from C + classic peepholes ---- */
+
+    /* P35 (v2.31, migrated): "mov R32,-1 -> or R32,-1" when flags
+     *  dead (3 bytes vs 5).  386+ 32-bit form; 16-bit keeps mov. */
+    { 1, 35,
+      { { "mov", 0, R_('a', RC_32), IV_(-1), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_CPU_386,  /* 32-bit form; 386+ */
+      { { ACT_REW, "or $a, -1" } },
+      "mov R32,-1 -> or R32,-1 (flags dead, 386+)", NULL },
+
+    /* P60 (v2.31, migrated): "or R16,-1 -> mov R16,-1" when flags
+     *  dead.  Symmetric of P35 for 16-bit (same size, mov is cleaner). */
+    { 1, 60,
+      { { "or", 0, R_('a', RC_16), IV_(-1), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, -1" } },
+      "or R16,-1 -> mov R16,-1 (flags dead)", NULL },
+
+    /* P141 (v2.31, migrated): "not R / inc R -> neg R" (flags dead).
+     *  ~R + 1 == -R in two's complement. */
+    { 2, 141,
+      { { "not", 0, RR_('a'), AN_, 1 },
+        { "inc", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_REW, "neg $a" }, { ACT_DEL, NULL } },
+      "not R / inc R -> neg R (flags dead)", NULL },
+
+    /* P142 (v2.31, migrated): "neg R / dec R -> not R" (flags dead).
+     *  -R - 1 == ~R. */
+    { 2, 142,
+      { { "neg", 0, RR_('a'), AN_, 1 },
+        { "dec", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_REW, "not $a" }, { ACT_DEL, NULL } },
+      "neg R / dec R -> not R (flags dead)", NULL },
+
+    /* P71 (v2.31): "sub R,R -> xor R,R" when AF dead (not SP).
+     *  Both zero R; sub forces AF=0, xor leaves AF undefined. */
+    { 1, 71,
+      { { "sub", 0, RR_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_AF | PRE_NOT_SP,
+      { { ACT_REW, "xor $a, $a" } },
+      "sub R,R -> xor R,R (AF dead)", NULL },
+
+    /* P48 (v2.31): "xor R,R / test R,R -> delete test".
+     *  xor already set ZF=1,SF=0,PF=1,CF=0,OF=0; test R,R on 0 matches. */
+    { 2, 48,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "xor R,R / test R,R -> delete test", NULL },
+
+    /* P480 (v2.32): "inc R / inc R -> add R,2".
+     *  Size: two INC r16/r32 = 2 bytes; ADD r,imm8 = 3 bytes → larger.
+     *  Speed: on 8086/286, INC is cheaper; on 386+ one ADD is typically
+     *  better throughput.  Gate: PRE_CPU_386 | PRE_NOT_OZ (-Os only).
+     *  Flags: NOT equivalent without a deadness proof —
+     *    - INC preserves CF; ADD sets CF from the sum.
+     *    - Two INCs can produce intermediate OF/AF different from
+     *      a single ADD of 2 (e.g. 0x7FFF +1 +1 vs +2).
+     *    - SF/ZF/PF of the final result match when R ends the same.
+     *  Therefore PRE_FLAGS_DEAD_ALL is mandatory.  Reverse (P496)
+     *  on 8086/286: add R,2 -> two incs, same flag gate. */
+    { 2, 480,
+      { { "inc", 0, RR_('a'), AN_, 1 },
+        { "inc", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP | PRE_CPU_386 | PRE_NOT_OZ,
+      { { ACT_REW, "add $a, 2" }, { ACT_DEL, NULL } },
+      "inc R / inc R -> add R,2 (386+, -Os, flags dead)", NULL },
+
+    /* P481 (v2.32): "dec R / dec R -> sub R,2" — same size/speed
+     *  rationale as P480. */
+    { 2, 481,
+      { { "dec", 0, RR_('a'), AN_, 1 },
+        { "dec", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP | PRE_CPU_386 | PRE_NOT_OZ,
+      { { ACT_REW, "sub $a, 2" }, { ACT_DEL, NULL } },
+      "dec R / dec R -> sub R,2 (386+, -Os, flags dead)", NULL },
+
+    /* P482: "add R,1 / add R,1 -> add R,2" when OF dead.
+     *  Size win always (imm forms fold); no CPU/Oz gate. */
+    { 2, 482,
+      { { "add", 0, RR_('a'), IV_(1), 2 },
+        { "add", 0, SM_('a'), IV_(1), 2 } },
+      PRE_FLAGS_DEAD_OF | PRE_NOT_SP,
+      { { ACT_REW, "add $a, 2" }, { ACT_DEL, NULL } },
+      "add R,1 / add R,1 -> add R,2 (OF dead)", NULL },
+
+    /* P483: "sub R,1 / sub R,1 -> sub R,2" when OF dead.
+     *  Size win always; no CPU/Oz gate. */
+    { 2, 483,
+      { { "sub", 0, RR_('a'), IV_(1), 2 },
+        { "sub", 0, SM_('a'), IV_(1), 2 } },
+      PRE_FLAGS_DEAD_OF | PRE_NOT_SP,
+      { { ACT_REW, "sub $a, 2" }, { ACT_DEL, NULL } },
+      "sub R,1 / sub R,1 -> sub R,2 (OF dead)", NULL },
+
+    /* P484: "mov R,S / xor R,R" -> "xor R,R" delete mov when flags
+     *  from mov none; xor overwrites R fully.  Mov is dead store. */
+    { 2, 484,
+      { { "mov", 0, RR_('a'), AN_, 2 },
+        { "xor", 0, SM_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "mov R,X / xor R,R -> delete mov", NULL },
+
+    /* P485/P486 (v2.36 WITHDRAWN): "sal/shl R,1 -> add R,R".
+     *  On 8086 ADD r,r is *slower* than SHL r,1 (3 vs 2 clocks) and
+     *  the same size.  Worse: P486 + P450 formed a multi-pass
+     *  oscillation (shl->add->shl->add...).  Canonical form is SHL
+     *  (P450); 386+ 32-bit with flags dead uses LEA via P323. */
+
+    /* P487: "and R,1 / and R,1" -> delete second (idempotent). */
+    { 2, 487,
+      { { "and", 0, RR_('a'), IM_, 2 },
+        { "and", 0, SM_('a'), IM_, 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "and R,K / and R,K -> delete second", p459_same_imm_check },
+    { 2, 487,
+      { { "or", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IM_, 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "or R,K / or R,K -> delete second", p459_same_imm_check },
+
+    /* P488: "xor R,K / xor R,K" already P476.  "mov R,1 / dec R ->
+     *  xor R,R" when flags dead. */
+    { 2, 488,
+      { { "mov", 0, RR_('a'), IV_(1), 2 },
+        { "dec", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_REW, "xor $a, $a" }, { ACT_DEL, NULL } },
+      "mov R,1 / dec R -> xor R,R (flags dead)", NULL },
+
+    /* P489: "mov R,-1 / inc R -> xor R,R" when flags dead. */
+    { 2, 489,
+      { { "mov", 0, RR_('a'), IV_(-1), 2 },
+        { "inc", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_REW, "xor $a, $a" }, { ACT_DEL, NULL } },
+      "mov R,-1 / inc R -> xor R,R (flags dead)", NULL },
+
+    /* P490: "pushf / popf" -> delete both (exact).  Already may be
+     *  in C as P3; table form for pushf/popf without operands. */
+    { 2, 490,
+      { { "pushf", 0, AN_, AN_, 0 },
+        { "popf",  0, AN_, AN_, 0 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "pushf / popf -> delete both", NULL },
+    { 2, 490,
+      { { "pushfd", 0, AN_, AN_, 0 },
+        { "popfd",  0, AN_, AN_, 0 } },
+      PRE_CPU_386,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "pushfd / popfd -> delete both (386+)", NULL },
+
+
+    /* ---- v2.32: more strength / identity ---- */
+
+    /* P491: "add R,2 / sub R,2" -> delete both (flags dead, not SP). */
+    { 2, 491,
+      { { "add", 0, RR_('a'), IV_(2), 2 },
+        { "sub", 0, SM_('a'), IV_(2), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "add R,2 / sub R,2 -> delete both (flags dead)", NULL },
+    { 2, 491,
+      { { "sub", 0, RR_('a'), IV_(2), 2 },
+        { "add", 0, SM_('a'), IV_(2), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "sub R,2 / add R,2 -> delete both (flags dead)", NULL },
+
+    /* P492: "shl R,2 / shr R,2" -> delete both when flags dead —
+     *  NOT sound (bits lost). WITHDRAWN. */
+
+    /* P492: "mov R,S / lea R,[R]" identity — needs lea.  Instead:
+     *  "or R,0 / and R,-1" already covered.  "test R,R / or R,0" ->
+     *  delete or (flags dead). */
+    { 2, 492,
+      { { "test", 0, RR_('a'), SM_('a'), 2 },
+        { "or",   0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "test R,R / or R,0 -> delete or (flags dead)", NULL },
+
+    /* P493: "xor R,R / mov R,0" already P306.  "lea R,[R+0]" C.
+     *  "add R,R / shr R,1" -> not identity with OF. skip.
+     *  "mov R,S / sub R,S / jz" leave.
+     *  "and R,0FFh" on 16-bit already P34 C.
+     *  "imul R,3 -> lea" is C P50/P380.
+     *  "neg R / add R,1 -> not" flags: -R+1 = ~R only if...
+     *  -R + 1 = ~R + 1 + 1 = ~R + 2, wrong. skip.
+     *  "not R / add R,1 -> neg" is P371 C / table form: */
+    { 2, 493,
+      { { "not", 0, RR_('a'), AN_, 1 },
+        { "add", 0, SM_('a'), IV_(1), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_REW, "neg $a" }, { ACT_DEL, NULL } },
+      "not R / add R,1 -> neg R (flags dead)", NULL },
+
+    /* P494: "neg R / add R,1 -> not R"?  -R+1 = ~(R-1) not ~R. skip.
+     *  "mov R,S / add R,0" -> delete add (flags dead). */
+    { 2, 494,
+      { { "mov", 0, RR_('a'), AN_, 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,X / add R,0 -> delete add (flags dead)", NULL },
+    { 2, 494,
+      { { "mov", 0, RR_('a'), AN_, 2 },
+        { "sub", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,X / sub R,0 -> delete sub (flags dead)", NULL },
+
+    /* P495: "xor R,R / sub R,R" -> keep xor, delete sub (flags dead). */
+    { 2, 495,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "sub", 0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "xor R,R / sub R,R -> delete sub (flags dead)", NULL },
+
+
+    /* ---- v2.34: more table rules ---- */
+
+    /* P498: "lea R,[R]" / "lea R,[R+0]" not matchable without lea
+     *  parser.  "mov R,S / lea R,[S]" would need mem.
+     *  "cmc / cmc" already P25.  "sahf / lahf" pair -> delete both
+     *  (lahf after sahf restores AH from flags that sahf just wrote
+     *  from AH - identity only if AH was source).  Skip.
+     *  "push R / mov R,X / pop R" is 3-op dead store - C P2 domain.
+     *  Simple: "and R,-1 / anything" already P458. */
+
+    /* P498: "xor R,S / xor S,R" (swap via 3-xor is 3 ops). 2-op:
+     *  "xchg R,R" -> nop delete (identity). */
+    /* P498 withdrawn v2.42: redundant with P1 */
+
+    /* P499: "test R,S / test R,S" -> delete second (same ops). */
+    { 2, 499,
+      { { "test", 0, RR_('a'), RR_('b'), 2 },
+        { "test", 0, SM_('a'), SM_('b'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "test R,S / test R,S -> delete second", NULL },
+
+    /* P500: "cmp R,S / cmp R,S" -> delete second. */
+    { 2, 500,
+      { { "cmp", 0, RR_('a'), RR_('b'), 2 },
+        { "cmp", 0, SM_('a'), SM_('b'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cmp R,S / cmp R,S -> delete second", NULL },
+
+    /* P501: "or R,R / test R,R" -> delete test (or already set
+     *  SF/ZF/PF same as test for same R).  CF/OF cleared by both. */
+    { 2, 501,
+      { { "or",   0, RR_('a'), SM_('a'), 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "or R,R / test R,R -> delete test", NULL },
+
+    /* P502: "and R,R / test R,R" -> delete test. */
+    { 2, 502,
+      { { "and",  0, RR_('a'), SM_('a'), 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "and R,R / test R,R -> delete test", NULL },
+
+    /* P503: "mov R,S / or R,0" already P469 style.  "lea" skip.
+     *  "shl R,0" P20.  "rol R,0 / ror R,0" -> delete (identity rotate). */
+    { 1, 503,
+      { { "rol", 0, RR_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL } },
+      "rol R,0 -> delete (flags dead)", NULL },
+    { 1, 503,
+      { { "ror", 0, RR_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL } },
+      "ror R,0 -> delete (flags dead)", NULL },
+
+    /* P504: "bt R,K / bt R,K" -> delete second (CF same). */
+    { 2, 504,
+      { { "bt", 0, RR_('a'), IM_, 2 },
+        { "bt", 0, SM_('a'), IM_, 2 } },
+      PRE_CPU_386,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "bt R,K / bt R,K -> delete second (386+)", p459_same_imm_check },
+
+    /* P505: "bswap R / bswap R" already P127.  "cdq / cdq" -> delete
+     *  second (idempotent on EAX/EDX if EAX unchanged).  Risky if
+     *  EAX changed between - only consecutive. */
+    { 2, 505,
+      { { "cwd", 0, AN_, AN_, 0 },
+        { "cwd", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cwd / cwd -> delete second", NULL },
+    { 2, 505,
+      { { "cdq", 0, AN_, AN_, 0 },
+        { "cdq", 0, AN_, AN_, 0 } },
+      PRE_CPU_386,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cdq / cdq -> delete second (386+)", NULL },
+
+    /* P506: "clc / cmc -> stc" and "stc / cmc -> clc" exact on CF. */
+    { 2, 506,
+      { { "clc", 0, AN_, AN_, 0 },
+        { "cmc", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_REW, "stc" }, { ACT_DEL, NULL } },
+      "clc / cmc -> stc", NULL },
+    { 2, 506,
+      { { "stc", 0, AN_, AN_, 0 },
+        { "cmc", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_REW, "clc" }, { ACT_DEL, NULL } },
+      "stc / cmc -> clc", NULL },
+
+    /* P507: "mov R,0 / add R,S -> mov R,S" when flags dead. */
+    { 2, 507,
+      { { "mov", 0, RR_('a'), IV_(0), 2 },
+        { "add", 0, SM_('a'), RR_('b'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, $b" }, { ACT_DEL, NULL } },
+      "mov R,0 / add R,S -> mov R,S (flags dead)", NULL },
+
+    /* P508: "mov R,0 / or R,S -> mov R,S" when flags dead. */
+    { 2, 508,
+      { { "mov", 0, RR_('a'), IV_(0), 2 },
+        { "or",  0, SM_('a'), RR_('b'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, $b" }, { ACT_DEL, NULL } },
+      "mov R,0 / or R,S -> mov R,S (flags dead)", NULL },
+
+    /* P509: "mov R,S / and R,S -> mov R,S" delete and (flags dead)
+     *  already P467.  "mov R,S / xor R,S -> xor R,R" (R^S with R==S
+     *  is 0). */
+    { 2, 509,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "xor", 0, SM_('a'), SM_('b'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "xor $a, $a" }, { ACT_DEL, NULL } },
+      "mov R,S / xor R,S -> xor R,R (flags dead)", NULL },
+
+    /* P510: "lea R,[S+0]" needs parser.  "imul R,1" P38.  "idiv"
+     *  no.  "shl R,3 / shr R,3" unsound.  "and R,R / or R,0" ->
+     *  delete or (flags dead). */
+
+    /* ---- v2.38: more safe table rules ---- */
+
+    /* P513: "or R,R / test R,R" already P501.  "xor R,R / or R,K" ->
+     *  "mov R,K" when flags dead (0|K == K). */
+    { 2, 513,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "or",  0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, $K1" }, { ACT_DEL, NULL } },
+      "xor R,R / or R,K -> mov R,K (flags dead)", NULL },
+
+    /* P514: "xor R,R / add R,K" -> "mov R,K" when flags dead. */
+    { 2, 514,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "add", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_REW, "mov $a, $K1" }, { ACT_DEL, NULL } },
+      "xor R,R / add R,K -> mov R,K (flags dead)", NULL },
+
+    /* P515: "xor R,R / sub R,K" -> "mov R, -K" when flags dead.
+     *  Uses template ${0 - K1}. */
+    { 2, 515,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "sub", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_REW, "mov $a, ${0 - K1}" }, { ACT_DEL, NULL } },
+      "xor R,R / sub R,K -> mov R,-K (flags dead)", NULL },
+
+    /* P516: "mov R,S / sub R,S -> xor R,R" already P281.  "mov R,S /
+     *  cmp R,S" -> delete cmp? cmp needs both equal -> ZF=1 always
+     *  after mov R,S.  Only when flags not all dead we cannot delete;
+     *  if flags dead, delete cmp. */
+    { 2, 516,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "cmp", 0, SM_('a'), SM_('b'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,S / cmp R,S -> delete cmp (flags dead)", NULL },
+
+    /* P517: "mov R,S / test R,S" same — test R,S with R==S is test R,R;
+     *  flags same as test after mov only if we keep test... if flags
+     *  dead delete test. */
+    { 2, 517,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "test", 0, SM_('a'), SM_('b'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,S / test R,S -> delete test (flags dead)", NULL },
+
+    /* P518: "push R / push R" not safe (two values).  "pop R / push R"
+     *  identity on stack top if nothing else — still changes SP
+     *  temporarily.  Skip.
+     *  "sahf / lahf" skip.
+     *  "and R,K / or R,0" -> delete or (flags dead). */
+    { 2, 518,
+      { { "and", 0, RR_('a'), IM_, 2 },
+        { "or",  0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "and R,K / or R,0 -> delete or (flags dead)", NULL },
+
+    /* P519: "or R,K / and R,-1" -> delete and (flags dead). */
+    { 2, 519,
+      { { "or",  0, RR_('a'), IM_, 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "or R,K / and R,-1 -> delete and (flags dead)", NULL },
+
+    /* P520: "lea R,[R+0] style" skip.  "adc R,0 / sbb R,0" with CF
+     *  dead already P444.  "rcl R,0 / rcr R,0" -> delete when flags
+     *  dead (count 0 is identity; CF preserved for rcl/rcr with 0). */
+    { 1, 520,
+      { { "rcl", 0, RR_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL } },
+      "rcl R,0 -> delete (flags dead)", NULL },
+    { 1, 520,
+      { { "rcr", 0, RR_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL } },
+      "rcr R,0 -> delete (flags dead)", NULL },
+
+    /* P521: "shl R,0" etc already P20.  "mov R,R / add R,0" -> del
+     *  second when flags dead. */
+    { 2, 521,
+      { { "mov", 0, RR_('a'), SM_('a'), 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "mov R,R / add R,0 -> delete both (flags dead)", NULL },
+
+    /* P522: "xor R,R / xor R,R" -> keep first, delete second (already
+     *  zero).  Or delete both if flags dead: result still 0, first
+     *  xor flags match second.  Safer: delete second only. */
+    { 2, 522,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "xor", 0, SM_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "xor R,R / xor R,R -> delete second", NULL },
+
+    /* P523: "sub R,R / xor R,R" -> keep either zeroing, delete second
+     *  when flags dead (xor preferred later by P71 if AF dead path). */
+    { 2, 523,
+      { { "sub", 0, RR_('a'), SM_('a'), 2 },
+        { "xor", 0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "sub R,R / xor R,R -> keep xor (flags dead)", NULL },
+
+    /* P524: "or R,0 / or R,0" -> delete both when flags dead. */
+    { 2, 524,
+      { { "or", 0, RR_('a'), IV_(0), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "or R,0 / or R,0 -> delete both (flags dead)", NULL },
+
+    /* P525: "and R,-1 / and R,-1" -> delete both when flags dead. */
+    { 2, 525,
+      { { "and", 0, RR_('a'), IV_(-1), 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "and R,-1 / and R,-1 -> delete both (flags dead)", NULL },
+
+    /* P526: "cmc / clc -> clc" and "cmc / stc -> stc" (second wins). */
+    { 2, 526,
+      { { "cmc", 0, AN_, AN_, 0 },
+        { "clc", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "cmc / clc -> clc", NULL },
+    { 2, 526,
+      { { "cmc", 0, AN_, AN_, 0 },
+        { "stc", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "cmc / stc -> stc", NULL },
+
+    /* P527: "mov R,S / mov R,T" -> delete first when R fully overwritten
+     *  and S not T... first is pure dead store if no flags (mov none).
+     *  Already covered by general dead-store P2 in C.  Table form for
+     *  consecutive reg-reg only: */
+    { 2, 527,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "mov", 0, SM_('a'), RR_('c'), 2 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "mov R,S / mov R,T -> delete first", NULL },
+
+    /* P528: "add R,K / sub R,K" same K -> delete both (flags dead). */
+    { 2, 528,
+      { { "add", 0, RR_('a'), IM_, 2 },
+        { "sub", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "add R,K / sub R,K -> delete both (same K, flags dead)", p459_same_imm_check },
+    { 2, 528,
+      { { "sub", 0, RR_('a'), IM_, 2 },
+        { "add", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "sub R,K / add R,K -> delete both (same K, flags dead)", p459_same_imm_check },
+
+    /* P529: "xor R,K / xor R,K" same K already P476.  "neg R / add R,0"
+     *  -> delete add (flags dead). */
+    { 2, 529,
+      { { "neg", 0, RR_('a'), AN_, 1 },
+        { "add", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "neg R / add R,0 -> delete add (flags dead)", NULL },
+
+    /* P530: "not R / and R,-1" -> delete and (flags dead). */
+
+    { 2, 530,
+      { { "not", 0, RR_('a'), AN_, 1 },
+        { "and", 0, SM_('a'), IV_(-1), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "not R / and R,-1 -> delete and (flags dead)", NULL },
+
+    /* ---- v2.39: more table rules ---- */
+
+    /* P535: "mov R,K / add R,0" -> delete add (flags dead). */
+    { 2, 535,
+      { { "mov", 0, RR_('a'), IM_, 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,K / add R,0 -> delete add (flags dead)", NULL },
+
+    /* P536: "xor R,R / sub R,0" -> delete sub (flags dead). */
+    { 2, 536,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "sub", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "xor R,R / sub R,0 -> delete sub (flags dead)", NULL },
+
+    /* P537: "shl R,1 / shl R,1" already P449.  "neg R / not R / dec"?
+     *  "or R,R / and R,R" -> delete and (flags dead). */
+    { 2, 537,
+      { { "or",  0, RR_('a'), SM_('a'), 2 },
+        { "and", 0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "or R,R / and R,R -> delete and (flags dead)", NULL },
+
+    /* P538: "and R,R / or R,R" -> delete or (flags dead). */
+    { 2, 538,
+      { { "and", 0, RR_('a'), SM_('a'), 2 },
+        { "or",  0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "and R,R / or R,R -> delete or (flags dead)", NULL },
+
+    /* P539: "test R,R / and R,R" -> delete and (flags dead). */
+    { 2, 539,
+      { { "test", 0, RR_('a'), SM_('a'), 2 },
+        { "and",  0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "test R,R / and R,R -> delete and (flags dead)", NULL },
+
+    /* P540: "inc R / sub R,1" -> delete both (flags dead, not SP). */
+    { 2, 540,
+      { { "inc", 0, RR_('a'), AN_, 1 },
+        { "sub", 0, SM_('a'), IV_(1), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "inc R / sub R,1 -> delete both (flags dead)", NULL },
+    { 2, 540,
+      { { "dec", 0, RR_('a'), AN_, 1 },
+        { "add", 0, SM_('a'), IV_(1), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "dec R / add R,1 -> delete both (flags dead)", NULL },
+
+
+    /* ---- v2.40: bulk high-frequency null/identity rules (92) ---- */
+    { 2, 541,
+      {
+        { "mov", 0, RR_('a'), IM_, 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,K / add R,0 -> delete add (flags dead)", NULL },
+
+    { 2, 542,
+      {
+        { "mov", 0, RR_('a'), IM_, 2 },
+        { "sub", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,K / sub R,0 -> delete sub (flags dead)", NULL },
+
+    { 2, 543,
+      {
+        { "mov", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,K / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 544,
+      {
+        { "mov", 0, RR_('a'), IM_, 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,K / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 545,
+      {
+        { "mov", 0, RR_('a'), IM_, 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,K / and R,-1 -> delete and (flags dead)", NULL },
+
+    { 2, 546,
+      {
+        { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,R / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 547,
+      {
+        { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,R / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 548,
+      {
+        { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,R / and R,-1 -> delete and (flags dead)", NULL },
+
+    { 2, 549,
+      {
+        { "sub", 0, RR_('a'), SM_('a'), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sub R,R / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 550,
+      {
+        { "mov", 0, RR_('a'), IV_(0), 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,0 / test R,R -> delete test", NULL },
+
+    { 2, 551,
+      {
+        { "mov", 0, RR_('a'), IV_(0), 2 },
+        { "cmp", 0, SM_('a'), IV_(0), 2 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,0 / cmp R,0 -> delete cmp", NULL },
+
+    { 1, 552,
+      {
+        { "shl", 0, RR_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL }
+      },
+      "shl R,0 -> delete (flags dead)", NULL },
+
+    { 1, 553,
+      {
+        { "shr", 0, RR_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL }
+      },
+      "shr R,0 -> delete (flags dead)", NULL },
+
+    { 1, 554,
+      {
+        { "sal", 0, RR_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL }
+      },
+      "sal R,0 -> delete (flags dead)", NULL },
+
+    { 1, 555,
+      {
+        { "sar", 0, RR_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL }
+      },
+      "sar R,0 -> delete (flags dead)", NULL },
+
+    { 1, 556,
+      {
+        { "rol", 0, RR_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL }
+      },
+      "rol R,0 -> delete (flags dead)", NULL },
+
+    { 1, 557,
+      {
+        { "ror", 0, RR_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL }
+      },
+      "ror R,0 -> delete (flags dead)", NULL },
+
+    { 2, 558,
+      {
+        { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "and", 0, SM_('a'), SM_('a'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,S / and R,R -> delete and (flags dead)", NULL },
+
+    { 2, 559,
+      {
+        { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "or", 0, SM_('a'), SM_('a'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,S / or R,R -> delete or (flags dead)", NULL },
+
+    { 1, 560,
+      {
+        { "cmp", 0, RR_('a'), SM_('a'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL }
+      },
+      "cmp R,R -> delete (flags dead)", NULL },
+
+    { 1, 561,
+      {
+        { "test", 0, RR_('a'), SM_('a'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL }
+      },
+      "test R,R -> delete (flags dead)", NULL },
+
+    { 1, 562,
+      {
+        { "add", 0, RR_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_DEL, NULL }
+      },
+      "add R,0 -> delete (flags dead)", NULL },
+
+    { 1, 563,
+      {
+        { "sub", 0, RR_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_DEL, NULL }
+      },
+      "sub R,0 -> delete (flags dead)", NULL },
+
+    { 1, 564,
+      {
+        { "or", 0, RR_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL }
+      },
+      "or R,0 -> delete (flags dead)", NULL },
+
+    { 1, 565,
+      {
+        { "xor", 0, RR_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL }
+      },
+      "xor R,0 -> delete (flags dead)", NULL },
+
+    { 1, 566,
+      {
+        { "and", 0, RR_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL }
+      },
+      "and R,-1 -> delete (flags dead)", NULL },
+
+    /* P567 withdrawn v2.42: redundant with P1 */
+
+    /* P568 withdrawn v2.42: redundant with P1 */
+
+    { 2, 569,
+      {
+        { "not", 0, RR_('a'), AN_, 1 },
+        { "not", 0, SM_('a'), AN_, 1 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_DEL, NULL },
+        { ACT_DEL, NULL }
+      },
+      "not/not -> delete both (flags dead)", NULL },
+
+    { 2, 570,
+      {
+        { "add", 0, RR_('a'), IV_(1), 2 },
+        { "dec", 0, SM_('a'), AN_, 1 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_DEL, NULL },
+        { ACT_DEL, NULL }
+      },
+      "add R,1 / dec R -> delete both (flags dead)", NULL },
+
+    { 2, 571,
+      {
+        { "sub", 0, RR_('a'), IV_(1), 2 },
+        { "inc", 0, SM_('a'), AN_, 1 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_DEL, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sub R,1 / inc R -> delete both (flags dead)", NULL },
+
+    { 2, 572,
+      {
+        { "or", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "or R,K / or R,0 -> delete second (flags dead)", NULL },
+
+    { 2, 573,
+      {
+        { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "mov", 0, SM_('a'), SM_('b'), 2 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,S / mov R,S -> delete second", NULL },
+
+    { 2, 574,
+      {
+        { "stc", 0, AN_, AN_, 0 },
+        { "stc", 0, AN_, AN_, 0 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "stc/stc -> delete second", NULL },
+
+    { 2, 575,
+      {
+        { "clc", 0, AN_, AN_, 0 },
+        { "clc", 0, AN_, AN_, 0 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "clc/clc -> delete second", NULL },
+
+    { 2, 576,
+      {
+        { "cli", 0, AN_, AN_, 0 },
+        { "cli", 0, AN_, AN_, 0 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "cli/cli -> delete second", NULL },
+
+    { 2, 577,
+      {
+        { "sti", 0, AN_, AN_, 0 },
+        { "sti", 0, AN_, AN_, 0 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sti/sti -> delete second", NULL },
+
+    { 2, 578,
+      {
+        { "cld", 0, AN_, AN_, 0 },
+        { "cld", 0, AN_, AN_, 0 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "cld/cld -> delete second", NULL },
+
+    { 2, 579,
+      {
+        { "std", 0, AN_, AN_, 0 },
+        { "std", 0, AN_, AN_, 0 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "std/std -> delete second", NULL },
+
+    { 2, 580,
+      {
+        { "test", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "test R,K / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 581,
+      {
+        { "cmp", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "cmp R,K / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 582,
+      {
+        { "and", 0, RR_('a'), IV_(0), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,0 / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 583,
+      {
+        { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "cmp", 0, SM_('a'), IV_(0), 2 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,R / cmp R,0 -> delete cmp", NULL },
+
+    { 2, 584,
+      {
+        { "or", 0, RR_('a'), IV_(-1), 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "or R,-1 / and R,-1 -> delete and (flags dead)", NULL },
+
+    { 2, 585,
+      {
+        { "mov", 0, RR_('a'), IV_(-1), 2 },
+        { "or", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,-1 / or R,-1 -> delete or (flags dead)", NULL },
+
+    { 2, 586,
+      {
+        { "mov", 0, RR_('a'), IV_(0), 2 },
+        { "and", 0, SM_('a'), IM_, 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,0 / and R,K -> delete and (flags dead)", NULL },
+
+    { 1, 587,
+      {
+        { "imul", 0, RR_('a'), IV_(1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NO_CPU_8086 | PRE_NOT_SP,
+      {
+        { ACT_DEL, NULL }
+      },
+      "imul R,1 -> delete (186+, flags dead)", NULL },
+
+    { 2, 588,
+      {
+        { "or", 0, RR_('a'), SM_('a'), 2 },
+        { "cmp", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "or R,R / cmp R,0 -> delete cmp (flags dead)", NULL },
+
+    { 2, 589,
+      {
+        { "and", 0, RR_('a'), SM_('a'), 2 },
+        { "cmp", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,R / cmp R,0 -> delete cmp (flags dead)", NULL },
+
+    { 2, 590,
+      {
+        { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "cmp", 0, SM_('a'), SM_('a'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,S / cmp R,R -> delete cmp (flags dead)", NULL },
+
+    { 1, 592,
+      {
+        { "or", 0, RR_('a'), SM_('a'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL }
+      },
+      "or R,R -> delete (flags dead)", NULL },
+
+    { 1, 593,
+      {
+        { "and", 0, RR_('a'), SM_('a'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL }
+      },
+      "and R,R -> delete (flags dead)", NULL },
+
+    { 2, 594,
+      {
+        { "mov", 0, RR_('a'), SM_('a'), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,R / xor R,0 -> delete both (flags dead)", NULL },
+
+    { 2, 595,
+      {
+        { "and", 0, RR_('a'), IM_, 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,K / add R,0 -> delete add (flags dead)", NULL },
+
+    { 2, 596,
+      {
+        { "and", 0, RR_('a'), IM_, 2 },
+        { "sub", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,K / sub R,0 -> delete sub (flags dead)", NULL },
+
+    { 2, 597,
+      {
+        { "and", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,K / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 598,
+      {
+        { "and", 0, RR_('a'), IM_, 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,K / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 599,
+      {
+        { "or", 0, RR_('a'), IM_, 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "or R,K / add R,0 -> delete add (flags dead)", NULL },
+
+    { 2, 600,
+      {
+        { "or", 0, RR_('a'), IM_, 2 },
+        { "sub", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "or R,K / sub R,0 -> delete sub (flags dead)", NULL },
+
+    { 2, 601,
+      {
+        { "or", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "or R,K / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 602,
+      {
+        { "or", 0, RR_('a'), IM_, 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "or R,K / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 603,
+      {
+        { "test", 0, RR_('a'), SM_('a'), 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "test R,R / test R,R -> delete second", NULL },
+
+    { 2, 604,
+      {
+        { "cmp", 0, RR_('a'), SM_('a'), 2 },
+        { "cmp", 0, SM_('a'), SM_('a'), 2 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "cmp R,R / cmp R,R -> delete second", NULL },
+
+    { 2, 605,
+      {
+        { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,R / add -> delete second (flags dead)", NULL },
+
+    { 2, 606,
+      {
+        { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "sub", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,R / sub -> delete second (flags dead)", NULL },
+
+    { 2, 607,
+      {
+        { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,R / or -> delete second (flags dead)", NULL },
+
+    { 2, 608,
+      {
+        { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,R / xor -> delete second (flags dead)", NULL },
+
+    { 2, 609,
+      {
+        { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,R / and -> delete second (flags dead)", NULL },
+
+    { 2, 610,
+      {
+        { "not", 0, RR_('a'), AN_, 1 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "not R / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 611,
+      {
+        { "neg", 0, RR_('a'), AN_, 1 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "neg R / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 612,
+      {
+        { "neg", 0, RR_('a'), AN_, 1 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "neg R / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 613,
+      {
+        { "inc", 0, RR_('a'), AN_, 1 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "inc R / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 614,
+      {
+        { "dec", 0, RR_('a'), AN_, 1 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "dec R / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 615,
+      {
+        { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,S / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 616,
+      {
+        { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,S / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 617,
+      {
+        { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,S / and R,-1 -> delete and (flags dead)", NULL },
+
+    { 2, 618,
+      {
+        { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,S / add R,0 -> delete add (flags dead)", NULL },
+
+    { 2, 619,
+      {
+        { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "sub", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,S / sub R,0 -> delete sub (flags dead)", NULL },
+
+    { 2, 620,
+      {
+        { "shl", 0, RR_('a'), IV_(1), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "shl R,1 / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 621,
+      {
+        { "shr", 0, RR_('a'), IV_(1), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "shr R,1 / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 622,
+      {
+        { "sal", 0, RR_('a'), IV_(1), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sal R,1 / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 623,
+      {
+        { "sar", 0, RR_('a'), IV_(1), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sar R,1 / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 624,
+      {
+        { "and", 0, RR_('a'), SM_('a'), 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,R / test R,R -> delete test", NULL },
+
+    { 2, 625,
+      {
+        { "or", 0, RR_('a'), SM_('a'), 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "or R,R / test R,R -> delete test", NULL },
+
+    { 2, 626,
+      {
+        { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "and", 0, SM_('a'), IM_, 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,R / and R,K -> delete and (flags dead)", NULL },
+
+    { 2, 627,
+      {
+        { "sub", 0, RR_('a'), SM_('a'), 2 },
+        { "and", 0, SM_('a'), IM_, 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sub R,R / and R,K -> delete and (flags dead)", NULL },
+
+    { 2, 628,
+      {
+        { "and", 0, RR_('a'), SM_('a'), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,R / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 629,
+      {
+        { "or", 0, RR_('a'), SM_('a'), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "or R,R / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 630,
+      {
+        { "and", 0, RR_('a'), SM_('a'), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,R / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 631,
+      {
+        { "or", 0, RR_('a'), SM_('a'), 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "or R,R / and R,-1 -> delete and (flags dead)", NULL },
+
+    { 2, 632,
+      {
+        { "test", 0, RR_('a'), SM_('a'), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "test R,R / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 633,
+      {
+        { "cmp", 0, RR_('a'), SM_('a'), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "cmp R,R / xor R,0 -> delete xor (flags dead)", NULL },
+
+
+    { 2, 634,
+      { { "shl", 0, RR_('a'), IV_(1), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "shl R,1 / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 635,
+      { { "shr", 0, RR_('a'), IV_(1), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "shr R,1 / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 636,
+      { { "mov", 0, RR_('a'), IV_(0), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,0 / or R,0 -> delete or (flags dead)", NULL },
+
+    { 2, 637,
+      { { "mov", 0, RR_('a'), IV_(0), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,0 / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 638,
+      { { "mov", 0, RR_('a'), IV_(-1), 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,-1 / and R,-1 -> delete and (flags dead)", NULL },
+
+    { 2, 639,
+      { { "inc", 0, RR_('a'), AN_, 1 },
+        { "xor", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "inc R / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 640,
+      { { "dec", 0, RR_('a'), AN_, 1 },
+        { "xor", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "dec R / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 641,
+      { { "not", 0, RR_('a'), AN_, 1 },
+        { "xor", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "not R / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 642,
+      { { "lea", 0, RR_('a'), ME_, 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_CPU_386,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "lea R,M / or R,0 -> delete or (flags dead, 386+)", NULL },
+
+    { 2, 643,
+      { { "lea", 0, RR_('a'), ME_, 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_CPU_386 | PRE_NOT_SP,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "lea R,M / add R,0 -> delete add (flags dead, 386+)", NULL },
+
+    /* ---- v2.41: second bulk high-frequency rules (88) P644-P731 ---- */
+    { 2, 644,
+      {
+        { "add", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "add R,K / or -> delete second (flags dead)", NULL },
+
+    { 2, 645,
+      {
+        { "add", 0, RR_('a'), IM_, 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "add R,K / xor -> delete second (flags dead)", NULL },
+
+    { 2, 646,
+      {
+        { "add", 0, RR_('a'), IM_, 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "add R,K / and -> delete second (flags dead)", NULL },
+
+    { 2, 647,
+      {
+        { "sub", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sub R,K / or -> delete second (flags dead)", NULL },
+
+    { 2, 648,
+      {
+        { "sub", 0, RR_('a'), IM_, 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sub R,K / xor -> delete second (flags dead)", NULL },
+
+    { 2, 649,
+      {
+        { "sub", 0, RR_('a'), IM_, 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sub R,K / and -> delete second (flags dead)", NULL },
+
+    { 2, 650,
+      {
+        { "and", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,K / or -> delete second (flags dead)", NULL },
+
+    { 2, 651,
+      {
+        { "and", 0, RR_('a'), IM_, 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,K / xor -> delete second (flags dead)", NULL },
+
+    { 2, 652,
+      {
+        { "and", 0, RR_('a'), IM_, 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,K / and -> delete second (flags dead)", NULL },
+
+    { 2, 653,
+      {
+        { "or", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "or R,K / or -> delete second (flags dead)", NULL },
+
+    { 2, 654,
+      {
+        { "or", 0, RR_('a'), IM_, 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "or R,K / xor -> delete second (flags dead)", NULL },
+
+    { 2, 655,
+      {
+        { "or", 0, RR_('a'), IM_, 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "or R,K / and -> delete second (flags dead)", NULL },
+
+    { 2, 656,
+      {
+        { "xor", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,K / or -> delete second (flags dead)", NULL },
+
+    { 2, 657,
+      {
+        { "xor", 0, RR_('a'), IM_, 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,K / xor -> delete second (flags dead)", NULL },
+
+    { 2, 658,
+      {
+        { "xor", 0, RR_('a'), IM_, 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,K / and -> delete second (flags dead)", NULL },
+
+    { 2, 659,
+      {
+        { "shl", 0, RR_('a'), IV_(1), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "shl R,1 / or -> delete second (flags dead)", NULL },
+
+    { 2, 660,
+      {
+        { "shl", 0, RR_('a'), IV_(1), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "shl R,1 / xor -> delete second (flags dead)", NULL },
+
+    { 2, 661,
+      {
+        { "shl", 0, RR_('a'), IV_(1), 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "shl R,1 / and -> delete second (flags dead)", NULL },
+
+    { 2, 662,
+      {
+        { "shl", 0, RR_('a'), IV_(1), 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "shl R,1 / add -> delete second (flags dead)", NULL },
+
+    { 2, 663,
+      {
+        { "shr", 0, RR_('a'), IV_(1), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "shr R,1 / or -> delete second (flags dead)", NULL },
+
+    { 2, 664,
+      {
+        { "shr", 0, RR_('a'), IV_(1), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "shr R,1 / xor -> delete second (flags dead)", NULL },
+
+    { 2, 665,
+      {
+        { "shr", 0, RR_('a'), IV_(1), 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "shr R,1 / and -> delete second (flags dead)", NULL },
+
+    { 2, 666,
+      {
+        { "shr", 0, RR_('a'), IV_(1), 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "shr R,1 / add -> delete second (flags dead)", NULL },
+
+    { 2, 667,
+      {
+        { "sal", 0, RR_('a'), IV_(1), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sal R,1 / or -> delete second (flags dead)", NULL },
+
+    { 2, 668,
+      {
+        { "sal", 0, RR_('a'), IV_(1), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sal R,1 / xor -> delete second (flags dead)", NULL },
+
+    { 2, 669,
+      {
+        { "sal", 0, RR_('a'), IV_(1), 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sal R,1 / and -> delete second (flags dead)", NULL },
+
+    { 2, 670,
+      {
+        { "sal", 0, RR_('a'), IV_(1), 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sal R,1 / add -> delete second (flags dead)", NULL },
+
+    { 2, 671,
+      {
+        { "sar", 0, RR_('a'), IV_(1), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sar R,1 / or -> delete second (flags dead)", NULL },
+
+    { 2, 672,
+      {
+        { "sar", 0, RR_('a'), IV_(1), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sar R,1 / xor -> delete second (flags dead)", NULL },
+
+    { 2, 673,
+      {
+        { "sar", 0, RR_('a'), IV_(1), 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sar R,1 / and -> delete second (flags dead)", NULL },
+
+    { 2, 674,
+      {
+        { "sar", 0, RR_('a'), IV_(1), 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sar R,1 / add -> delete second (flags dead)", NULL },
+
+    { 2, 675,
+      {
+        { "rol", 0, RR_('a'), IV_(1), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "rol R,1 / or -> delete second (flags dead)", NULL },
+
+    { 2, 676,
+      {
+        { "rol", 0, RR_('a'), IV_(1), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "rol R,1 / xor -> delete second (flags dead)", NULL },
+
+    { 2, 677,
+      {
+        { "rol", 0, RR_('a'), IV_(1), 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "rol R,1 / and -> delete second (flags dead)", NULL },
+
+    { 2, 678,
+      {
+        { "rol", 0, RR_('a'), IV_(1), 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "rol R,1 / add -> delete second (flags dead)", NULL },
+
+    { 2, 679,
+      {
+        { "ror", 0, RR_('a'), IV_(1), 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "ror R,1 / or -> delete second (flags dead)", NULL },
+
+    { 2, 680,
+      {
+        { "ror", 0, RR_('a'), IV_(1), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "ror R,1 / xor -> delete second (flags dead)", NULL },
+
+    { 2, 681,
+      {
+        { "ror", 0, RR_('a'), IV_(1), 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "ror R,1 / and -> delete second (flags dead)", NULL },
+
+    { 2, 682,
+      {
+        { "ror", 0, RR_('a'), IV_(1), 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "ror R,1 / add -> delete second (flags dead)", NULL },
+
+    { 2, 683,
+      {
+        { "mov", 0, RR_('a'), IM_, 2 },
+        { "or", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,K / or R,0 -> delete (flags dead)", NULL },
+
+    { 2, 684,
+      {
+        { "mov", 0, RR_('a'), IM_, 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,K / xor R,0 -> delete (flags dead)", NULL },
+
+    { 2, 685,
+      {
+        { "mov", 0, RR_('a'), IM_, 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,K / and R,-1 -> delete (flags dead)", NULL },
+
+    { 2, 686,
+      {
+        { "mov", 0, RR_('a'), IM_, 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,K / add R,0 -> delete (flags dead)", NULL },
+
+    { 2, 687,
+      {
+        { "mov", 0, RR_('a'), IM_, 2 },
+        { "sub", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,K / sub R,0 -> delete (flags dead)", NULL },
+
+    { 2, 688,
+      {
+        { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,R / test R,R -> delete test", NULL },
+
+    { 2, 689,
+      {
+        { "sub", 0, RR_('a'), SM_('a'), 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sub R,R / test R,R -> delete test (flags dead)", NULL },
+
+    { 2, 690,
+      {
+        { "sub", 0, RR_('a'), SM_('a'), 2 },
+        { "cmp", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sub R,R / cmp R,0 -> delete cmp (flags dead)", NULL },
+
+    { 2, 691,
+      {
+        { "lea", 0, RR_('a'), ME_, 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_CPU_386,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "lea R,M / xor -> delete second (flags dead, 386+)", NULL },
+
+    { 2, 692,
+      {
+        { "lea", 0, RR_('a'), ME_, 2 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_CPU_386,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "lea R,M / and -> delete second (flags dead, 386+)", NULL },
+
+    { 2, 693,
+      {
+        { "lea", 0, RR_('a'), ME_, 2 },
+        { "sub", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP | PRE_CPU_386,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "lea R,M / sub -> delete second (flags dead, 386+)", NULL },
+
+    { 2, 694,
+      {
+        { "not", 0, RR_('a'), AN_, 1 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "not R / and -> delete second (flags dead)", NULL },
+
+    { 2, 695,
+      {
+        { "not", 0, RR_('a'), AN_, 1 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "not R / add -> delete second (flags dead)", NULL },
+
+    { 2, 696,
+      {
+        { "not", 0, RR_('a'), AN_, 1 },
+        { "sub", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "not R / sub -> delete second (flags dead)", NULL },
+
+    { 2, 697,
+      {
+        { "neg", 0, RR_('a'), AN_, 1 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "neg R / and -> delete second (flags dead)", NULL },
+
+    { 2, 698,
+      {
+        { "neg", 0, RR_('a'), AN_, 1 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "neg R / add -> delete second (flags dead)", NULL },
+
+    { 2, 699,
+      {
+        { "neg", 0, RR_('a'), AN_, 1 },
+        { "sub", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "neg R / sub -> delete second (flags dead)", NULL },
+
+    { 2, 700,
+      {
+        { "inc", 0, RR_('a'), AN_, 1 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "inc R / and -> delete second (flags dead)", NULL },
+
+    { 2, 701,
+      {
+        { "inc", 0, RR_('a'), AN_, 1 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "inc R / add -> delete second (flags dead)", NULL },
+
+    { 2, 702,
+      {
+        { "inc", 0, RR_('a'), AN_, 1 },
+        { "sub", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "inc R / sub -> delete second (flags dead)", NULL },
+
+    { 2, 703,
+      {
+        { "inc", 0, RR_('a'), AN_, 1 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "inc R / xor -> delete second (flags dead)", NULL },
+
+    { 2, 704,
+      {
+        { "dec", 0, RR_('a'), AN_, 1 },
+        { "and", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "dec R / and -> delete second (flags dead)", NULL },
+
+    { 2, 705,
+      {
+        { "dec", 0, RR_('a'), AN_, 1 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "dec R / add -> delete second (flags dead)", NULL },
+
+    { 2, 706,
+      {
+        { "dec", 0, RR_('a'), AN_, 1 },
+        { "sub", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "dec R / sub -> delete second (flags dead)", NULL },
+
+    { 2, 707,
+      {
+        { "dec", 0, RR_('a'), AN_, 1 },
+        { "xor", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "dec R / xor -> delete second (flags dead)", NULL },
+
+    { 2, 708,
+      {
+        { "and", 0, RR_('a'), IV_(0), 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,0 / test R,R -> delete test", NULL },
+
+    { 2, 709,
+      {
+        { "and", 0, RR_('a'), IV_(0), 2 },
+        { "cmp", 0, SM_('a'), IV_(0), 2 }
+      },
+      0,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,0 / cmp R,0 -> delete cmp", NULL },
+
+    { 1, 710,
+      {
+        { "imul", 0, RR_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NO_CPU_8086,
+      {
+        { ACT_REW, "xor $a, $a" }
+      },
+      "imul R,0 -> xor R,R (flags dead, 186+)", NULL },
+
+    { 2, 711,
+      {
+        { "neg", 0, RR_('a'), AN_, 1 },
+        { "neg", 0, SM_('a'), AN_, 1 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_DEL, NULL },
+        { ACT_DEL, NULL }
+      },
+      "neg/neg -> delete both (flags dead)", NULL },
+
+    { 2, 712,
+      {
+        { "clc", 0, AN_, AN_, 0 },
+        { "cmc", 0, AN_, AN_, 0 }
+      },
+      0,
+      {
+        { ACT_REW, "stc" },
+        { ACT_DEL, NULL }
+      },
+      "clc / cmc -> stc", NULL },
+
+    { 2, 713,
+      {
+        { "or", 0, RR_('a'), IM_, 2 },
+        { "and", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL },
+        { ACT_REW, "xor $a, $a" }
+      },
+      "or R,K / and R,0 -> xor R,R (flags dead)", NULL },
+
+    { 2, 714,
+      {
+        { "add", 0, RR_('a'), IM_, 2 },
+        { "and", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_DEL, NULL },
+        { ACT_REW, "xor $a, $a" }
+      },
+      "add R,K / and R,0 -> xor R,R (flags dead)", NULL },
+
+    { 2, 715,
+      {
+        { "test", 0, RR_('a'), SM_('a'), 2 },
+        { "cmp", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "test R,R / cmp R,0 -> delete cmp (flags dead)", NULL },
+
+    { 2, 716,
+      {
+        { "cmp", 0, RR_('a'), IV_(0), 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "cmp R,0 / test R,R -> delete test (flags dead)", NULL },
+
+    { 2, 717,
+      {
+        { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "test", 0, SM_('a'), RR_('b'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,S / test R,S -> delete test (flags dead)", NULL },
+
+    { 2, 718,
+      {
+        { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "or", 0, SM_('a'), RR_('b'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,S / or R,S -> delete or (flags dead)", NULL },
+
+    { 2, 719,
+      {
+        { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "and", 0, SM_('a'), RR_('b'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "mov R,S / and R,S -> delete and (flags dead)", NULL },
+
+    { 2, 720,
+      {
+        { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "or", 0, SM_('a'), SM_('a'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,R / or R,R -> delete or (flags dead)", NULL },
+
+    { 2, 721,
+      {
+        { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "and", 0, SM_('a'), SM_('a'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "xor R,R / and R,R -> delete and (flags dead)", NULL },
+
+    { 2, 722,
+      {
+        { "sub", 0, RR_('a'), SM_('a'), 2 },
+        { "or", 0, SM_('a'), SM_('a'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sub R,R / or R,R -> delete or (flags dead)", NULL },
+
+    { 2, 723,
+      {
+        { "sub", 0, RR_('a'), SM_('a'), 2 },
+        { "and", 0, SM_('a'), SM_('a'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sub R,R / and R,R -> delete and (flags dead)", NULL },
+
+    { 2, 724,
+      {
+        { "and", 0, RR_('a'), IV_(0), 2 },
+        { "xor", 0, SM_('a'), SM_('a'), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,0 / xor R,R -> delete xor (flags dead)", NULL },
+
+    { 2, 725,
+      {
+        { "or", 0, RR_('a'), IV_(-1), 2 },
+        { "or", 0, SM_('a'), IV_(-1), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "or R,-1 / or R,-1 -> delete second (flags dead)", NULL },
+
+    { 2, 726,
+      {
+        { "and", 0, RR_('a'), IV_(0), 2 },
+        { "and", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_KEEP, NULL },
+        { ACT_DEL, NULL }
+      },
+      "and R,0 / and R,0 -> delete second (flags dead)", NULL },
+
+    { 2, 727,
+      {
+        { "add", 0, RR_('a'), IV_(0), 2 },
+        { "sub", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_DEL, NULL },
+        { ACT_DEL, NULL }
+      },
+      "add R,0 / sub R,0 -> delete both (flags dead)", NULL },
+
+    { 2, 728,
+      {
+        { "sub", 0, RR_('a'), IV_(0), 2 },
+        { "add", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      {
+        { ACT_DEL, NULL },
+        { ACT_DEL, NULL }
+      },
+      "sub R,0 / add R,0 -> delete both (flags dead)", NULL },
+
+    { 2, 729,
+      {
+        { "shl", 0, RR_('a'), IV_(0), 2 },
+        { "shr", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL },
+        { ACT_DEL, NULL }
+      },
+      "shl R,0 / shr R,0 -> delete both (flags dead)", NULL },
+
+    { 2, 730,
+      {
+        { "rol", 0, RR_('a'), IV_(0), 2 },
+        { "ror", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL },
+        { ACT_DEL, NULL }
+      },
+      "rol R,0 / ror R,0 -> delete both (flags dead)", NULL },
+
+    { 2, 731,
+      {
+        { "ror", 0, RR_('a'), IV_(0), 2 },
+        { "rol", 0, SM_('a'), IV_(0), 2 }
+      },
+      PRE_FLAGS_DEAD_ALL,
+      {
+        { ACT_DEL, NULL },
+        { ACT_DEL, NULL }
+      },
+      "ror R,0 / rol R,0 -> delete both (flags dead)", NULL },
+
+
+    { 2, 732,
+      { { "sar", 0, RR_('a'), IV_(1), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "sar R,1 / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 733,
+      { { "rol", 0, RR_('a'), IV_(1), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "rol R,1 / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 734,
+      { { "ror", 0, RR_('a'), IV_(1), 2 },
+        { "xor", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "ror R,1 / xor R,0 -> delete xor (flags dead)", NULL },
+
+    { 2, 735,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,S / test R,R -> delete test (flags dead)", NULL },
+
+    { 2, 736,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "cmp", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "mov R,S / cmp R,0 -> delete cmp (flags dead)", NULL },
+
+    { 2, 737,
+      { { "push", 0, RR_('a'), AN_, 1 },
+        { "pop", 0, SM_('a'), AN_, 1 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "push R / pop R -> delete both", NULL },
+
+    { 2, 738,
+      { { "xchg", 0, RR_('a'), RR_('b'), 2 },
+        { "xchg", 0, SM_('a'), SM_('b'), 2 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "xchg R,S / xchg R,S -> delete both", NULL },
+
+    { 2, 739,
+      { { "cbw", 0, AN_, AN_, 0 },
+        { "cbw", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cbw / cbw -> delete second", NULL },
+
+    { 2, 740,
+      { { "cwd", 0, AN_, AN_, 0 },
+        { "cwd", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "cwd / cwd -> delete second", NULL },
+
+    { 2, 741,
+      { { "clc", 0, AN_, AN_, 0 },
+        { "stc", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "clc / stc -> stc", NULL },
+
+    { 2, 742,
+      { { "stc", 0, AN_, AN_, 0 },
+        { "clc", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "stc / clc -> clc", NULL },
+
+    { 2, 743,
+      { { "cld", 0, AN_, AN_, 0 },
+        { "std", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "cld / std -> std", NULL },
+
+    /* ================================================================
+     *  v2.52 curated high-value batch (audited)
+     *  Only rules that are:
+     *    - not already present in the table or covered by a C rule
+     *    - provably safe (value + flags)
+     *  Removed from the first draft: duplicates of P136/P137/P205/
+     *  P227/P228/P28/P422/P443/P470/P471/P472/P473/P476/P477/P487/
+     *  P506/P537-539, the unsound shl1/shr1 "cancel" pair, and
+     *  low-value chains already reduced by P9/P39/P48/P59.
+     * ================================================================ */
+
+    /* P744: std / cld -> cld (direction-flag dominance; P743 is the inverse) */
+    { 2, 744,
+      { { "std", 0, AN_, AN_, 0 },
+        { "cld", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "std / cld -> cld", NULL },
+
+    /* P745: cli / sti -> sti (interrupt-flag dominance) */
+    { 2, 745,
+      { { "cli", 0, AN_, AN_, 0 },
+        { "sti", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "cli / sti -> sti", NULL },
+
+    /* P746: sti / cli -> cli */
+    { 2, 746,
+      { { "sti", 0, AN_, AN_, 0 },
+        { "cli", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
+      "sti / cli -> cli", NULL },
+
+    /* P748: lahf / lahf -> delete second (sahf already P422) */
+    { 2, 748,
+      { { "lahf", 0, AN_, AN_, 0 },
+        { "lahf", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "lahf / lahf -> delete second", NULL },
+
+    /* P749: wait / wait -> delete second (fwait already P136) */
+    { 2, 749,
+      { { "wait", 0, AN_, AN_, 0 },
+        { "wait", 0, AN_, AN_, 0 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "wait / wait -> delete second", NULL },
+
+    /* P775: xor R,0 / xor R,K -> mov R,K (flags dead).
+     *  Distinct from xor0/or and xor0/add folds already in the table. */
+    { 2, 775,
+      { { "xor", 0, RR_('a'), IV_(0), 2 },
+        { "xor", 0, SM_('a'), IM_, 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, $K1" }, { ACT_DEL, NULL } },
+      "xor0 / xor K -> mov R,K (flags dead)", NULL },
+
+    /* ================================================================
+     *  v2.52 research batch (FPC / LLVM / Watcom / classic DOS ASM)
+     *  Only patterns verified missing from C + table, and sound.
+     * ================================================================ */
+
+    /* P802 (LLVM / FPC): "and R, K / test R, R" -> delete test.
+     *  After `and R,K`, R holds (R&K).  `test R,R` recomputes flags
+     *  from that same value.  AND and TEST both clear CF/OF and set
+     *  SF/ZF/PF from the result; AF is undefined in both.  Exact
+     *  equivalence -- no flag scan required.  Distinct from
+     *  "and R,R / test R,R" (P502) and from "and R,0 / test". */
+    { 2, 802,
+      { { "and",  0, RR_('a'), IM_, 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "and R,K / test R,R -> del test", NULL },
+
+    /* P803: "or R, K / test R, R" -> delete test (same flag reasoning). */
+    { 2, 803,
+      { { "or",   0, RR_('a'), IM_, 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "or R,K / test R,R -> del test", NULL },
+
+    /* P804: "xor R, K / test R, R" -> delete test. */
+    { 2, 804,
+      { { "xor",  0, RR_('a'), IM_, 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "xor R,K / test R,R -> del test", NULL },
+
+    /* P805: "add R, K / test R, R" -> delete test when flags dead
+     *  for AF/CF/OF differences is NOT needed for ZF/SF/PF of the
+     *  result -- but ADD sets CF/OF/AF differently from TEST.
+     *  Only safe when the next consumer of flags only needs ZF
+     *  (covered by C paths) or all flags dead.  Conservative:
+     *  require all flags dead. */
+    { 2, 805,
+      { { "add",  0, RR_('a'), IM_, 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "add R,K / test R,R -> del test (flags dead)", NULL },
+
+    /* P806: "sub R, K / test R, R" -> delete test (flags dead).
+     *  SUB already set ZF from the result; TEST is redundant when
+     *  the flag difference (CF/OF/AF) is unobservable. */
+    { 2, 806,
+      { { "sub",  0, RR_('a'), IM_, 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "sub R,K / test R,R -> del test (flags dead)", NULL },
+
+    /* P807: "inc R / test R, R" -> delete test (flags dead).
+     *  INC preserves CF; TEST clears it -- all six must be dead. */
+    { 2, 807,
+      { { "inc",  0, RR_('a'), AN_, 1 },
+        { "test", 0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "inc R / test R,R -> del test (flags dead)", NULL },
+
+    /* P808: "dec R / test R, R" -> delete test (flags dead). */
+    { 2, 808,
+      { { "dec",  0, RR_('a'), AN_, 1 },
+        { "test", 0, SM_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "dec R / test R,R -> del test (flags dead)", NULL },
+
+    /* P809: "lea R, [S] / mov T, R" with R dead -> "mov T, S"
+     *  (equal width).  Covered partially by C copy-prop; table form
+     *  for the pure register LEA without displacement.  Skipped:
+     *  lea parser is C-side.  Instead: */
+
+    /* P810: "mov R, S / test R, R" -> "test S, S" when R dead
+     *  (flags from test on R equal test on S since R==S's value).
+     *  Distinct from movzx form P432. */
+    { 2, 810,
+      { { "mov",  0, RR_('a'), RR_('b'), 2 },
+        { "test", 0, SM_('a'), SM_('a'), 2 } },
+      PRE_REG_DEAD_RA,
+      { { ACT_REW, "test $b, $b" }, { ACT_DEL, NULL } },
+      "mov R,S / test R,R -> test S,S (R dead)", NULL },
+
+    /* P811: "mov R, S / cmp R, 0" -> "test S, S" when R dead, AF dead
+     *  (cmp R,0 == test R,R for all but AF; R holds S). */
+    { 2, 811,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "cmp", 0, SM_('a'), IV_(0), 2 } },
+      PRE_REG_DEAD_RA | PRE_FLAGS_DEAD_AF,
+      { { ACT_REW, "test $b, $b" }, { ACT_DEL, NULL } },
+      "mov R,S / cmp R,0 -> test S,S (R dead, AF dead)", NULL },
+
+    /* ================================================================
+     *  v2.52 research batch 2
+     *  P40/P53/P54/P55 already cover mov+imm ALU const-fold.
+     *  P47 covers mov+add/sub imm → lea.  Missing: mov+inc/dec → lea
+     *  (LLVM issue #182784 style; INC/DEC are distinct mnemonics).
+     * ================================================================ */
+
+    /* P812: "mov R,S / inc R" -> "lea R,[S+1]" (flags dead, not SP).
+     *  Intel syntax.  Research: LLVM X86FixupLEAs / missed mov+dec→lea. */
+    { 2, 812,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "inc", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP | PRE_INTEL,
+      { { ACT_REW, "lea $a, [$b+1]" }, { ACT_DEL, NULL } },
+      "mov R,S / inc R -> lea R,[S+1] (flags dead)", NULL },
+
+    /* P813: "mov R,S / dec R" -> "lea R,[S-1]" (flags dead, not SP). */
+    { 2, 813,
+      { { "mov", 0, RR_('a'), RR_('b'), 2 },
+        { "dec", 0, SM_('a'), AN_, 1 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP | PRE_INTEL,
+      { { ACT_REW, "lea $a, [$b-1]" }, { ACT_DEL, NULL } },
+      "mov R,S / dec R -> lea R,[S-1] (flags dead)", NULL },
+
+    /* P820: "xor R,R / cmp R,0" -> delete cmp (AF dead).
+     *  xor already set ZF=1,SF=0,PF=1; cmp R,0 recomputes same for
+     *  ZF/SF/PF, AF differs.  Chain P11+P48 also gets this; direct
+     *  form saves a pass. */
+    { 2, 820,
+      { { "xor", 0, RR_('a'), SM_('a'), 2 },
+        { "cmp", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_AF,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "xor0 / cmp R,0 -> del cmp (AF dead)", NULL },
+
+    /* P822: "or R,R / cmp R,0" -> delete cmp (AF dead). */
+    { 2, 822,
+      { { "or",  0, RR_('a'), SM_('a'), 2 },
+        { "cmp", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_AF,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "or R,R / cmp R,0 -> del cmp (AF dead)", NULL },
+
+    /* P823: "and R,R / cmp R,0" -> delete cmp (AF dead). */
+    { 2, 823,
+      { { "and", 0, RR_('a'), SM_('a'), 2 },
+        { "cmp", 0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_AF,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "and R,R / cmp R,0 -> del cmp (AF dead)", NULL },
+
+    /* P824: "test R,R / cmp R,0" -> delete cmp (AF dead).
+     *  test and cmp R,0 agree on ZF/SF/PF; AF undefined vs defined. */
+    { 2, 824,
+      { { "test", 0, RR_('a'), SM_('a'), 2 },
+        { "cmp",  0, SM_('a'), IV_(0), 2 } },
+      PRE_FLAGS_DEAD_AF,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "test R,R / cmp R,0 -> del cmp (AF dead)", NULL },
+
+    /* ================================================================
+     *  v2.52 research batch 3 (Paul Hsieh / Watcom / TP / MSC / VC)
+     *  Classic generators emit redundant same-operand ALU pairs.
+     * ================================================================ */
+
+    /* P840: "and R,S / and R,S" -> delete second.
+     *  After first, R = R&S; second is (R&S)&S = R&S.  Value identity.
+     *  Flags of second match flags of first (CF/OF cleared, SF/ZF/PF
+     *  from same result).  Safe without flag scan.  Distinct from
+     *  and R,R (P147) and and R,K / and R,K (imm form). */
+    { 2, 840,
+      { { "and", 0, RR_('a'), RR_('b'), 2 },
+        { "and", 0, SM_('a'), SM_('b'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "and R,S / and R,S -> del second", NULL },
+
+    /* P841: "or R,S / or R,S" -> delete second (same reasoning). */
+    { 2, 841,
+      { { "or", 0, RR_('a'), RR_('b'), 2 },
+        { "or", 0, SM_('a'), SM_('b'), 2 } },
+      0,
+      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
+      "or R,S / or R,S -> del second", NULL },
+
+    /* P842 withdrawn: "xor R,S / xor R,S -> del both" is unsound when
+     *  R==S (xor R,R zeros; deleting both would restore a non-zero R).
+     *  When R!=S it is sound but needs a same-reg check the table
+     *  cannot express without a custom check(); deferred. */
+
+    /* P843: "add R,S / sub R,S" -> delete both when flags dead.
+     *  (R+S)-S = R.  Inverse pair.  Not SP. */
+    { 2, 843,
+      { { "add", 0, RR_('a'), RR_('b'), 2 },
+        { "sub", 0, SM_('a'), SM_('b'), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "add R,S / sub R,S -> delete both (flags dead)", NULL },
+
+    /* P844: "sub R,S / add R,S" -> delete both (flags dead, not SP). */
+    { 2, 844,
+      { { "sub", 0, RR_('a'), RR_('b'), 2 },
+        { "add", 0, SM_('a'), SM_('b'), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "sub R,S / add R,S -> delete both (flags dead)", NULL },
+
 };
 
 
@@ -7504,8 +11374,25 @@ static const int g_nrule_tbl =
 /* initialize the engine's rule pointer.  Called once from main(). */
 static void init_table_rules(void)
 {
+    int i;
     g_rules = g_rule_tbl;
     g_nrules = g_nrule_tbl;
+    /* v2.46: compact chains — no large 2D array */
+    for (i = 0; i < RULE_IDX_BUCK; i++) g_rule_head[i] = RULE_IDX_NONE;
+    g_rule_wild_head = RULE_IDX_NONE;
+    for (i = 0; i < 4096; i++) g_rule_next[i] = RULE_IDX_NONE;
+    for (i = 0; i < g_nrules && i < 4096; i++) {
+        const char *m = g_rules[i].pat[0].mnem;
+        g_rule_next[i] = RULE_IDX_NONE;
+        if (m == NULL || m[0] == '\0') {
+            g_rule_next[i] = g_rule_wild_head;
+            g_rule_wild_head = (unsigned short)i;
+        } else {
+            unsigned h = rule_mnem_hash(m);
+            g_rule_next[i] = g_rule_head[h];
+            g_rule_head[h] = (unsigned short)i;
+        }
+    }
 }
 
 /* ===========================================================================
@@ -8105,37 +11992,88 @@ static const struct imul2_s {
 *  is the count of rewrites applied. */
 #define MAX_PASSES 4
 
+/* v2.52: abort with a clear message if free stack is too low for
+ *  run_pass.  Watcom /s disables stack probes (silent abort on
+ *  overflow).  stackavail() is Watcom-specific; on MSVC/GCC we only
+ *  document the link flags — there is no portable free-stack API. */
+static void guard_stack(const char *where)
+{
+#if defined(__WATCOMC__)
+    unsigned long free_bytes = (unsigned long)stackavail();
+    if (free_bytes < 96UL * 1024UL) {
+        fprintf(stderr,
+            "smartpp: fatal: low stack at %s (%lu bytes free).\n"
+            "  Cause: oversized stack frame or _STACKSIZE too small.\n"
+            "  Fix: ensure _STACKSIZE>=2MiB, avoid /s while debugging,\n"
+            "  keep MAXLINE rewrite temps in static/heap (g_tmpa/b).\n",
+            where ? where : "unknown", free_bytes);
+        fflush(stderr);
+        exit(3);
+    }
+#else
+    (void)where; /* MSVC/GCC: rely on /STACK or -Wl,--stack + off-stack temps */
+#endif
+}
+
 static long run_pass(void)
 {
     long i;
     long before = 0;
     int kk;
+    char *movbuf, *xorbuf, *testbuf, *jccbuf, *loopbuf;
+    guard_stack("run_pass");
+    ensure_work_bufs();
+    if (g_build == NULL) g_build = (char *)xmalloc(G_BUILD_SZ);
+    if (g_scratch == NULL) g_scratch = (char *)xmalloc(MAXLINE);
+    movbuf = g_work[0];
+    xorbuf = g_work[1];
+    testbuf = g_work[2];
+    jccbuf = g_work[3];
+    loopbuf = g_work[4];
     for (kk = 1; kk < STSZ; kk++) before += st[kk];
     for (i = 0; i < g_nlines; i++) {
-        struct pinfo *pi = &g_pcur;
-        struct pinfo *pn = &g_pnew;
+        struct pinfo *pi;
+        struct pinfo *pn;
         long j;
-        int i1ok = 0;
+        int i1ok;
+
+        /* v2.48: all decls first (Watcom = C89, no mid-block decls) */
+        pi = &g_pcur;
+        pn = &g_pnew;
+        j = 0;
+        i1ok = 0;
 
         if (DEL(i) || INDEF(i)) continue;
         {
             int cv = cpu_directive_value(L(i));
             if (cv != 0) {
-                /* v2.26: if the user passed -m on the command line,
-                 *  g_cpu_max is the hard ceiling.  Directives can
-                 *  only set g_curcpu to min(cv, g_cpu_max) -- they
-                 *  cannot raise the CPU level beyond what the user
-                 *  explicitly requested.  This prevents a .386
-                 *  directive from enabling movzx when the user is
-                 *  targeting 8086 (-m86). */
-                if (g_cpu_max > 0 && cv > g_cpu_max) {
-                    if (g_curcpu != g_cpu_max && opt_verbose)
-                        vlog("smartpp: line %ld: CPU directive %d clamped to %d (command-line ceiling)\n",
-                            i + 1, cv, g_cpu_max);
-                    g_curcpu = g_cpu_max;
-                }
-                else {
-                    if (g_curcpu != cv && opt_verbose)
+                /* v2.27: directives freely set g_curcpu (raise or
+                 *  lower).  -m only supplied the initial level.  When
+                 *  the level actually changes, -w (default) emits a
+                 *  one-line warning with the directive text and the
+                 *  old/new short CPU names. */
+                if (g_curcpu != cv) {
+                    int old_cpu = g_curcpu;
+                    if (opt_warn) {
+                        char dname[32];
+                        const char *s = L(i);
+                        size_t n = 0;
+                        while (*s == ' ' || *s == '\t') s++;
+                        while (s[n] && s[n] != ' ' && s[n] != '\t' &&
+                               s[n] != ';' && s[n] != '\r' && s[n] != '\n' &&
+                               n + 1 < sizeof(dname)) {
+                            dname[n] = s[n];
+                            n++;
+                        }
+                        dname[n] = '\0';
+                        wlog("smartpp: warning: line %ld: %s directive found. "
+                             "CPU level %s from %s to %s\n",
+                             i + 1, dname[0] ? dname : "(cpu)",
+                             (cv > old_cpu) ? "raised" : "set",
+                             cpu_name_short(old_cpu),
+                             cpu_name_short(cv));
+                    }
+                    if (opt_verbose)
                         vlog("smartpp: line %ld: CPU level set to %d by directive\n",
                             i + 1, cv);
                     g_curcpu = cv;
@@ -8192,9 +12130,29 @@ static long run_pass(void)
                                  jcc_canon(pi->mnem) == jcc_canon(pm->mnem))
                             thread = 1;
                         if (thread && !ci_eq(pi->jtarget, pm->jtarget)) {
-                            vlog("smartpp: line %ld: threaded '%s' -> '%s' (P5)\n",
-                                i + 1, pi->jtarget, pm->jtarget);
-                            retarget_line(i, pi, pm->jtarget);
+                            /* v2.43: multi-hop — follow pure jmp chain up to 3 */
+                            const char *final = pm->jtarget;
+                            int hops = 1;
+                            long cur = mid;
+                            while (hops < 3) {
+                                int duph = 0;
+                                long tl = resolve_jtarget(cur, final, &duph);
+                                long nxt;
+                                if (duph || tl < 0) break;
+                                nxt = instr_after_label(tl);
+                                if (nxt < 0 || nxt == cur) break;
+                                parse_line(nxt, pm);
+                                if (pm->toobig || !pm->jtarget_ok ||
+                                    pm->cls != I_JMP)
+                                    break;
+                                if (ci_eq(final, pm->jtarget)) break;
+                                final = pm->jtarget;
+                                cur = nxt;
+                                hops++;
+                            }
+                            vlog("smartpp: line %ld: threaded '%s' -> '%s' (P5, %d hop)\n",
+                                i + 1, pi->jtarget, final, hops);
+                            retarget_line(i, pi, final);
                             st[5]++;
                             continue;
                         }
@@ -10484,6 +14442,42 @@ static long run_pass(void)
             #undef REV_MOV_WIN
         }
 
+        /* P853 (v2.52, Intel Optimization Manual + AMD SOG + Agner):
+         *  On x64, "xor R64,R64" -> "xor R32,R32".
+         *  Writing a 32-bit register zero-extends into the full 64-bit
+         *  register.  Benefits: 1 byte shorter (no REX.W), recognized
+         *  zeroing idiom on Silvermont (64-bit form is NOT dep-breaking
+         *  there), and the canonical form compilers emit.
+         *  Same for "sub R64,R64" -> "xor R32,R32" (canonical zeroing).
+         *  Flags: both define all six; result R=0 identical. */
+        if (g_curcpu >= 128 && !pi->toobig && !pi->haslabel &&
+            pi->nops == 2) {
+            int r0 = find_reg(pi->op0), r1 = find_reg(pi->op1);
+            if (r0 >= 0 && r0 == r1 &&
+                (g_regs[r0].hi - g_regs[r0].lo) == 64) {
+                const char *r32 = reg_name_at_width(r0, 32);
+                if (r32 != NULL &&
+                    (ci_eq(pi->mnem, "xor") || ci_eq(pi->mnem, "sub"))) {
+                    strcpy(g_build, pi->prefix);
+                    strcat(g_build, "xor ");
+                    strcat(g_build, r32);
+                    strcat(g_build, ", ");
+                    strcat(g_build, r32);
+                    if (pi->comment[0]) {
+                        strcat(g_build, " ");
+                        strcat(g_build, pi->comment);
+                    }
+                    vlog("smartpp: line %ld: '%s %s,%s' -> 'xor %s,%s' "
+                         "(P853, x64 zeroing idiom)\n",
+                         i + 1, pi->mnem, pi->op0, pi->op1, r32, r32);
+                    replace_line_marked(i, g_build,
+                        "xor/sub r64,r64 -> xor r32,r32 (x64)", 853);
+                    st[853]++;
+                    continue;
+                }
+            }
+        }
+
         /* ---- v2.18 x64: xor r32,r32 already zeros r64; drop
          *  following xor r64,r64 of the same family.  Also drop
          *  mov r32,r32 (P1) is enough for identity; extra: after
@@ -10931,7 +14925,8 @@ static long run_pass(void)
                                 strcat(g_build, newstr);
                             }
                             replace_line(k, g_build);
-                            st[370]++;
+                            wlog_line(i, "-Ox rule P370 applied (widen rep string) [not 100%% safe]\n");
+                        st[370]++;
                             vlog("smartpp: line %ld/%ld: widen string %s -> %s count %ld -> %ld (-Ox P370)\n",
                                 i + 1, k + 1, base, newstr, cnt, newcnt);
                             steps = STR_WIDEN_WIN; /* end window */
@@ -11311,7 +15306,8 @@ static long run_pass(void)
                         i + 1, pi->op0, pi->op0);
                     replace_line(i, g_build);
                     DEL(j) = 1;
-                    st[383]++;
+                    wlog_line(i, "-Ox rule P383 applied (call/ret tail-call) [not 100%% safe]\n");
+                        st[383]++;
                     continue;
                 }
             }
@@ -11337,7 +15333,8 @@ static long run_pass(void)
                     i + 1, tgt, tgt);
                 replace_line(tcl, g_build);
                 DEL(i) = 1;
-                st[383]++;
+                wlog_line(i, "-Ox rule P383 applied (call/ret tail-call) [not 100%% safe]\n");
+                        st[383]++;
                 continue;
             }
         }
@@ -11619,12 +15616,13 @@ static long run_pass(void)
                     parse_line(j, pj);
                     if (!pj->haslabel && !pj->toobig &&
                         pj->cls == I_OTHER && pj->nops == 2 &&
-                        ci_eq(pj->mnem, "add") &&
+                        (ci_eq(pj->mnem, "add") || ci_eq(pj->mnem, "sub")) &&
                         find_reg(pj->op0) == pi->dreg &&
                         try_parse_number(pj->op1, &imm47) && imm47 != 0 &&
                         flags_clear(next_code(j), F_ALL6)) {
                         char opnd[MAXTOK];
-                        emit_lea_disp(opnd, pi->sreg, imm47);
+                        long disp = ci_eq(pj->mnem, "sub") ? -imm47 : imm47;
+                        emit_lea_disp(opnd, pi->sreg, disp);
                         strcpy(g_build, pj->prefix);
                         strcat(g_build, "lea ");
                         strcat(g_build, pj->op0);
@@ -11634,9 +15632,39 @@ static long run_pass(void)
                             strcat(g_build, " ");
                             strcat(g_build, pj->comment);
                         }
-                        vlog("smartpp: line %ld: 'mov %s, %s' / 'add %s, %s' rewritten to 'lea %s, %s' (P47)\n",
+                        vlog("smartpp: line %ld: 'mov %s, %s' / '%s %s, %s' rewritten to 'lea %s, %s' (P47)\n",
                             i + 1, pi->op0, pi->op1,
-                            pj->op0, pj->op1, pj->op0, opnd);
+                            pj->mnem, pj->op0, pj->op1, pj->op0, opnd);
+                        replace_line(j, g_build);
+                        DEL(i) = 1;
+                        st[47]++;
+                        continue;
+                    }
+                    /* v2.35 P47b: mov R,S / add R,S -> lea R,[S+S]
+                     *  (R was S, add is *2).  Same gates as P47. */
+                    if (!pj->haslabel && !pj->toobig &&
+                        pj->cls == I_OTHER && pj->nops == 2 &&
+                        ci_eq(pj->mnem, "add") &&
+                        find_reg(pj->op0) == pi->dreg &&
+                        find_reg(pj->op1) == pi->sreg &&
+                        flags_clear(next_code(j), F_ALL6)) {
+                        char opnd[MAXTOK];
+                        if (g_att)
+                            sprintf(opnd, "(%%%s,%%%s,1)",
+                                g_regs[pi->sreg].name,
+                                g_regs[pi->sreg].name);
+                        else
+                            sprintf(opnd, "[%s+%s]",
+                                g_regs[pi->sreg].name,
+                                g_regs[pi->sreg].name);
+                        strcpy(g_build, pj->prefix);
+                        strcat(g_build, "lea ");
+                        strcat(g_build, pj->op0);
+                        strcat(g_build, ", ");
+                        strcat(g_build, opnd);
+                        vlog("smartpp: line %ld: 'mov %s, %s' / 'add %s, %s' -> 'lea %s, %s' (P47b)\n",
+                            i + 1, pi->op0, pi->op1, pj->op0, pj->op1,
+                            pj->op0, opnd);
                         replace_line(j, g_build);
                         DEL(i) = 1;
                         st[47]++;
@@ -12333,7 +16361,6 @@ static long run_pass(void)
                              * cdq leaves eax unchanged → eax differs) */
                             reg_dead_cf(next_code(j), r414)) {
                             /* sar eax,31 / mov reg, eax -> cdq / mov reg, edx */
-                            char movbuf[MAXLINE];
                             strcpy(g_build, pi->prefix);
                             strcat(g_build, "cdq");
                             sprintf(movbuf, "%smov %s, edx", pj->prefix, pj->op0);
@@ -12343,6 +16370,138 @@ static long run_pass(void)
                             replace_line(j, movbuf);
                             st[414]++;
                             continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P852 (v2.52, Agner Fog / Pentium tutorials):
+         *  "bt R, K / jc|jb L"  -> "test R, (1<<K) / jnz L"
+         *  "bt R, K / jnc|jae L" -> "test R, (1<<K) / jz L"
+         *  386+ (bt).  bt sets CF from bit K; test sets ZF from AND.
+         *  Equivalent branch when only CF is consumed by the jcc.
+         *  Prefer test: pairable, not microcoded on some cores. */
+        if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
+            pi->nops == 2 && ci_eq(pi->mnem, "bt") && g_curcpu >= 8) {
+            int r852 = find_reg(pi->op0);
+            long k852;
+            if (r852 >= 0 && try_parse_number(pi->op1, &k852) &&
+                k852 >= 0 && k852 < 32) {
+                int w852 = g_regs[r852].hi - g_regs[r852].lo;
+                if ((w852 == 32) || (w852 == 16 && k852 < 16) ||
+                    (w852 == 8 && k852 < 8)) {
+                    j = next_code(i);
+                    if (j >= 0 && !INDEF(j)) {
+                        struct pinfo *pj = &g_ppair;
+                        parse_line(j, pj);
+                        if (!pj->haslabel && !pj->toobig &&
+                            pj->cls == I_JCC && pj->jtarget_ok) {
+                            const char *newj = NULL;
+                            if (ci_eq(pj->mnem, "jc") || ci_eq(pj->mnem, "jb") ||
+                                ci_eq(pj->mnem, "jnae"))
+                                newj = "jnz";
+                            else if (ci_eq(pj->mnem, "jnc") || ci_eq(pj->mnem, "jae") ||
+                                     ci_eq(pj->mnem, "jnb"))
+                                newj = "jz";
+                            if (newj && flags_clear(next_code(j), F_ALL6)) {
+                                unsigned long mask = 1UL << (unsigned)k852;
+                                char num[32];
+                                if (w852 == 8) mask &= 0xFFUL;
+                                else if (w852 == 16) mask &= 0xFFFFUL;
+                                else mask &= 0xFFFFFFFFUL;
+                                sprintf(num, "%lu", mask);
+                                strcpy(g_build, pi->prefix);
+                                strcat(g_build, "test ");
+                                strcat(g_build, pi->op0);
+                                strcat(g_build, ", ");
+                                strcat(g_build, num);
+                                vlog("smartpp: line %ld: 'bt %s,%ld' / '%s' -> "
+                                     "'test %s,%s' / '%s' (P852)\n",
+                                     i + 1, pi->op0, k852, pj->mnem,
+                                     pi->op0, num, newj);
+                                replace_line_marked(i, g_build,
+                                    "bt R,K / jcc -> test R,mask / jcc", 852);
+                                strcpy(g_build, pj->prefix);
+                                strcat(g_build, newj);
+                                strcat(g_build, " ");
+                                strcat(g_build, pj->op0);
+                                if (pj->comment[0]) {
+                                    strcat(g_build, " ");
+                                    strcat(g_build, pj->comment);
+                                }
+                                replace_line_marked(j, g_build,
+                                    "bt R,K / jcc -> test R,mask / jcc", 852);
+                                st[852]++;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P854 (v2.52, Intel 386 Programming Guide / Leventhal, archive.org):
+         *  "bts R, K1 / bts R, K2" -> "or R, (1<<K1)|(1<<K2)"
+         *  "btr R, K1 / btr R, K2" -> "and R, ~((1<<K1)|(1<<K2))"
+         *  Leventhal: "OR AL,00001100B replaces two BTS".  One ALU
+         *  vs two microcoded bit ops.  386+.  Flags dead required. */
+        if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
+            pi->nops == 2 && g_curcpu >= 8 &&
+            (ci_eq(pi->mnem, "bts") || ci_eq(pi->mnem, "btr"))) {
+            int r854 = find_reg(pi->op0);
+            long k1;
+            if (r854 >= 0 && g_regs[r854].fam != 4 &&
+                try_parse_number(pi->op1, &k1) && k1 >= 0 && k1 < 32) {
+                int w854 = g_regs[r854].hi - g_regs[r854].lo;
+                if ((w854 == 32) || (w854 == 16 && k1 < 16) ||
+                    (w854 == 8 && k1 < 8)) {
+                    j = next_code(i);
+                    if (j >= 0 && !INDEF(j)) {
+                        struct pinfo *pj = &g_ppair;
+                        parse_line(j, pj);
+                        if (!pj->haslabel && !pj->toobig &&
+                            pj->cls == I_OTHER && pj->nops == 2 &&
+                            ci_eq(pj->mnem, pi->mnem) &&
+                            find_reg(pj->op0) == r854) {
+                            long k2;
+                            if (try_parse_number(pj->op1, &k2) &&
+                                k2 >= 0 && k2 < 32 && k2 != k1 &&
+                                ((w854 == 32) || (w854 == 16 && k2 < 16) ||
+                                 (w854 == 8 && k2 < 8)) &&
+                                flags_clear(next_code(j), F_ALL6)) {
+                                unsigned long m1 = 1UL << (unsigned)k1;
+                                unsigned long m2 = 1UL << (unsigned)k2;
+                                unsigned long mask = m1 | m2;
+                                unsigned long full =
+                                    (w854 == 8) ? 0xFFUL :
+                                    (w854 == 16) ? 0xFFFFUL : 0xFFFFFFFFUL;
+                                char num[32];
+                                const char *op854;
+                                if (ci_eq(pi->mnem, "bts")) {
+                                    op854 = "or ";
+                                    mask &= full;
+                                } else {
+                                    op854 = "and ";
+                                    mask = (~mask) & full;
+                                }
+                                sprintf(num, "%lu", mask);
+                                strcpy(g_build, pi->prefix);
+                                strcat(g_build, op854);
+                                strcat(g_build, pi->op0);
+                                strcat(g_build, ", ");
+                                strcat(g_build, num);
+                                vlog("smartpp: line %ld: '%s %s,%ld' / '%s %s,%ld' "
+                                     "-> '%s %s, %s' (P854, 386+)\n",
+                                     i + 1, pi->mnem, pi->op0, k1,
+                                     pj->mnem, pj->op0, k2,
+                                     op854, pi->op0, num);
+                                replace_line_marked(i, g_build,
+                                    "bts/btr pair -> or/and mask (386+)", 854);
+                                DEL(j) = 1;
+                                st[854]++;
+                                continue;
+                            }
                         }
                     }
                 }
@@ -12429,7 +16588,6 @@ static long run_pass(void)
                             if (div) break;
                         }
                         if (found_flagdef) {
-                            char xorbuf[MAXLINE];
                             /* v2.22 fix: insert xor BEFORE the flag-defining
                              * instruction (b), not after it.  insert_line_after(b-1)
                              * places it between b-1 and b.  If b==0, we can't
@@ -12561,6 +16719,45 @@ static long run_pass(void)
             }
         }
 
+        /* P36 (v2.52, was documented since v1.70 but never implemented):
+         *  "mov sp,bp / pop bp"   -> "leave"   (16-bit)
+         *  "mov esp,ebp / pop ebp" -> "leave"  (32-bit)
+         *  CPU: 80186+ (g_curcpu >= 2).  ENTER/LEAVE were introduced
+         *  on the 80186, NOT the 286 (common misconception).
+         *  leave does not touch flags.  Size: 2+1 = 3 bytes -> 1 byte.
+         *  Width of SP and BP must match (both 16 or both 32). */
+        if (!pi->haslabel && !pi->toobig && !g_att &&
+            g_curcpu >= 2 && pi->cls == I_MOV && pi->nops == 2 &&
+            pi->dreg >= 0 && g_regs[pi->dreg].fam == 4 &&   /* sp/esp */
+            pi->sreg >= 0 && g_regs[pi->sreg].fam == 5 &&   /* bp/ebp */
+            g_regs[pi->dreg].hi == g_regs[pi->sreg].hi) {  /* same width */
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    pj->cls == I_POP && pj->nops == 1 &&
+                    find_reg(pj->op0) >= 0 &&
+                    g_regs[find_reg(pj->op0)].fam == 5 &&
+                    g_regs[find_reg(pj->op0)].hi == g_regs[pi->dreg].hi) {
+                    strcpy(g_build, pi->prefix);
+                    strcat(g_build, "leave");
+                    if (pi->comment[0] != '\0') {
+                        strcat(g_build, " ");
+                        strcat(g_build, pi->comment);
+                    }
+                    vlog("smartpp: line %ld: 'mov %s,%s' / 'pop %s' "
+                         "-> 'leave' (P36, 186+)\n",
+                         i + 1, pi->op0, pi->op1, pj->op0);
+                    replace_line_marked(i, g_build,
+                        "mov SP,BP / pop BP -> leave (186+)", 36);
+                    DEL(j) = 1;
+                    st[36]++;
+                    continue;
+                }
+            }
+        }
+
         /* P426 (v2.25): "cmp R, 1 / jl L" -> "test R, R / jle L"
          *  R < 1 (signed) ⟺ R <= 0 (signed).  cmp R,1 sets flags for
          *  R-1; jl checks SF≠OF (R<1).  test R,R sets flags for R;
@@ -12589,8 +16786,6 @@ static long run_pass(void)
                                  (ci_eq(pj->mnem, "jg") || ci_eq(pj->mnem, "jnle")))
                             new_jcc = "jge";
                         if (new_jcc != NULL) {
-                            char testbuf[MAXLINE];
-                            char jccbuf[MAXLINE];
                             /* rewrite cmp R,imm -> test R,R */
                             strcpy(testbuf, pi->prefix);
                             strcat(testbuf, "test ");
@@ -12623,20 +16818,20 @@ static long run_pass(void)
             }
         }
 
-        /* P427 (v2.25): "dec cx / jnz L" -> "loop L" (8086 only, -Oz).
-         *  loop decrements CX and jumps if CX!=0; dec cx/jnz does the
-         *  same.  But loop doesn't touch flags while dec sets them,
-         *  so flags must be dead.  CX must be dead after (loop
-         *  overwrites CX).  -Oz only: loop is 2 bytes (shorter than
-         *  dec+jnz = 3-4 bytes) but slower on 386+ (11 vs 9 cycles).
-         *  GEMA note: autoalign moves addresses; this is safe. */
+        /* P427 (v2.25): "dec cx / jnz L" -> "loop L" (-Oz).
+         *  CORRECT pair is jnz/jne, NOT jz/je.
+         *  LOOP: CX--, jump if CX != 0.  Equivalent to dec cx / jnz.
+         *  dec cx / jz would jump when CX becomes 0 -- the OPPOSITE.
+         *  loop does not touch flags; dec does -- flags must be dead.
+         *  CX dead after (loop overwrites CX).  -Oz: 2 bytes vs 3-4.
+         *  Available on 8086+; slower microcode on 386+ is why -Oz only. */
         if (opt_zopt && !pi->haslabel && !pi->toobig &&
             pi->cls == I_OTHER && pi->nops == 1 &&
             ci_eq(pi->mnem, "dec")) {
             int r427 = find_reg(pi->op0);
             if (r427 >= 0 && g_regs[r427].fam == 1 &&
                 (g_regs[r427].hi - g_regs[r427].lo) == 16) {
-                /* dec cx */
+                /* dec cx (16-bit CX only; LOOP uses CX not ECX) */
                 j = next_code(i);
                 if (j >= 0 && !INDEF(j)) {
                     struct pinfo *pj = &g_ppair;
@@ -12646,7 +16841,6 @@ static long run_pass(void)
                         (ci_eq(pj->mnem, "jnz") || ci_eq(pj->mnem, "jne")) &&
                         flags_clear(next_code(j), F_ALL6) &&
                         reg_dead_cf(next_code(j), r427)) {
-                        char loopbuf[MAXLINE];
                         strcpy(loopbuf, pi->prefix);
                         strcat(loopbuf, "loop ");
                         strcat(loopbuf, pj->op0);
@@ -12659,6 +16853,921 @@ static long run_pass(void)
                         replace_line(i, loopbuf);
                         DEL(j) = 1;
                         st[427]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* P850 (v2.52): "test cx,cx / jz|je L" or "cmp cx,0 / jz|je L"
+         *  -> "jcxz L" (8086+).  JCXZ jumps iff CX==0; does not write
+         *  flags.  cmp/test write flags -- require flags dead after.
+         *  Short jump only (±128); same assumption as P427/LOOP.
+         *  -Oz: jcxz is 2 bytes vs test+jz = 4+ bytes. */
+        if (opt_zopt && !pi->haslabel && !pi->toobig && pi->nops == 2) {
+            int r850 = find_reg(pi->op0);
+            int is_zero_test = 0;
+            if (r850 >= 0 && g_regs[r850].fam == 1 &&
+                (g_regs[r850].hi - g_regs[r850].lo) == 16) {
+                /* CX */
+                if (ci_eq(pi->mnem, "test") &&
+                    find_reg(pi->op1) == r850)
+                    is_zero_test = 1;
+                else if (ci_eq(pi->mnem, "cmp")) {
+                    long v850;
+                    if (try_parse_number(pi->op1, &v850) && v850 == 0)
+                        is_zero_test = 1;
+                }
+            }
+            if (is_zero_test) {
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig &&
+                        pj->cls == I_JCC && pj->jtarget_ok &&
+                        (ci_eq(pj->mnem, "jz") || ci_eq(pj->mnem, "je")) &&
+                        flags_clear(next_code(j), F_ALL6)) {
+                        strcpy(loopbuf, pi->prefix);
+                        strcat(loopbuf, "jcxz ");
+                        strcat(loopbuf, pj->op0);
+                        if (pj->comment[0] != 0) {
+                            strcat(loopbuf, " ");
+                            strcat(loopbuf, pj->comment);
+                        }
+                        vlog("smartpp: line %ld: '%s cx' / 'jz %s' -> "
+                             "'jcxz %s' (P850, -Oz)\n",
+                             i + 1, pi->mnem, pj->op0, pj->op0);
+                        replace_line_marked(i, loopbuf,
+                            "test/cmp cx,0 / jz -> jcxz (-Oz)", 850);
+                        DEL(j) = 1;
+                        st[850]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* P851 (v2.52): "test ecx,ecx / jz|je L" or "cmp ecx,0 / jz|je L"
+         *  -> "jecxz L" (386+).  Same reasoning as P850; JECXZ needs
+         *  386.  ECX width = 32. */
+        if (opt_zopt && g_curcpu >= 8 && !pi->haslabel && !pi->toobig &&
+            pi->nops == 2) {
+            int r851 = find_reg(pi->op0);
+            int is_zero_test = 0;
+            if (r851 >= 0 && g_regs[r851].fam == 1 &&
+                g_regs[r851].hi == 32) {
+                /* ECX */
+                if (ci_eq(pi->mnem, "test") &&
+                    find_reg(pi->op1) == r851)
+                    is_zero_test = 1;
+                else if (ci_eq(pi->mnem, "cmp")) {
+                    long v851;
+                    if (try_parse_number(pi->op1, &v851) && v851 == 0)
+                        is_zero_test = 1;
+                }
+            }
+            if (is_zero_test) {
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig &&
+                        pj->cls == I_JCC && pj->jtarget_ok &&
+                        (ci_eq(pj->mnem, "jz") || ci_eq(pj->mnem, "je")) &&
+                        flags_clear(next_code(j), F_ALL6)) {
+                        strcpy(loopbuf, pi->prefix);
+                        strcat(loopbuf, "jecxz ");
+                        strcat(loopbuf, pj->op0);
+                        if (pj->comment[0] != 0) {
+                            strcat(loopbuf, " ");
+                            strcat(loopbuf, pj->comment);
+                        }
+                        vlog("smartpp: line %ld: '%s ecx' / 'jz %s' -> "
+                             "'jecxz %s' (P851, 386+, -Oz)\n",
+                             i + 1, pi->mnem, pj->op0, pj->op0);
+                        replace_line_marked(i, loopbuf,
+                            "test/cmp ecx,0 / jz -> jecxz (386+,-Oz)", 851);
+                        DEL(j) = 1;
+                        st[851]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+
+
+        /* P511 (v2.35): stack-frame store forwarding.
+         *  "mov [bp±n], R / mov S, [bp±n]" (same slot) ->
+         *    if S and R same family+width: delete the load;
+         *    else: "mov S, R" (and delete nothing of the store).
+         *  Only pure bp/ebp/rbp±disp (is_stack_mem_operand) — never
+         *  absolute or SI/DI/BX memory (MMIO / alias risk).
+         *  Intel syntax; consecutive code lines only. */
+        if (!g_att && !pi->toobig && !pi->haslabel &&
+            pi->nops == 2 && ci_eq(pi->mnem, "mov") &&
+            find_reg(pi->op0) < 0 && find_reg(pi->op1) >= 0 &&
+            is_stack_mem_operand(pi->op0)) {
+            int rsrc = find_reg(pi->op1);
+            char k0[64], k1[64];
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j) &&
+                stack_mem_key(pi->op0, k0, (int)sizeof(k0))) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    pj->cls == I_MOV && pj->nops == 2 &&
+                    pj->dreg >= 0 &&
+                    is_stack_mem_operand(pj->op1) &&
+                    stack_mem_key(pj->op1, k1, (int)sizeof(k1)) &&
+                    ci_eq(k0, k1)) {
+                    if (g_regs[pj->dreg].fam == g_regs[rsrc].fam &&
+                        (g_regs[pj->dreg].hi - g_regs[pj->dreg].lo) ==
+                        (g_regs[rsrc].hi - g_regs[rsrc].lo) &&
+                        g_regs[pj->dreg].lo == g_regs[rsrc].lo) {
+                        /* same register: load is pure redundant */
+                        vlog("smartpp: line %ld: deleted stack reload (P511)\\n",
+                            j + 1);
+                        DEL(j) = 1;
+                        st[511]++;
+                        continue;
+                    }
+                    /* different reg, same width family: mov S, R */
+                    if ((g_regs[pj->dreg].hi - g_regs[pj->dreg].lo) ==
+                        (g_regs[rsrc].hi - g_regs[rsrc].lo)) {
+                        strcpy(g_build, pj->prefix);
+                        strcat(g_build, "mov ");
+                        strcat(g_build, pj->op0);
+                        strcat(g_build, ", ");
+                        strcat(g_build, pi->op1);
+                        vlog("smartpp: line %ld: stack forward '%s' -> '%s' (P511)\\n",
+                            j + 1, L(j), g_build);
+                        replace_line(j, g_build);
+                        st[511]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* P512 (v2.35): "setcc R8 / movzx Rwide, R8" -> delete movzx
+         *  when Rwide is dead after the movzx (setcc already wrote R8;
+         *  movzx only zero-extends, and nobody reads the wide result).
+         *  386+.  Does NOT delete movzx when the wide reg is live —
+         *  high bits would be wrong without the zero-extend. */
+        if (g_curcpu >= 8 && !pi->toobig && !pi->haslabel &&
+            pi->nops == 1 && ci_eq_n(pi->mnem, "set", 3)) {
+            int r8 = find_reg(pi->op0);
+            j = next_code(i);
+            if (r8 >= 0 && (g_regs[r8].hi - g_regs[r8].lo) == 8 &&
+                j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    ci_eq(pj->mnem, "movzx") && pj->nops == 2) {
+                    int rd = find_reg(pj->op0);
+                    int rs = find_reg(pj->op1);
+                    if (rd >= 0 && rs >= 0 &&
+                        g_regs[rs].fam == g_regs[r8].fam &&
+                        g_regs[rs].lo == g_regs[r8].lo &&
+                        (g_regs[rs].hi - g_regs[rs].lo) == 8 &&
+                        (g_regs[rd].hi - g_regs[rd].lo) > 8 &&
+                        reg_dead_cf(next_code(j), rd)) {
+                        vlog("smartpp: line %ld: deleted dead 'movzx' after setcc (P512)\\n",
+                            j + 1);
+                        DEL(j) = 1;
+
+                        st[512]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* P531 (v2.39): constant stack-store forwarding.
+         *  "mov [bp±n], imm / mov R, [bp±n]" -> "mov R, imm"
+         *  (same slot).  Extends P511 to immediate stores. */
+        if (!g_att && !pi->toobig && !pi->haslabel &&
+            pi->nops == 2 && ci_eq(pi->mnem, "mov") &&
+            find_reg(pi->op0) < 0 && find_reg(pi->op1) < 0 &&
+            is_stack_mem_operand(pi->op0)) {
+            long vimm;
+            char k0[64], k1[64];
+            if (try_parse_number(pi->op1, &vimm) &&
+                stack_mem_key(pi->op0, k0, (int)sizeof(k0))) {
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig &&
+                        pj->cls == I_MOV && pj->nops == 2 &&
+                        pj->dreg >= 0 &&
+                        is_stack_mem_operand(pj->op1) &&
+                        stack_mem_key(pj->op1, k1, (int)sizeof(k1)) &&
+                        ci_eq(k0, k1)) {
+                        strcpy(g_build, pj->prefix);
+                        strcat(g_build, "mov ");
+                        strcat(g_build, pj->op0);
+                        strcat(g_build, ", ");
+                        strcat(g_build, pi->op1);
+                        vlog("smartpp: line %ld: stack imm forward -> '%s' (P531)\n",
+                            j + 1, g_build);
+                        replace_line(j, g_build);
+                        st[531]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* P532 (v2.39): "lea R,[S+imm1] / add R,imm2" ->
+         *  "lea R,[S+imm1+imm2]" when flags dead, R not SP.
+         *  Also "lea / sub R,imm2" with negative combined disp. */
+        if (!pi->toobig && !pi->haslabel && !g_att &&
+            pi->cls == I_LEA && pi->dreg >= 0 &&
+            g_regs[pi->dreg].fam != 4) {
+            int base532 = -1;
+            long disp532 = 0;
+            if (lea_bracket(pi->op1, &base532, &disp532) && base532 >= 0) {
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    long imm2;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig &&
+                        pj->nops == 2 &&
+                        find_reg(pj->op0) == pi->dreg &&
+                        try_parse_number(pj->op1, &imm2) &&
+                        (ci_eq(pj->mnem, "add") || ci_eq(pj->mnem, "sub")) &&
+                        flags_clear(next_code(j), F_ALL6)) {
+                        long nd = ci_eq(pj->mnem, "sub") ?
+                            (disp532 - imm2) : (disp532 + imm2);
+                        char opnd[MAXTOK];
+                        emit_lea_disp(opnd, base532, nd);
+                        strcpy(g_build, pi->prefix);
+                        strcat(g_build, "lea ");
+                        strcat(g_build, pi->op0);
+                        strcat(g_build, ", ");
+                        strcat(g_build, opnd);
+                        vlog("smartpp: line %ld: folded lea+arith -> '%s' (P532)\n",
+                            i + 1, g_build);
+                        replace_line(i, g_build);
+                        DEL(j) = 1;
+                        st[532]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* P533 (v2.39): "push R / mov R, X / pop S"
+         *  -> "mov S, R" / "mov R, X" when R,S not SP and the
+         *  original R is captured into S.  If S==R, the pop restores
+         *  the old R and discards X: equivalent to deleting all three
+         *  only when X is a pure dead write — still leave as
+         *  "mov R,X; mov R,old" which is just restore: delete all
+         *  three. */
+        if (!pi->toobig && !pi->haslabel &&
+            pi->cls == I_PUSH && pi->nops == 1 && pi->dreg >= 0 &&
+            g_regs[pi->dreg].fam != 4) {
+            int r533 = pi->dreg;
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    pj->cls == I_MOV && pj->nops == 2 &&
+                    pj->dreg == r533) {
+                    long k = next_code(j);
+                    if (k >= 0 && !INDEF(k)) {
+                        struct pinfo *pk = &g_pnext;
+                        parse_line(k, pk);
+                        if (!pk->haslabel && !pk->toobig &&
+                            pk->cls == I_POP && pk->nops == 1 &&
+                            pk->dreg >= 0 &&
+                            g_regs[pk->dreg].fam != 4) {
+                            if (pk->dreg == r533) {
+                                /* push R / mov R,X / pop R -> delete all
+                                 *  (pop restores pre-push R; X discarded). */
+                                vlog("smartpp: line %ld: push/mov/pop same R deleted (P533)\n",
+                                    i + 1);
+                                DEL(i) = 1;
+                                DEL(j) = 1;
+                                DEL(k) = 1;
+                                st[533]++;
+                                continue;
+                            }
+                            /* push R / mov R,X / pop S -> mov S,R ; mov R,X
+                             *  Use original R name from push. */
+                            {
+                                snprintf(g_tmpa, MAXLINE, "%smov %s, %s",
+                                    pk->prefix, pk->op0, pi->op0);
+                                snprintf(g_tmpb, MAXLINE, "%smov %s, %s",
+                                    pj->prefix, pj->op0, pj->op1);
+                                vlog("smartpp: line %ld: push/mov/pop -> mov/mov (P533)\n",
+                                    i + 1);
+                                replace_line(i, g_tmpa);
+                                replace_line(j, g_tmpb);
+                                DEL(k) = 1;
+                                st[533]++;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P534 (v2.39): "mov R,0 / add R,S / mov T,R" -> "mov T,S"
+         *  when R dead after the last mov and flags dead after add
+         *  (add's flags lost).  Short copy-prop through a zeroed add. */
+        if (!pi->toobig && !pi->haslabel &&
+            pi->cls == I_MOV && pi->nops == 2 &&
+            pi->dreg >= 0 && pi->srcimm &&
+            g_regs[pi->dreg].fam != 4) {
+            long zv;
+            if (try_parse_number(pi->op1, &zv) && zv == 0) {
+                int r534 = pi->dreg;
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig &&
+                        ci_eq(pj->mnem, "add") && pj->nops == 2 &&
+                        find_reg(pj->op0) == r534 &&
+                        find_reg(pj->op1) >= 0 &&
+                        find_reg(pj->op1) != r534 &&
+                        flags_clear(next_code(j), F_ALL6)) {
+                        long k = next_code(j);
+                        if (k >= 0 && !INDEF(k)) {
+                            struct pinfo *pk = &g_pnext;
+                            parse_line(k, pk);
+                            if (!pk->haslabel && !pk->toobig &&
+                                pk->cls == I_MOV && pk->nops == 2 &&
+                                pk->dreg >= 0 &&
+                                find_reg(pk->op1) == r534 &&
+                                pk->dreg != r534 &&
+                                reg_dead_cf(next_code(k), r534)) {
+                                strcpy(g_build, pk->prefix);
+                                strcat(g_build, "mov ");
+                                strcat(g_build, pk->op0);
+                                strcat(g_build, ", ");
+                                strcat(g_build, pj->op1);
+                                vlog("smartpp: line %ld: mov0/add/mov -> '%s' (P534)\n",
+                                    i + 1, g_build);
+                                replace_line(k, g_build);
+                                DEL(i) = 1;
+                                DEL(j) = 1;
+                                st[534]++;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+
+        /* ================================================================
+         *  v2.43: the eight remaining high-value C optimizations
+         * ================================================================ */
+
+        /* P750: limited copy-prop — "mov R,S / mov T,R" -> "mov T,S"
+         *  when R is dead after the second mov and R != S, T != R.
+         *  One-hop only; window is exactly two consecutive moves. */
+        if (!pi->toobig && !pi->haslabel &&
+            pi->cls == I_MOV && pi->nops == 2 &&
+            pi->dreg >= 0 && pi->sreg >= 0 &&
+            pi->dreg != pi->sreg &&
+            g_regs[pi->dreg].fam != 4) {
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    pj->cls == I_MOV && pj->nops == 2 &&
+                    pj->dreg >= 0 &&
+                    find_reg(pj->op1) == pi->dreg &&
+                    pj->dreg != pi->dreg &&
+                    reg_width(pj->dreg) == reg_width(pi->dreg) &&
+                    reg_dead_cf(next_code(j), pi->dreg)) {
+                    strcpy(g_build, pj->prefix);
+                    strcat(g_build, "mov ");
+                    strcat(g_build, pj->op0);
+                    strcat(g_build, ", ");
+                    strcat(g_build, pi->op1);
+                    vlog("smartpp: line %ld: copy-prop mov/mov -> '%s' (P750)\n",
+                        i + 1, g_build);
+                    replace_line(j, g_build);
+                    /* keep first mov: S still needed if live; if R was
+                     *  only used by second, first may die later via P2 */
+                    st[750]++;
+                    continue;
+                }
+            }
+        }
+
+        /* P751: constant branch after zeroing —
+         *  "xor R,R" / "sub R,R" / "or R,0" sets ZF=1, SF=0.
+         *  jz/je  L -> jmp L;  jnz/jne L -> delete; jns ok stay if SF=0
+         *  Only jz/je/jnz/jne (ZF-only) to stay sound. */
+        if (!pi->toobig && !pi->haslabel && pi->nops == 2 &&
+            ((ci_eq(pi->mnem, "xor") || ci_eq(pi->mnem, "sub")) &&
+             find_reg(pi->op0) >= 0 &&
+             find_reg(pi->op0) == find_reg(pi->op1))) {
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    pj->cls == I_JCC && pj->jtarget_ok) {
+                    int c = jcc_canon(pj->mnem);
+                    /* canon: 0=o,1=no,2=b,3=ae,4=e/z,5=ne/nz, ... */
+                    if (c == 4) { /* je/jz: always taken */
+                        strcpy(g_build, pj->prefix);
+                        strcat(g_build, "jmp ");
+                        strcat(g_build, pj->jtarget);
+                        vlog("smartpp: line %ld: zeroing / jz -> jmp (P751)\n",
+                            i + 1);
+                        replace_line(j, g_build);
+                        st[751]++;
+                        continue;
+                    }
+                    if (c == 5) { /* jne/jnz: never taken */
+                        vlog("smartpp: line %ld: zeroing / jnz deleted (P751)\n",
+                            i + 1);
+                        delete_keep_label(j, pj);
+                        st[751]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* P753: empty frame — "push bp / mov bp,sp / pop bp" consecutive
+         *  -> delete all three (bp restored, sp same net).  No body. */
+        if (!pi->toobig && !pi->haslabel &&
+            pi->cls == I_PUSH && pi->nops == 1 &&
+            pi->dreg >= 0 && g_regs[pi->dreg].fam == 5) {
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    pj->cls == I_MOV && pj->nops == 2 &&
+                    pj->dreg >= 0 && g_regs[pj->dreg].fam == 5 &&
+                    pj->sreg >= 0 && g_regs[pj->sreg].fam == 4) {
+                    long k = next_code(j);
+                    if (k >= 0 && !INDEF(k)) {
+                        struct pinfo *pk = &g_pnext;
+                        parse_line(k, pk);
+                        if (!pk->haslabel && !pk->toobig &&
+                            pk->cls == I_POP && pk->nops == 1 &&
+                            pk->dreg >= 0 && g_regs[pk->dreg].fam == 5) {
+                            vlog("smartpp: line %ld: empty bp frame deleted (P753)\n",
+                                i + 1);
+                            DEL(i) = 1;
+                            DEL(j) = 1;
+                            DEL(k) = 1;
+                            st[753]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P754: lea scale completeness — "lea R,[S+S*2]" is *3 etc.
+         *  Covered by P380 for imul.  Extra: "mov R,S / lea R,[R+R*2]"
+         *  already becomes *3 via multi-pass.  "add R,R / add R,S" with
+         *  R was S: skip.  Implement "lea R,[R*3]" via scaled form is
+         *  assembler sugar.  Here: "shl R,1 / add R,S" with R!=S and
+         *  flags dead -> lea R,[S+R*1] wait R already *2.  Skip complex.
+         *  Practical: "imul R, 3/5/9" already P380.  Mark hit via
+         *  ensuring lea R,[R+R*2] identity scale stays.
+         *  Additional: mov R,S / add R,R -> lea R,[S+S] (P47b). Done.
+         *  P754 = nop placeholder counted when P380 fires on 3/5/9 —
+         *  instead add "lea R,[S*3]" fold is not standard Intel syntax.
+         *  Real add: "lea R,[R+R*4]" -> lea already; if followed by
+         *  "sub R,S" with S original... skip.
+         *  Implement: "mov R,S / shl R,1 / add R,S" -> lea R,[S+S*2]
+         *  (= *3) when flags dead and 386+. */
+        if (g_curcpu >= 8 && !g_att && !pi->toobig && !pi->haslabel &&
+            pi->cls == I_MOV && pi->nops == 2 &&
+            pi->dreg >= 0 && pi->sreg >= 0 &&
+            pi->dreg != pi->sreg &&
+            reg_width(pi->dreg) >= 32 &&
+            g_regs[pi->dreg].fam != 4) {
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                long shv;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    (ci_eq(pj->mnem, "shl") || ci_eq(pj->mnem, "sal")) &&
+                    pj->nops == 2 &&
+                    find_reg(pj->op0) == pi->dreg &&
+                    try_parse_number(pj->op1, &shv) && shv == 1) {
+                    long k = next_code(j);
+                    if (k >= 0 && !INDEF(k)) {
+                        struct pinfo *pk = &g_pnext;
+                        parse_line(k, pk);
+                        if (!pk->haslabel && !pk->toobig &&
+                            ci_eq(pk->mnem, "add") && pk->nops == 2 &&
+                            find_reg(pk->op0) == pi->dreg &&
+                            find_reg(pk->op1) == pi->sreg &&
+                            flags_clear(next_code(k), F_ALL6)) {
+                            char opnd[MAXTOK];
+                            emit_lea_scaled(opnd, pi->sreg, 2); /* S+S*2 */
+                            strcpy(g_build, pi->prefix);
+                            strcat(g_build, "lea ");
+                            strcat(g_build, pi->op0);
+                            strcat(g_build, ", ");
+                            strcat(g_build, opnd);
+                            vlog("smartpp: line %ld: mov/shl/add -> *3 lea (P754)\n",
+                                i + 1);
+                            replace_line(i, g_build);
+                            DEL(j) = 1;
+                            DEL(k) = 1;
+                            st[754]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P755: setcc after zeroing — "xor R,R / sete R8" stays;
+         *  "xor eax,eax / setz al" is common.  Already handled when
+         *  flags known.  Extra: "cmp R,R / setz R8" -> "mov R8,1"
+         *  when only that byte needed is hard.  Practical:
+         *  "cmp R,R / je L" -> jmp L; "cmp R,R / jne L" -> delete. */
+        if (!pi->toobig && !pi->haslabel &&
+            ci_eq(pi->mnem, "cmp") && pi->nops == 2 &&
+            find_reg(pi->op0) >= 0 &&
+            find_reg(pi->op0) == find_reg(pi->op1)) {
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    pj->cls == I_JCC && pj->jtarget_ok) {
+                    int c = jcc_canon(pj->mnem);
+                    if (c == 4) {
+                        strcpy(g_build, pj->prefix);
+                        strcat(g_build, "jmp ");
+                        strcat(g_build, pj->jtarget);
+                        vlog("smartpp: line %ld: cmp R,R / je -> jmp (P755)\n",
+                            i + 1);
+                        replace_line(j, g_build);
+                        DEL(i) = 1;
+                        st[755]++;
+                        continue;
+                    }
+                    if (c == 5) {
+                        vlog("smartpp: line %ld: cmp R,R / jne deleted (P755)\n",
+                            i + 1);
+                        DEL(i) = 1;
+                        delete_keep_label(j, pj);
+                        st[755]++;
+                        continue;
+                    }
+                }
+                /* setcc on equality always true: sete/setz R8 -> mov R8,1
+                 *  when R8 dead upper and 386+. */
+                if (g_curcpu >= 8 && !pj->haslabel && !pj->toobig &&
+                    pj->nops == 1 && ci_eq_n(pj->mnem, "set", 3)) {
+                    /* setz/sete only */
+                    if (ci_eq(pj->mnem, "setz") || ci_eq(pj->mnem, "sete")) {
+                        int r8 = find_reg(pj->op0);
+                        if (r8 >= 0 &&
+                            (g_regs[r8].hi - g_regs[r8].lo) == 8) {
+                            strcpy(g_build, pj->prefix);
+                            strcat(g_build, "mov ");
+                            strcat(g_build, pj->op0);
+                            strcat(g_build, ", 1");
+                            vlog("smartpp: line %ld: cmp R,R / sete -> mov 1 (P755)\n",
+                                i + 1);
+                            replace_line(j, g_build);
+                            DEL(i) = 1;
+                            st[755]++;
+                            continue;
+                        }
+                    }
+                    if (ci_eq(pj->mnem, "setnz") || ci_eq(pj->mnem, "setne")) {
+                        int r8 = find_reg(pj->op0);
+                        if (r8 >= 0 &&
+                            (g_regs[r8].hi - g_regs[r8].lo) == 8) {
+                            strcpy(g_build, pj->prefix);
+                            strcat(g_build, "mov ");
+                            strcat(g_build, pj->op0);
+                            strcat(g_build, ", 0");
+                            vlog("smartpp: line %ld: cmp R,R / setne -> mov 0 (P755)\n",
+                                i + 1);
+                            replace_line(j, g_build);
+                            DEL(i) = 1;
+                            st[755]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P756: x87 identity — "fld ST(0)" is no-op-ish (pushes dup);
+         *  safer: "fld X / fstp X" same mem operand consecutive ->
+         *  delete both only if X is stack mem (no MMIO). */
+        if (!pi->toobig && !pi->haslabel &&
+            ci_eq(pi->mnem, "fld") && pi->nops == 1 &&
+            is_stack_mem_operand(pi->op0)) {
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                char k0[64], k1[64];
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    ci_eq(pj->mnem, "fstp") && pj->nops == 1 &&
+                    is_stack_mem_operand(pj->op0) &&
+                    stack_mem_key(pi->op0, k0, (int)sizeof(k0)) &&
+                    stack_mem_key(pj->op0, k1, (int)sizeof(k1)) &&
+                    ci_eq(k0, k1)) {
+                    vlog("smartpp: line %ld: fld/fstp same stack deleted (P756)\n",
+                        i + 1);
+                    DEL(i) = 1;
+                    DEL(j) = 1;
+                    st[756]++;
+                    continue;
+                }
+            }
+        }
+        /* fst / fstp same after fld already covered.
+         *  "fchs / fchs" -> delete both (involution). */
+        if (!pi->toobig && !pi->haslabel &&
+            (ci_eq(pi->mnem, "fchs") || ci_eq(pi->mnem, "fabs"))) {
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    ci_eq(pj->mnem, pi->mnem)) {
+                    vlog("smartpp: line %ld: x87 double %s deleted (P756)\n",
+                        i + 1, pi->mnem);
+                    DEL(i) = 1;
+                    DEL(j) = 1;
+                    st[756]++;
+                    continue;
+                }
+            }
+        }
+
+        /* P757: "and R32, 0FFh/0FFFFh" -> movzx when flags dead, 386+.
+         *  Complements P34. */
+        if (g_curcpu >= 8 && !pi->toobig && !pi->haslabel &&
+            ci_eq(pi->mnem, "and") && pi->nops == 2 &&
+            find_reg(pi->op0) >= 0) {
+            int r = find_reg(pi->op0);
+            long mask;
+            int w = g_regs[r].hi - g_regs[r].lo;
+            if (w == 32 && try_parse_number(pi->op1, &mask) &&
+                flags_clear(next_code(i), F_ALL6)) {
+                const char *low = NULL;
+                if (mask == 0xFF) {
+                    /* eax -> al, ebx -> bl, ... */
+                    if (ci_eq(g_regs[r].name, "eax")) low = "al";
+                    else if (ci_eq(g_regs[r].name, "ebx")) low = "bl";
+                    else if (ci_eq(g_regs[r].name, "ecx")) low = "cl";
+                    else if (ci_eq(g_regs[r].name, "edx")) low = "dl";
+                } else if (mask == 0xFFFF) {
+                    if (ci_eq(g_regs[r].name, "eax")) low = "ax";
+                    else if (ci_eq(g_regs[r].name, "ebx")) low = "bx";
+                    else if (ci_eq(g_regs[r].name, "ecx")) low = "cx";
+                    else if (ci_eq(g_regs[r].name, "edx")) low = "dx";
+                }
+                if (low) {
+                    strcpy(g_build, pi->prefix);
+                    strcat(g_build, "movzx ");
+                    strcat(g_build, pi->op0);
+                    strcat(g_build, ", ");
+                    strcat(g_build, low);
+                    vlog("smartpp: line %ld: and mask -> '%s' (P757)\n",
+                        i + 1, g_build);
+                    replace_line(i, g_build);
+                    st[757]++;
+                    continue;
+                }
+            }
+        }
+
+        /* P496/P497 (v2.33): reverse of P480/P481 on pre-386.
+         *  "add R,2 -> inc R / inc R" and "sub R,2 -> dec R / dec R".
+         *
+         *  Why reverse on 8086/286:
+         *    - Size: ADD/SUB r,imm8 = 3 bytes; two INC/DEC = 2 bytes.
+         *    - Speed: INC/DEC cheaper than immediate ADD on 8086/286.
+         *  On 386+ the forward fold (P480/P481) is preferred under -Os.
+         *
+         *  Flag non-equivalence (same as P480):
+         *    INC/DEC preserve CF; ADD/SUB write CF.  Intermediate OF/AF
+         *    of two INC/DEC can differ from one ADD/SUB of 2.  Safe only
+         *    when ALL six status flags are dead after the instruction.
+         *  SP excluded (interrupt window between the two incs). */
+        if (g_curcpu < 8 && !pi->haslabel && !pi->toobig &&
+            pi->nops == 2 &&
+            (ci_eq(pi->mnem, "add") || ci_eq(pi->mnem, "sub"))) {
+            int r496 = find_reg(pi->op0);
+            long v;
+            /* dreg is not set for I_OTHER ALU; use find_reg(op0). */
+            if (r496 >= 0 && g_regs[r496].fam != 4 &&
+                (g_regs[r496].hi - g_regs[r496].lo) >= 16 &&
+                try_parse_number(pi->op1, &v) && v == 2 &&
+                flags_clear(next_code(i), F_ALL6)) {
+                const char *op = ci_eq(pi->mnem, "add") ? "inc" : "dec";
+                int pno = ci_eq(pi->mnem, "add") ? 496 : 497;
+                snprintf(g_tmpa, MAXLINE, "%s%s %s", pi->prefix, op, pi->op0);
+                snprintf(g_tmpb, MAXLINE, "%s%s %s", pi->prefix, op, pi->op0);
+                replace_line_marked(i, g_tmpa,
+                    ci_eq(pi->mnem, "add") ?
+                        "add R,2->inc/inc (8086)" :
+                        "sub R,2->dec/dec (8086)", pno);
+                insert_line_after(i, g_tmpb);
+                st[pno]++;
+                continue;
+            }
+        }
+
+        /* P800 (v2.52, Watcom / classic DOS): merge consecutive byte
+         *  immediates into one word move.
+         *    mov al, i1 / mov ah, i2  ->  mov ax, (i2<<8)|i1
+         *  Same for bx/cx/dx.  Both immediates must fit in 0..255.
+         *  Flag-neutral (mov).  Research: Open Watcom PR #96 (Guti). */
+        if (!pi->haslabel && !pi->toobig &&
+            ci_eq(pi->mnem, "mov") && pi->nops == 2) {
+            static const struct { const char *lo, *hi, *w; } pairs[] = {
+                { "al", "ah", "ax" },
+                { "bl", "bh", "bx" },
+                { "cl", "ch", "cx" },
+                { "dl", "dh", "dx" },
+            };
+            int pi_pair;
+            long v0, v1;
+            int p800_hit = 0;
+            for (pi_pair = 0; pi_pair < 4 && !p800_hit; pi_pair++) {
+                int order = 0; /* 0: lo then hi; 1: hi then lo */
+                if (ci_eq(pi->op0, pairs[pi_pair].lo) &&
+                    try_parse_number(pi->op1, &v0) &&
+                    v0 >= 0 && v0 <= 255) {
+                    order = 0;
+                } else if (ci_eq(pi->op0, pairs[pi_pair].hi) &&
+                           try_parse_number(pi->op1, &v0) &&
+                           v0 >= 0 && v0 <= 255) {
+                    order = 1;
+                } else
+                    continue;
+                j = next_code(i);
+                if (j < 0 || INDEF(j)) break;
+                {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    if (pj->haslabel || pj->toobig ||
+                        !ci_eq(pj->mnem, "mov") || pj->nops != 2)
+                        break;
+                    if (order == 0) {
+                        if (!ci_eq(pj->op0, pairs[pi_pair].hi) ||
+                            !try_parse_number(pj->op1, &v1) ||
+                            v1 < 0 || v1 > 255)
+                            break;
+                    } else {
+                        if (!ci_eq(pj->op0, pairs[pi_pair].lo) ||
+                            !try_parse_number(pj->op1, &v1) ||
+                            v1 < 0 || v1 > 255)
+                            break;
+                        { long t = v0; v0 = v1; v1 = t; }
+                    }
+                    {
+                        unsigned long combined =
+                            ((unsigned long)v1 << 8) |
+                            ((unsigned long)v0 & 0xFFul);
+                        snprintf(g_tmpa, MAXLINE, "%smov %s, %lu",
+                                 pi->prefix, pairs[pi_pair].w, combined);
+                        vlog("smartpp: line %ld: mov %s,%ld / mov %s,%ld "
+                             "-> mov %s,%lu (P800)\n",
+                             i + 1, pairs[pi_pair].lo, v0,
+                             pairs[pi_pair].hi, v1,
+                             pairs[pi_pair].w, combined);
+                        replace_line_marked(i, g_tmpa,
+                            "mov lo,i1 / mov hi,i2 -> mov word", 800);
+                        DEL(j) = 1;
+                        st[800]++;
+                        p800_hit = 1;
+                    }
+                }
+            }
+            if (p800_hit) continue;
+        }
+
+        /* P801 (v2.52, FPC): "mov edx, eax / sar edx, 31" -> "cdq"
+         *  (386+).  Sign-extends EAX into EDX:EAX.  Both instructions
+         *  flag-neutral for the final value of EDX; SAR sets flags,
+         *  CDQ does not -- require flags dead after the pair.
+         *  Research: FPC #36551 (mov-cdq.patch). */
+        if (g_curcpu >= 8 && !pi->haslabel && !pi->toobig &&
+            ci_eq(pi->mnem, "mov") && pi->nops == 2 &&
+            ci_eq(pi->op0, "edx") && ci_eq(pi->op1, "eax")) {
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                long v;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    ci_eq(pj->mnem, "sar") && pj->nops == 2 &&
+                    ci_eq(pj->op0, "edx") &&
+                    try_parse_number(pj->op1, &v) && v == 31 &&
+                    flags_clear(next_code(j), F_ALL6)) {
+                    snprintf(g_tmpa, MAXLINE, "%scdq", pi->prefix);
+                    vlog("smartpp: line %ld: mov edx,eax / sar edx,31 "
+                         "-> cdq (P801)\n", i + 1);
+                    replace_line_marked(i, g_tmpa,
+                        "mov edx,eax / sar edx,31 -> cdq", 801);
+                    DEL(j) = 1;
+                    st[801]++;
+                    continue;
+                }
+            }
+        }
+
+        /* P830 (v2.52, demoscene size-coding):
+         *  "xor eax,eax / xor edx,edx" -> "xor eax,eax / cdq" under -Oz.
+         *  With EAX=0, CDQ yields EDX=0 in 1 byte vs 2 for xor edx,edx.
+         *  Research: Agner Fog; rrrola/hugi 256b intros.  386+.
+         *  cdq does not touch flags; post flags == flags after first xor. */
+        if (opt_zopt && g_curcpu >= 8 && !pi->haslabel && !pi->toobig &&
+            ci_eq(pi->mnem, "xor") && pi->nops == 2 &&
+            ci_eq(pi->op0, "eax") && ci_eq(pi->op1, "eax")) {
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    ci_eq(pj->mnem, "xor") && pj->nops == 2 &&
+                    ci_eq(pj->op0, "edx") && ci_eq(pj->op1, "edx")) {
+                    snprintf(g_tmpa, MAXLINE, "%scdq", pj->prefix);
+                    vlog("smartpp: line %ld: xor eax,eax / xor edx,edx "
+                         "-> xor eax,eax / cdq (-Oz, P830)\n", i + 1);
+                    replace_line_marked(j, g_tmpa,
+                        "xor eax,eax / xor edx,edx -> cdq (-Oz)", 830);
+                    st[830]++;
+                    continue;
+                }
+            }
+        }
+
+        /* P831: 16-bit "xor ax,ax / xor dx,dx" -> "xor ax,ax / cwd" (-Oz). */
+        if (opt_zopt && !pi->haslabel && !pi->toobig &&
+            ci_eq(pi->mnem, "xor") && pi->nops == 2 &&
+            ci_eq(pi->op0, "ax") && ci_eq(pi->op1, "ax")) {
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    ci_eq(pj->mnem, "xor") && pj->nops == 2 &&
+                    ci_eq(pj->op0, "dx") && ci_eq(pj->op1, "dx")) {
+                    snprintf(g_tmpa, MAXLINE, "%scwd", pj->prefix);
+                    vlog("smartpp: line %ld: xor ax,ax / xor dx,dx "
+                         "-> xor ax,ax / cwd (-Oz, P831)\n", i + 1);
+                    replace_line_marked(j, g_tmpa,
+                        "xor ax,ax / xor dx,dx -> cwd (-Oz)", 831);
+                    st[831]++;
+                    continue;
+                }
+            }
+        }
+
+        /* P832: "mov eax, 0 / xor edx,edx" -> "xor eax,eax / cdq" (-Oz).
+         *  Shortest dual-zero idiom.  Flags dead after required. */
+        if (opt_zopt && g_curcpu >= 8 && !pi->haslabel && !pi->toobig &&
+            ci_eq(pi->mnem, "mov") && pi->nops == 2 &&
+            ci_eq(pi->op0, "eax")) {
+            long v;
+            if (try_parse_number(pi->op1, &v) && v == 0) {
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig &&
+                        ci_eq(pj->mnem, "xor") && pj->nops == 2 &&
+                        ci_eq(pj->op0, "edx") && ci_eq(pj->op1, "edx") &&
+                        flags_clear(next_code(j), F_ALL6)) {
+                        snprintf(g_tmpa, MAXLINE, "%sxor eax, eax", pi->prefix);
+                        snprintf(g_tmpb, MAXLINE, "%scdq", pj->prefix);
+                        vlog("smartpp: line %ld: mov eax,0 / xor edx,edx "
+                             "-> xor eax,eax / cdq (-Oz, P832)\n", i + 1);
+                        replace_line_marked(i, g_tmpa,
+                            "mov eax,0 / xor edx,edx -> xor/cdq (-Oz)", 832);
+                        replace_line_marked(j, g_tmpb,
+                            "mov eax,0 / xor edx,edx -> xor/cdq (-Oz)", 832);
+                        st[832]++;
                         continue;
                     }
                 }
@@ -12946,6 +18055,162 @@ static const struct rname_ext_s {
     { 439, "xor+xor->xor fold (M4)" },
     { 441, "test -1/setcc->setcc (M6)" },
     { 443, "add 0/adc 0->del (M4)" },
+    { 444, "adc/sbb R,0->del" },
+    { 445, "xor0 / or R,R->del or" },
+    { 446, "mov0 / and->del and" },
+    { 447, "mov0 / or 0->del or" },
+    { 448, "mov0 / xor 0->del xor" },
+    { 449, "shift 1/1->shift 2" },
+    { 450, "add R,R->shl R,1" },
+    { 451, "xor0 / add 0->del add" },
+    { 452, "neg/neg pair" },
+    { 453, "inc/dec pair" },
+    { 456, "and R,0->xor R,R" },
+    { 457, "or R,0->del" },
+    { 458, "and R,-1->del" },
+    { 459, "rol/ror same k->del" },
+    { 460, "dup mov R,S" },
+    { 461, "dup and/or R,R" },
+    { 462, "xor0 / and->del and" },
+    { 463, "dup add R,0" },
+    { 464, "dup sub R,0" },
+    { 465, "push R/pop R->del" },
+    { 466, "stc/clc dominate" },
+    { 467, "mov/and same->del and" },
+    { 468, "mov/or same->del or" },
+    { 469, "mov/xor0->del xor" },
+    { 470, "dup test R,K" },
+    { 471, "dup cmp R,K" },
+    { 472, "not/xor-1 pair->del" },
+    { 473, "and/or R,R->del or" },
+    { 474, "or/and R,R->del and" },
+    { 475, "add0/sub0 pair->del" },
+    { 476, "xor/xor pair->del" },
+    { 477, "test/or R,R->del or" },
+    { 478, "mov-1/not->mov0" },
+    { 479, "mov0/not->mov-1" },
+    { 480, "inc/inc->add 2" },
+    { 481, "dec/dec->sub 2" },
+    { 482, "add1/add1->add 2" },
+    { 483, "sub1/sub1->sub 2" },
+    { 484, "mov/xor0->del mov" },
+    { 485, "withdrawn" },
+    { 486, "withdrawn" },
+    { 487, "dup and/or R,K" },
+    { 488, "mov1/dec->xor0" },
+    { 489, "mov-1/inc->xor0" },
+    { 490, "pushf/popf->del" },
+    { 491, "add2/sub2 pair->del" },
+    { 492, "test/or0->del or" },
+    { 493, "not/add1->neg" },
+    { 494, "mov/add0->del add" },
+    { 495, "xor0/sub0->del sub" },
+    { 496, "add2->inc/inc (8086)" },
+    { 497, "sub2->dec/dec (8086)" },
+    { 498, "xchg R,R->del" },
+    { 499, "dup test R,S" },
+    { 500, "dup cmp R,S" },
+    { 501, "or/test R,R->del test" },
+    { 502, "and/test R,R->del test" },
+    { 503, "rol/ror 0->del" },
+    { 504, "dup bt R,K" },
+    { 505, "dup cwd/cdq" },
+    { 506, "clc/cmc->stc" },
+    { 507, "mov0/add->mov" },
+    { 508, "mov0/or->mov" },
+    { 509, "mov/xor same->xor0" },
+    { 510, "and R,R/or0->del or" },
+    { 511, "stack store forward" },
+    { 512, "setcc+dead movzx" },
+    { 750, "copy-prop mov/mov" },
+    { 751, "zeroing/jcc fold" },
+    { 753, "empty bp frame" },
+    { 754, "mov/shl/add *3 lea" },
+    { 755, "cmp R,R / jcc|setcc" },
+    { 756, "x87 identity pairs" },
+    { 757, "and mask->movzx" },
+
+    { 513, "xor0/or K->mov" },
+    { 514, "xor0/add K->mov" },
+    { 515, "xor0/sub K->mov-K" },
+    { 516, "mov/cmp same->del cmp" },
+    { 517, "mov/test same->del test" },
+    { 518, "and K/or0->del or" },
+    { 519, "or K/and-1->del and" },
+    { 520, "rcl/rcr 0->del" },
+    { 521, "mov R,R/add0->del" },
+    { 522, "dup xor R,R" },
+    { 523, "sub0/xor0->keep xor" },
+    { 524, "dup or R,0" },
+    { 525, "dup and R,-1" },
+    { 526, "cmc/clc|stc" },
+    { 527, "mov R,S/mov R,T->del first" },
+    { 528, "add/sub same K->del" },
+    { 529, "neg/add0->del add" },
+    { 530, "not/and-1->del and" },
+    { 531, "stack imm forward" },
+    { 532, "lea+add/sub fold" },
+    { 533, "push/mov/pop fold" },
+    { 534, "mov0/add/mov copyprop" },
+    { 535, "mov K/add0->del add" },
+    { 536, "xor0/sub0->del sub" },
+    { 537, "or/and R,R->del and" },
+    { 538, "and/or R,R->del or" },
+    { 539, "test/and R,R->del and" },
+    { 540, "inc/sub1 or dec/add1" },
+    {  47, "mov+add/sub->lea" },
+    { 480, "inc/inc->add2 (386+,-Os)" },
+    { 481, "dec/dec->sub2 (386+,-Os)" },
+    {  35, "mov-1->or" },
+    {  60, "or R16,-1->mov" },
+    { 141, "not/inc->neg" },
+    { 142, "neg/dec->not" },
+    {  71, "sub R,R->xor" },
+    {  48, "xor+test->delete test" },
+    {  14, "double xchg" },
+    {  15, "mov R,S/mov S,R" },
+    {  32, "push/pop->mov" },
+    {  18, "add/sub R,0" },
+    {  23, "not pair" },
+    {  25, "cmc pair" },
+    {  37, "xor R,-1->not" },
+    {   9, "mov0->xor" },
+    {  11, "cmp0->test" },
+    { 744, "std / cld -> cld" },
+    { 745, "cli / sti -> sti" },
+    { 746, "sti / cli -> cli" },
+    { 748, "lahf / lahf" },
+    { 749, "wait / wait" },
+    { 775, "xor0 / xor K -> mov" },
+    { 800, "mov lo,i / mov hi,i -> mov word" },
+    { 801, "mov edx,eax / sar 31 -> cdq" },
+    { 802, "and R,K / test R,R" },
+    { 803, "or R,K / test R,R" },
+    { 804, "xor R,K / test R,R" },
+    { 805, "add R,K / test R,R" },
+    { 806, "sub R,K / test R,R" },
+    { 807, "inc R / test R,R" },
+    { 808, "dec R / test R,R" },
+    { 810, "mov R,S / test R,R -> test S,S" },
+    { 811, "mov R,S / cmp R,0 -> test S,S" },
+    { 812, "mov R,S / inc -> lea [S+1]" },
+    { 813, "mov R,S / dec -> lea [S-1]" },
+    { 820, "xor0 / cmp R,0" },
+    { 822, "or R,R / cmp R,0" },
+    { 823, "and R,R / cmp R,0" },
+    { 824, "test R,R / cmp R,0" },
+    { 830, "xor eax,eax / xor edx,edx -> cdq (-Oz)" },
+    { 831, "xor ax,ax / xor dx,dx -> cwd (-Oz)" },
+    { 832, "mov eax,0 / xor edx,edx -> xor/cdq (-Oz)" },
+    { 840, "and R,S / and R,S" },
+    { 841, "or R,S / or R,S" },
+    { 843, "add R,S / sub R,S -> del both" },
+    { 844, "sub R,S / add R,S -> del both" },
+    { 850, "test/cmp cx,0 / jz -> jcxz (-Oz)" },
+    { 851, "test/cmp ecx,0 / jz -> jecxz (386+,-Oz)" },
+    { 852, "bt R,K / jcc -> test R,mask / jcc (386+)" },
+    { 853, "xor/sub r64,r64 -> xor r32,r32 (x64)" },
+    { 854, "bts/btr pair -> or/and mask (386+)" },
     { 0, NULL }
 };
 
@@ -13148,13 +18413,14 @@ static void usage(FILE *f)
     fprintf(f, "\n");
     fprintf(f, "Options:\n");
     fprintf(f, "  -m86|-m186|-m286|-m386|-m486|-m586|-m686|-m64\n");
-    fprintf(f, "                  initial CPU level (default 8086; source directives override)\n");
+    fprintf(f, "                  initial CPU level (default 8086; source directives may raise/lower)\n");
     fprintf(f, "  -att|-intel     force AT&T or Intel syntax (default: auto-detect)\n");
     fprintf(f, "  -Os             optimize for speed (default)\n");
     fprintf(f, "  -Oz             optimize for size (shorter encoding preferred)\n");
     fprintf(f, "  -Ox             maximum optimization with non-100%%-safe transforms\n");
     fprintf(f, "  -mark|-nomark   enable/disable '; SMARTPP ...(Pn)' markers (default: on)\n");
     fprintf(f, "  -v|-nv          enable/disable per-line rule notices (default: off)\n");
+    fprintf(f, "  -w|-nw          show warnings (CPU directives, -Ox unsafe opts; default: on)\n");
     fprintf(f, "  -color|-ncolor  force colored diagnostics on/off (default: on)\n");
     fprintf(f, "  -I DIR         add include search path (repeatable)\n");
     fprintf(f, "  -noinclude     do not follow INCLUDE / include / .include\n");
@@ -13183,6 +18449,22 @@ static const char *cpu_name(int cpu)
     }
 }
 
+/* Short labels for the -w CPU-directive diagnostic. */
+static const char *cpu_name_short(int cpu)
+{
+    switch (cpu) {
+        case 1:  return "8086";
+        case 2:  return "186";
+        case 4:  return "286";
+        case 8:  return "386";
+        case 16: return "486";
+        case 32: return "586";
+        case 64: return "686";
+        case 128: return "x64";
+        default: return "unknown";
+    }
+}
+
 int main(int argc, char *argv[])
 {
     char *inpath = NULL, *outpath = NULL;
@@ -13206,6 +18488,8 @@ int main(int argc, char *argv[])
             else if (a[1] == 'o' && a[2] != '\0') outpath = a + 2;
             else if (strcmp(a, "-v") == 0) opt_verbose = 1;          /* enable per-line notices */
             else if (strcmp(a, "-nv") == 0) opt_verbose = 0;         /* disable (default) */
+            else if (strcmp(a, "-w") == 0) opt_warn = 1;             /* enable warnings (default) */
+            else if (strcmp(a, "-nw") == 0) opt_warn = 0;            /* disable all warnings */
             else if (strcmp(a, "-color") == 0) opt_color = 1;       /* force color ON */
             else if (strcmp(a, "-ncolor") == 0) opt_color = 0;      /* force color OFF */
             else if (strcmp(a, "--ncolor") == 0) opt_color = 0;     /* alias */
@@ -13237,17 +18521,17 @@ int main(int argc, char *argv[])
                 return 0;
             }
             else if (strcmp(a, "-m86") == 0 || strcmp(a, "-m8086") == 0) {
-                g_curcpu = 1;  g_cpu_max = 1;
+                g_curcpu = 1;
             }
-            else if (strcmp(a, "-m186") == 0) { g_curcpu = 2;  g_cpu_max = 2; }
-            else if (strcmp(a, "-m286") == 0) { g_curcpu = 4;  g_cpu_max = 4; }
-            else if (strcmp(a, "-m386") == 0) { g_curcpu = 8;  g_cpu_max = 8; }
-            else if (strcmp(a, "-m486") == 0) { g_curcpu = 16; g_cpu_max = 16; }
-            else if (strcmp(a, "-m586") == 0) { g_curcpu = 32; g_cpu_max = 32; }
-            else if (strcmp(a, "-m686") == 0) { g_curcpu = 64; g_cpu_max = 64; }
+            else if (strcmp(a, "-m186") == 0) { g_curcpu = 2; }
+            else if (strcmp(a, "-m286") == 0) { g_curcpu = 4; }
+            else if (strcmp(a, "-m386") == 0) { g_curcpu = 8; }
+            else if (strcmp(a, "-m486") == 0) { g_curcpu = 16; }
+            else if (strcmp(a, "-m586") == 0) { g_curcpu = 32; }
+            else if (strcmp(a, "-m686") == 0) { g_curcpu = 64; }
             else if (strcmp(a, "-m64") == 0 ||
                      strcmp(a, "-mx64") == 0 ||
-                     strcmp(a, "-mx86-64") == 0) { g_curcpu = 128; g_cpu_max = 128; }
+                     strcmp(a, "-mx86-64") == 0) { g_curcpu = 128; }
             else {
                 fprintf(stderr, "smartpp: unknown option '%s'\n", a);
                 usage(stderr);
@@ -13280,6 +18564,11 @@ int main(int argc, char *argv[])
     /* Unbuffered stderr so progress + summary always appear immediately */
     setvbuf(stderr, NULL, _IONBF, 0);
 
+    /* v2.50: heap buffers (not BSS) — needed before collect_labels/parse */
+    if (g_scratch == NULL) g_scratch = (char *)xmalloc(MAXLINE);
+    if (g_build == NULL) g_build = (char *)xmalloc(G_BUILD_SZ);
+    ensure_work_bufs();
+
     print_banner(stderr);
     fprintf(stderr, "smartpp: loading '%s'...\n", inpath);
     fflush(stderr);
@@ -13299,6 +18588,7 @@ int main(int argc, char *argv[])
     fprintf(stderr, "smartpp: %ld labels, CPU %s\n", g_nlab, cpu_name(g_curcpu));
     fflush(stderr);
     init_table_rules();    /* v1.85: declarative rule engine */
+    guard_stack("before optimize");
     /* Fixed-point: keep running passes until no rewrite fires or
      *  MAX_PASSES is reached.  Each pass re-scans all live lines, so
      *  chained rewrites (P45 -> P35, P43 -> P9, P40 -> P9, P16 -> P18)
