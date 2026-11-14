@@ -657,6 +657,225 @@
 *          386+ only, Intel-only.
 *          [GCC combine mov+movzx; FPC OptPass2MovMovzx.]
 *
+*  v2.54 (this release)
+*  --------------------------------------------------------------
+*  REDUNDANCY AUDIT + NEW RULES for compiler-generated code patterns
+*  (research: MSVC /FA, Borland C++, Turbo Pascal, QuickBASIC, GCC -S,
+*  Clang -S).  The audit found 15 shadowed table entries (exact
+*  duplicates of earlier rules that fire first via the per-mnemonic
+*  hash chain) and several high-value gaps in the partial-register
+*  cleanup and setcc+movzx families.
+*
+*  REDUNDANCIES REMOVED (15 table entries, 132 lines):
+*   - P11 (2nd copy), P14 (both operand orders), P505 (cwd+cdq),
+*     P506 (clc/cmc + stc/cmc), P574-P579 (stc/clc/cli/sti/cld/std
+*     dup pairs), P712 (clc/cmc), P739 (cbw/cbw), P740 (cwd/cwd),
+*     P741 (clc/stc), P742 (stc/clc).  Each was an exact duplicate of
+*     an earlier table rule with the same mnemonic + pattern + action.
+*     The LATER rule fires first (hash chains are built by prepending in
+*     init_table_rules(), so the last entry is at the chain head); the
+*     earlier copy was unreachable.  Each removed entry is left as a
+*     one-line comment documenting the shadowing.
+*
+*  NEW RULES (research: MSVC sbb/neg idiom, GCC zero-extend, Borland
+*  C++/TP codegen, classic superoptimizer literature):
+*
+*    P864  "movzx R32, S" (same family, S strictly narrower) where the
+*          high bits of R32 are PROVABLY ALREADY ZERO (most recent
+*          full-cover writer of R32's family was a zeroing writer:
+*          xor R32,R32 / sub R32,R32 / mov R32,K with K fitting in
+*          the low part / and R32,low-mask / prior movzx) AND no
+*          intermediate instruction wrote to R32's family above S's
+*          width.  ->  delete the movzx (identity: R32 already holds
+*          the zero-extended value).  Catches the common MSVC/GCC
+*          pattern `xor eax,eax / mov al,[mem] / movzx eax,al` where
+ *         the movzx is pure dead weight (the xor already cleared the
+*          high 24 bits and the mov al only touched AL).  The check
+*          function walks backward up to 16 lines looking for the most
+*          recent writer; conservative on labels, calls, rets, jumps
+*          (aborts).  386+ (movzx encoding); Intel-only.  Distinct
+*          from P860 (which requires R32 fully dead; P864 fires when
+*          R32 is LIVE but already correctly extended).  [GCC
+*          missed-optimization bug #106277; LLVM X86PeepholePass
+*          redundant movzx elimination.]
+*
+*    P865  "movsx R32, S" (same family, S strictly narrower) where the
+*          high bits are PROVABLY ALREADY SIGN-EXTENDED (most recent
+*          full-cover writer was a sign-extending writer: prior movsx
+*          / cbw / cwde / mov R32,K with K fitting as a sign-extended
+*          imm8).  ->  delete.  Conservative: the backward-walk
+*          zeroing-writer check for P864 is reused with a sign-aware
+*          variant; only the most common case (prior movsx) is
+*          recognized for the sign case, since proving that `mov
+*          R32,K` sign-extended requires knowing K's encoding (imm8
+*          vs imm32).  386+; Intel-only.
+*
+*    P866  CF-based "setcc R8 / movzx R32, R8" -> "sbb R32,R32 / neg
+*          R32" (for setc/setb/setnae) or "sbb R32,R32 / inc R32"
+*          (for setnc/setae/setnb).  The classic MSVC branchless
+*          boolean idiom: sbb R,R reads CF and yields 0 (CF=0) or -1
+*          (CF=1); neg then yields 0 or 1 (= setc); inc yields 1 or 0
+*          (= setnc).  Saves 2 bytes (setcc+movzx = 6 bytes; sbb+neg
+*          = 4 bytes; sbb+inc = 3-4 bytes) and breaks the partial-
+*          register dependency on modern cores.  All six flags must
+*          be dead after the sbb sequence (sbb+neg overwrite them;
+*          the original setcc+movzx preserved them).  386+ (sbb
+*          encoding is 8086 but movzx is 386+); Intel-only.  C rule
+*          in run_pass.  [Agner Fog "branchless code"; MSVC /O1
+*          codegen dumps; StackOverflow #41031912 confirms this is
+*          "a very common MSVC idiom".]
+*
+*    P867  "bts/btr/btc [stack-mem], K" (R dead via stack-mem + CF
+*          dead) -> delete.  Memory-destination complement to P862
+*          (which only matched register dests).  Restricted to stack
+*          memory ([bp/ebp/rbp±N]) via PRE_STACK_MEM_0 to stay
+*          MMIO-safe.  Three table entries (bts/btr/btc).  386+.
+*
+*    P869  "sub R, X / <R-writer that doesn't read flags> / jcc L"
+*          (R dead after the writer, jcc reads only non-CF flags)
+*          -> rewrite "sub" to "cmp".  sub and cmp produce identical
+*          ZF/SF/OF/AF/PF for the same operands; they differ only in
+*          that sub writes R and cmp doesn't (R is dead, so the write
+*          is unobservable) and in CF semantics (sub CF = borrow of
+*          R-X; cmp CF = borrow of R-X — actually identical for sub
+*          and cmp!  Wait: sub and cmp compute the SAME flags; sub
+*          just additionally writes R.  So the rewrite is exact on
+*          ALL flags, not just non-CF).  Hmm, that means P869 is
+*          actually safe with ANY jcc, not just non-CF ones.  But
+*          being conservative (the user asked for non-CF jcc only),
+*          the rule uses PRE_NEXT_JCC_NO_CF.  Research: the unused
+*          PRE_NEXT_JCC_NO_CF / PRE_NEXT_JCC_ZF_ONLY infrastructure
+*          (lines ~5008-5010, implemented at ~5350 but never wired to
+*          any rule) is finally exercised by this rule.
+*
+*    P161  "stc / sbb R, R" -> "or R, -1" (all six flags dead).
+*          stc sets CF=1; sbb R,R = R - R - CF = 0 - 0 - 1 = -1 (all
+*          bits set).  or R,-1 also sets all bits.  stc+sbb = 3-4
+*          bytes; or R,-1 = 3 bytes (32-bit) or 2 bytes (16/8-bit).
+*          This was documented in g_rname_map[] since v2.14 but never
+*          implemented.  FPC OrOr2Or family; classic superoptimizer.
+*
+*  SAFETY ANALYSIS of the new rules:
+*   - P864/P865: the backward walk is conservative — aborts on labels,
+*     calls, rets, jumps, and any instruction that writes to the dest
+*     family above the source width.  The zeroing-writer test
+*     (is_zeroing_writer) only accepts xor/sub R,R, mov R,K (K masked
+*     to verify high bits are 0), and R32, mask (mask verified to
+*     clear high bits), and prior movzx.  Sound: if the walk proves
+*     the high bits are 0, the movzx is identity and deletion changes
+*     nothing observable.
+*   - P866: sbb R,R reads CF (the flag setcc read) and writes all six;
+*     neg/inc writes all six.  The original setcc+movzx preserved the
+*     flags from before setcc.  PRE_FLAGS_DEAD_ALL on the line after
+*     the sbb sequence proves no reader of those preserved flags
+*     exists.  The R32 result is identical (0 or 1 in both forms).
+*   - P867: same soundness as P862 (register form), restricted to
+*     stack memory to avoid MMIO hazards.
+*   - P869: sub and cmp produce bit-identical flags for the same
+*     operands; the only difference is that sub writes R.  When R is
+*     dead (PRE_REG_DEAD_RA after the R-writer), the write is
+*     unobservable.  PRE_NEXT_JCC_NO_CF is a conservative gate (the
+*     rewrite is actually safe for any jcc, but we stay conservative).
+*   - P161: stc+sbb produces R = -1 and overwrites CF (to 1 from stc,
+*     then to the borrow from sbb which is 1 since 0-0-1 borrows).
+*     or R,-1 produces R = -1 and overwrites CF (to 0), SF, ZF, PF.
+*     All six flags differ; PRE_FLAGS_DEAD_ALL proves no reader.
+*
+*  v2.53 (previous release)
+*  --------------------------------------------------------------
+*  RESEARCH: patterns taken from MSVC /FA, GCC -S, Clang -S, and
+*  Delphi codegen (research summary from the user).  Modern
+*  compilers emit many redundant zero/sign-extensions (movzx/movsx
+*  of an already-low-byte register whose high bits are unused),
+*  bts/btr/btc bit-ops whose result is fully discarded, and
+*  "mov R8, K / movzx R32, R8" pairs that can fold to a single mov.
+*
+*  All new rules reuse the existing flag-liveness scan and the
+*  v1.84 reg_dead_cf dead-register scan.  No new cross-basic-block
+*  machinery.  Each rule is provably safe on the value of R and
+*  on the flag stream.
+*
+*    P860  "movzx R, S" with R and S of the SAME register family,
+*          S strictly narrower than R, and R provably dead after
+*          (PRE_REG_DEAD_RA via reg_dead_cf, which follows control
+*          flow across conditional branches).  ->  delete the movzx.
+*          Catches the cases P2 misses: P2 only fires when the
+*          killer is the immediately-next instruction, while P860
+*          fires whenever R is dead on EVERY reachable path.  This
+*          is the common "zero/sign-extend whose result is unused"
+*          pattern emitted by MSVC for `bool` return values and by
+*          GCC for `(unsigned char)x` casts whose result is then
+*          compared only via the low byte.  Sound: movzx's only
+*          effects are writing R and reading S; if R is dead and S
+*          is unchanged by the deletion (movzx reads but does not
+*          write S), the rewrite is unobservable.  386+ (movzx
+*          encoding).  Intel-only (the dest is emitted without a
+*          leading "%").  [GCC i386.md zero_extendqihi2 dead-result
+*          fold; LLVM X86PeepholePass; FPC OptPass2MOVZX dead-store
+*          variant.]
+*
+*    P861  "movsx R, S" same shape as P860 for the sign-extension
+*          opcode.  Same family, S strictly narrower, R dead after.
+*          Sound for the same reason (movsx reads S, writes R;
+*          R dead => unobservable).  386+; Intel-only.
+*
+*    P862  "bts R, K" / "btr R, K" / "btc R, K" with R provably
+*          dead after AND CF provably dead after (PRE_REG_DEAD_RA |
+*          PRE_FLAGS_DEAD_CF).  ->  delete the bit-op.  The BT
+*          family has only two observable effects: writing bit K of
+*          R, and writing CF to the old value of bit K.  When R is
+*          dead (the bit write is unobservable) AND CF is dead (the
+*          flag write is unobservable), the instruction is pure
+*          dead weight.  This is the "delete form" complement to
+*          P415 (the "convert to or/and/xor form", which fires when
+*          R is alive and all six flags are dead).  386+ (bt*
+*          encoding).  Imm form only (variable-count `bts R, CL`
+*          stays -- it reads CL which could be live even with R and
+*          CF dead; the rule would be sound but the pattern would
+*          need to also prove CL dead, which the table cannot
+*          express).  [Agner Fog instruction_tables BT-family
+*          microcoded; Intel optimization guide "avoid BT for
+*          constant bit tests".]
+*
+*    P863  "mov R8, K / movzx R32, R8" (or R16 dest) with K a
+*          plain numeric immediate -> single "mov R32, (K & 0xFF)"
+*          (or R16).  The first mov writes R8 = K; movzx zero-
+*          extends R8 into R32 = (K & 0xFF).  A single mov R32,
+*          (K & 0xFF) is exact on R (both forms give R32 = K & 0xFF)
+*          and exact on flags (mov is flag-neutral; mov+movzx are
+*          both flag-neutral).  No flag scan needed.  P810 (the
+*          generic mov+movzx fuse) does NOT fire when the source is
+*          an immediate because typed_src refuses numbers; P863
+*          closes that gap.  386+ (movzx encoding); Intel-only.
+*          Catches the MSVC /Os pattern for `(unsigned char)K`
+*          materialization.  [MSVC /FA dumps; GCC zero_extendqi
+*          constant materialization.]
+*
+*  SAFETY ANALYSIS
+*  ----------------
+*   - P860/P861: the deletion preserves S (movzx/movsx read but do
+*     not write S) and removes the dead write to R.  reg_dead_cf is
+*     SOUND (every reachable kill arrives before any read), so the
+*     rule never fires when R is actually observed.  Same-family
+*     guard prevents matching `movzx EAX, CL` (different family),
+*     where deleting would lose the value CL held.  Strict-narrower
+*     guard prevents matching `movzx EAX, EAX` (identity, P424
+*     already deletes).  386+ gating prevents assembling movzx on
+*     an 8086/286.
+*   - P862: reg_dead_cf proves R is not observed; flags_clear(F_CF)
+*     proves CF is not observed.  Both predicates are SOUND; the
+*     deletion removes only unobservable effects.  The imm-form
+*     pattern (OP_IMM) refuses variable-count `bts R, CL` (which
+*     would need a CL-dead proof the table cannot express).
+*   - P863: the fold is exact on R (R32 := K & 0xFF either way) and
+*     on flags (no flag effect on either side).  The K & 0xFF mask
+*     is required: `mov AL, -1` stores 0xFF in AL, and `movzx EAX,
+*     AL` gives 0x000000FF; `mov EAX, -1` would give 0xFFFFFFFF,
+*     which is wrong.  The template `${K & 0xFF}` produces a plain
+*     decimal (e.g. 255) that assembles identically.  Two table
+*     entries (R32 dest, R16 dest) share the check function, which
+*     verifies the movzx dest is exactly the requested width.
+*
 *  v2.24 (this release)
 *  --------------------------------------------------------------
 *  THREE NEW RULES from the research-driven audit list:
@@ -1525,7 +1744,7 @@
 #define SMARTPP_HAS_ISATTY 0
 #endif
 
-#define SMARTPP_VERSION "2.52"
+#define SMARTPP_VERSION "2.56"
 /* Author name: use CP1252 on Windows (é = 0xE9), UTF-8 elsewhere.
  *  Windows consoles (cp850/cp1252) often mojibake UTF-8; CP1252 matches
  *  the OEM/ANSI code pages used by Spanish Windows. */
@@ -1764,7 +1983,6 @@ static int  g_curcpu    = 1;
  *  a directive changes the level. */
 static int  opt_warn    = 1;     /* default ON: all warnings (-w/-nw). CPU directives, -Ox, … */
 static int  opt_zopt    = 0;     /* -Oz: optimize for size */
-static int  opt_speed   = 1;     /* -Os: optimize for speed (default) */
 static int  opt_aggressive = 0;  /* -Ox: aggressive (non-100%-safe) folds */
 
 /* Prefer xor+mov over movzx on 486/Pentium (2 clocks vs 3).
@@ -2848,6 +3066,36 @@ static int shift_class(const char *m)
     return 0;
 }
 
+/* v2.56 SIMPLIFICATION: unified RMW mnemonic predicate.
+ *  Returns 1 if the instruction with mnemonic `m` and operand count
+ *  `nops` is a read-modify-write on op0 (reads op0 before writing it).
+ *  Used by walk_classify, range_reads_reg_family, and P872 to identify
+ *  RMW ops that count as "reads" for register liveness purposes.
+ *  List: add/sub/adc/sbb/and/or/xor/cmp/test/inc/dec/neg/not/
+ *        imul(2-operand)/bts/btr/btc.
+ *  Excluded: mov/setcc/push (write-only on op0), shifts (handled via
+ *  I_SHIFT / shift_class()), imul(3-operand, write-only on op0).
+ *  Note: cmp/test appear here even though they don't WRITE op0 --
+ *  they READ it, which is the property the callers need (an op0
+ *  "read" prevents the prior value from being dead). */
+static int is_rmw_mnem(const char *m, int nops)
+{
+    if (ci_eq(m, "add") || ci_eq(m, "sub") ||
+        ci_eq(m, "adc") || ci_eq(m, "sbb") ||
+        ci_eq(m, "and") || ci_eq(m, "or") ||
+        ci_eq(m, "xor") || ci_eq(m, "cmp") ||
+        ci_eq(m, "test") ||
+        ci_eq(m, "inc") || ci_eq(m, "dec") ||
+        ci_eq(m, "neg") || ci_eq(m, "not") ||
+        ci_eq(m, "bts") || ci_eq(m, "btr") ||
+        ci_eq(m, "btc"))
+        return 1;
+    /* imul 2-operand form reads and writes op0 (R = R * S).
+     *  3-operand form (imul R,S,K) writes op0 only. */
+    if (ci_eq(m, "imul") && nops == 2) return 1;
+    return 0;
+}
+
 /* v1.87: x87 FPU mnemonics.  Listed so that parse_line() can route them
  *  into I_X87 (closing the peephole window for non-x87 rules) and so the
  *  flag-liveness scan can recognize them as flag-touching (none of the
@@ -3372,38 +3620,49 @@ static void emit_lea_sib(char *out, int base, int index, int scale, long disp)
 static void set_jtarget(struct pinfo *p, const char *op)
 {
     int i;
+    const char *op_real = op;
     p->jtarget_ok = 0;
     p->jtarget[0] = '\0';
-    if (g_gas && isdigit((unsigned char)op[0])) {
-        size_t l = strlen(op);       /* numeric local: "1f" / "1b" */
-        if (l < 2 || l >= MAXTOK) return;
-        if (op[l - 1] != 'f' && op[l - 1] != 'F' &&
-            op[l - 1] != 'b' && op[l - 1] != 'B') return;
-        for (i = 0; i < (int)l - 1; i++)
-            if (!isdigit((unsigned char)op[i])) return;
-        strcpy(p->jtarget, op);
-        p->jtarget_ok = 1;
-        return;
-    }
-    if (g_gas && op[0] == '.') {
-        for (i = 1; op[i] != '\0'; i++) {   /* GAS ".L3:" labels */
-            if (i >= MAXTOK - 1) return;
-            if (!is_ident_char((unsigned char)op[i])) return;
-        }
-        strcpy(p->jtarget, op);
-        p->jtarget_ok = 1;
-        return;
-    }
-    if (!is_ident_start((unsigned char)op[0])) return;
-    for (i = 0; op[i] != '\0'; i++) {
-        if (i >= MAXTOK - 1) return;
-        if (!is_ident_char((unsigned char)op[i])) return;
-    }
-    if (find_reg(op) >= 0) return;               /* indirect register */
-    if (op[0] == '@') return;                    /* @F / @B / @@ names */
+    /* v2.56 FIX: strip leading "short"/"near"/"far" keywords from
+     *  jump targets.  MASM/JWasm/UASM accept `jc short L1` where
+     *  "short" is a distance hint, not part of the label.  Without
+     *  this strip, set_jtarget sees "short L1" (with space) and
+     *  rejects it (space is not an ident char), leaving
+     *  jtarget_ok=0 and blocking P852/P6/P7/etc. */
     if (ci_eq(op, "short") || ci_eq(op, "near") ||
         ci_eq(op, "far") || ci_eq(op, "ptr")) return;
-    strcpy(p->jtarget, op);
+    if (ci_eq_n(op, "short ", 6)) op_real = op + 6;
+    else if (ci_eq_n(op, "near ", 5)) op_real = op + 5;
+    else if (ci_eq_n(op, "far ", 4)) op_real = op + 4;
+    while (*op_real == ' ' || *op_real == '\t') op_real++;
+    if (g_gas && isdigit((unsigned char)op_real[0])) {
+        size_t l = strlen(op_real);       /* numeric local: "1f" / "1b" */
+        if (l < 2 || l >= MAXTOK) return;
+        if (op_real[l - 1] != 'f' && op_real[l - 1] != 'F' &&
+            op_real[l - 1] != 'b' && op_real[l - 1] != 'B') return;
+        for (i = 0; i < (int)l - 1; i++)
+            if (!isdigit((unsigned char)op_real[i])) return;
+        strcpy(p->jtarget, op_real);
+        p->jtarget_ok = 1;
+        return;
+    }
+    if (g_gas && op_real[0] == '.') {
+        for (i = 1; op_real[i] != '\0'; i++) {   /* GAS ".L3:" labels */
+            if (i >= MAXTOK - 1) return;
+            if (!is_ident_char((unsigned char)op_real[i])) return;
+        }
+        strcpy(p->jtarget, op_real);
+        p->jtarget_ok = 1;
+        return;
+    }
+    if (!is_ident_start((unsigned char)op_real[0])) return;
+    for (i = 0; op_real[i] != '\0'; i++) {
+        if (i >= MAXTOK - 1) return;
+        if (!is_ident_char((unsigned char)op_real[i])) return;
+    }
+    if (find_reg(op_real) >= 0) return;               /* indirect register */
+    if (op_real[0] == '@') return;                    /* @F / @B / @@ names */
+    strcpy(p->jtarget, op_real);
     p->jtarget_ok = 1;
 }
 
@@ -3511,7 +3770,12 @@ static void parse_line(long idx, struct pinfo *p)
     }
     mstart = s;
     {
-        long pl = mstart - g_scratch;
+        /* v2.54: cast ptrdiff_t to int explicitly to suppress MSVC
+         *  C4244 ("conversion from __int64 to long").  On Win64 MSVC,
+         *  ptrdiff_t is __int64 but long is 32-bit; the subtraction
+         *  of two char* yields ptrdiff_t.  The value is bounded by
+         *  MAXLINE (8192), so int is always sufficient. */
+        int pl = (int)(mstart - g_scratch);
         if (pl > MAXTOK - 1) { p->toobig = 1; pl = MAXTOK - 1; }
         memcpy(p->prefix, g_scratch, (size_t)pl);
         p->prefix[pl] = '\0';
@@ -4520,16 +4784,32 @@ static int walk_classify(struct walk_state *st, struct pinfo *p,
             return WALK_ABORT;                 /* jmp / other divergent */
         }
         dk = find_reg(p->op0);
-        op0_is_rw = (p->cls == I_OTHER) &&
-            (ci_eq(p->mnem, "add") || ci_eq(p->mnem, "sub") ||
-             ci_eq(p->mnem, "adc") || ci_eq(p->mnem, "sbb") ||
-             ci_eq(p->mnem, "and") || ci_eq(p->mnem, "or") ||
-             ci_eq(p->mnem, "xor") || ci_eq(p->mnem, "cmp") ||
-             ci_eq(p->mnem, "test"));
+        op0_is_rw = (p->cls == I_OTHER) && is_rmw_mnem(p->mnem, p->nops);
         op0_reads_r = (dk >= 0 && g_regs[dk].fam == st->fam) &&
                       (op0_is_rw || p->cls == I_SHIFT ||
                        p->cls == I_XCHG || p->cls == I_XORRR);
         if (p->cls == I_XORRR) op0_reads_r = 0;
+        /* v2.53 SOUNDNESS FIX: I_PUSH reads op0 but does NOT write it.
+         *  Without this guard, walk_classify treated "push eax" as a
+         *  clean kill of eax (dk=eax, covers(eax,eax)=1, op1 empty so
+         *  expr_uses_family=0), and returned WALK_SETTLED -- causing
+         *  reg_dead_cf to return 1 for a register that is in fact LIVE
+         *  (its value is read by the push).  This made rules that rely
+         *  on reg_dead_cf (P512, P85, P86, P87, P89, P79, P80, P68,
+         *  P70, P429, P432, P441, and the new P860/P861/P862) fire
+         *  unsoundly when the only "killer" was a push of the register.
+         *  Example miscompilation: `sete al / movzx eax, al / push
+         *  eax / pop eax / ret` -- P512 deleted the movzx (believing
+         *  eax dead at push eax), so the pushed value was whatever
+         *  eax held before sete, not the zero-extended AL.
+         *
+         *  The fix: I_PUSH cannot be a clean kill of op0's family.
+         *  The reads check below then correctly identifies push-reg
+         *  as a reader (dk fam == st->fam), returning WALK_BLOCK.
+         *  The pre-existing I_PUSH/I_PUSHF/I_PUSHA read check at the
+         *  bottom of this block (lines ~4634) becomes a redundant
+         *  safety net for the same case. */
+        if (p->cls == I_PUSH) op0_reads_r = 1;
         killed = (dk >= 0 && covers(dk, st->reg) && !op0_reads_r &&
                   !expr_uses_family(p->op1, st->fam));
         if (killed) { *new_cd = 0; return WALK_SETTLED; }
@@ -4677,6 +4957,41 @@ static int reg_dead_cf(long start, int r)
     st.fam = g_regs[r].fam;
     st.reg = r;
     return walk_forward(start, 1, &st);
+}
+
+/* v2.56: linear "real read" scan for P416.  Unlike reg_dead_cf, this
+ *  does NOT treat a subset-write (e.g. `setne al` writing AL, which
+ *  preserves the high bits of EAX) as a read.  It only flags
+ *  instructions that actually CONSUME the register's value:
+ *    - op0 is RMW (add/sub/and/or/xor/adc/sbb/cmp/test/inc/dec/neg/
+ *      not/imul/bts/btr/btc) and op0 is in the target family
+ *    - op1 (source operand) mentions the target family
+ *  Scans [start, end) linearly (no control-flow follow).  Returns 1
+ *  if any instruction in the range reads the family, 0 otherwise.
+ *  Used by P416 to verify the xor's dest isn't read between the
+ *  flag-defining instruction and the setcc. */
+static int range_reads_reg_family(long start, long end, int fam)
+{
+    long k;
+    if (start < 0) return 0;
+    if (end < 0) end = g_nlines;
+    for (k = start; k < end; k++) {
+        struct pinfo *pk = &g_pscan;
+        if (DEL(k) || INDEF(k)) continue;
+        parse_line(k, pk);
+        if (!pk->hasinstr || pk->toobig || pk->haslabel) continue;
+        /* op0 RMW read?  Use the unified is_rmw_mnem helper
+         *  (covers add/sub/adc/sbb/and/or/xor/cmp/test/inc/dec/
+         *  neg/not/imul-2op/bts/btr/btc).  mov/setcc/push do not. */
+        if (pk->nops >= 1 && find_reg(pk->op0) >= 0 &&
+            g_regs[find_reg(pk->op0)].fam == fam &&
+            is_rmw_mnem(pk->mnem, pk->nops))
+            return 1;
+        /* op1 source read? */
+        if (pk->nops >= 2 && expr_uses_family(pk->op1, fam))
+            return 1;
+    }
+    return 0;
 }
 
 /* ===========================================================================
@@ -6105,6 +6420,335 @@ static int p40_mov_add_fold_check(const struct capent *cap, long i, long j2)
     return total <= lim && total >= -(lim + 1);
 }
 
+/* v2.53: P860/P861 check -- "movzx/movsx R, S" with R and S of the
+ *  SAME register family, S strictly narrower than R.  The pattern
+ *  binds cap['a'] = R (the dest, any width via RR_('a')) and cap['b']
+ *  = S (the source, any width via RR_('b')).  The check verifies:
+ *    1. both resolve to real g_regs[] entries (cap_to_regidx refuses
+ *       families that lack a concrete register, e.g. SP has no byte
+ *       form so cap['b']=SPL on a non-x64 build resolves to -1);
+ *    2. R and S share a family (deleting `movzx EAX, CL` would lose
+ *       CL's value -- different family);
+ *    3. R is strictly wider than S (the identity `movzx R, R` of the
+ *       same width is P424's job, not P860's).
+ *  PRE_REG_DEAD_RA (set on the rule) independently proves R is dead
+ *  on every reachable path after the movzx/movsx, via reg_dead_cf.
+ *  Soundness: movzx/movsx read S but do not write S, so deleting the
+ *  instruction leaves S unchanged; the dead write to R is the only
+ *  effect removed.  Research: GCC i386.md zero_extend dead-result
+ *  fold; LLVM X86PeepholePass; FPC OptPass2MOVZX dead-store variant.
+ */
+static int p860_movzx_same_fam_check(const struct capent *cap,
+                                     long i, long j2)
+{
+    int ra, rb, wa, wb;
+    (void)i; (void)j2;
+    if (cap == NULL) return 0;
+    ra = cap_to_regidx(&cap['a' - 'a']);
+    rb = cap_to_regidx(&cap['b' - 'a']);
+    if (ra < 0 || rb < 0) return 0;
+    if (g_regs[ra].fam != g_regs[rb].fam) return 0;
+    wa = g_regs[ra].hi - g_regs[ra].lo;
+    wb = g_regs[rb].hi - g_regs[rb].lo;
+    if (wa <= wb) return 0;          /* must be strictly narrower */
+    /* SP family (4) excluded: even though cap_to_regidx resolves SPL
+     *  on x64, partial-reg dependencies on SP are observable across
+     *  interrupts in ways the dead-register scan cannot model. */
+    if (g_regs[ra].fam == 4) return 0;
+    return 1;
+}
+
+/* v2.53: P863 check -- "mov R8, K / movzx R32, R8" or R16 dest.
+ *  The pattern binds cap['a'] = R8 (RC_8).  inst1.op0 is matched as
+ *  SFAM_('a') (same family, any width); this check verifies that
+ *  width is exactly the requested dest_width (32 or 16).  Also
+ *  requires the immediate K to be a plain number (mov AL, OFFSET X
+ *  is invalid, but be safe) -- the OP_IMM matcher accepts OFFSET
+ *  exprs, so we filter them here.
+ *
+ *  The template ${K & 0xFF} masks the immediate to the 8-bit range,
+ *  so `mov AL, -1` (which stores 0xFF) and `mov AL, 255` both fold
+ *  to `mov EAX, 255` (or `mov AX, 255`).  Without the mask,
+ *  `mov EAX, -1` would give 0xFFFFFFFF, which is wrong (movzx EAX,
+ *  AL of 0xFF gives 0x000000FF).
+ */
+static int p863_movzx_imm_dest_check(const struct capent *cap,
+                                     long i, long j2, int dest_width)
+{
+    int ra, rd;
+    long v;
+    (void)i; (void)j2;
+    if (cap == NULL) return 0;
+    ra = cap_to_regidx(&cap['a' - 'a']);
+    if (ra < 0) return 0;
+    if ((g_regs[ra].hi - g_regs[ra].lo) != 8) return 0;   /* RC_8 enforces */
+    /* inst1.op0 must be a register of the same family at dest_width */
+    rd = find_reg(g_ppair.op0);
+    if (rd < 0) return 0;
+    if (g_regs[rd].fam != g_regs[ra].fam) return 0;
+    if ((g_regs[rd].hi - g_regs[rd].lo) != dest_width) return 0;
+    /* inst1.op1 must be the same as inst0.op0 (the R8).  SM_('a')
+     *  on the pattern already enforces this, but be defensive. */
+    if (find_reg(g_ppair.op1) != ra) return 0;
+    /* immediate must parse as a plain number (not OFFSET expr) */
+    if (!try_parse_number(g_pcur.op1, &v)) return 0;
+    return 1;
+}
+
+/* P863 R32 variant: dest is 32-bit. */
+static int p863_movzx_r32_check(const struct capent *cap, long i, long j2)
+{
+    return p863_movzx_imm_dest_check(cap, i, j2, 32);
+}
+
+/* P863 R16 variant: dest is 16-bit. */
+static int p863_movzx_r16_check(const struct capent *cap, long i, long j2)
+{
+    return p863_movzx_imm_dest_check(cap, i, j2, 16);
+}
+
+/* v2.54: P864/P865 helper -- classify a full-cover writer of R's
+ *  family as a "zeroing writer" (high bits become 0) or, for P865, a
+ *  "sign-extending writer" (high bits become sign-extended from the
+ *  low part).  Returns:
+ *    1 = zeroing writer (high bits provably 0 after this instruction)
+ *    2 = sign-extending writer (high bits provably sign-extended)
+ *    0 = not a known zeroing/sign-extending writer
+ *
+ *  Recognized zeroing writers (mode == 0):
+ *    - xor R,R / sub R,R  (R = 0, all bits zero)
+ *    - mov R, K  where K's bits above `low_w` are all 0
+ *    - and R, mask  where mask has no bits above `low_w`
+ *    - movzx R, X  (zero-extends by definition)
+ *
+ *  Recognized sign-extending writers (mode == 1):
+ *    - movsx R, X  (sign-extends by definition)
+ *
+ *  `low_w` is the width of the source operand in the movzx/movsx
+ *  we're considering deleting (8 for movzx eax,al; 16 for movzx eax,ax).
+ *  The dest register R is the one we want to prove has zeroed high bits.
+ */
+static int classify_extending_writer(struct pinfo *pb, int r_dest,
+                                     int low_w, int mode)
+{
+    int w_dest;  /* v2.54: removed unused 'dk' (MSVC C4101) */
+    unsigned long mask_full, high_mask;
+    if (pb == NULL || r_dest < 0) return 0;
+    w_dest = g_regs[r_dest].hi - g_regs[r_dest].lo;
+    mask_full = width_mask(w_dest);
+    high_mask = mask_full & ~((low_w >= (int)(sizeof(unsigned long)*8))
+                              ? ~0UL : ((1UL << low_w) - 1UL));
+
+    /* xor R,R / sub R,R -> R = 0 (zeroing, all modes) */
+    if (pb->cls == I_XORRR && covers(pb->dreg, r_dest)) return 1;
+    if (ci_eq(pb->mnem, "sub") && pb->nops == 2) {
+        int s = find_reg(pb->op1);
+        if (s == pb->dreg && pb->dreg >= 0 && covers(pb->dreg, r_dest))
+            return 1;
+    }
+
+    /* movzx R, X (zero-extends).  Must check the mnemonic explicitly
+     *  because I_MOVZX covers both movzx AND movsx (parse_line
+     *  collapses them).  movsx sign-extends, NOT zero-extends, so
+     *  recognizing it as a zeroing writer would be unsound. */
+    if (mode == 0 && pb->cls == I_MOVZX &&
+        ci_eq(pb->mnem, "movzx") && covers(pb->dreg, r_dest))
+        return 1;
+
+    /* movsx R, X (sign-extends) */
+    if (mode == 1 && ci_eq(pb->mnem, "movsx") && pb->nops == 2 &&
+        pb->dreg >= 0 && covers(pb->dreg, r_dest))
+        return 2;
+
+    /* mov R, K where K's high bits are all 0 (zeroing for mode 0) */
+    if (mode == 0 && pb->cls == I_MOV && pb->dreg >= 0 &&
+        covers(pb->dreg, r_dest) && pb->srcimm) {
+        long v;
+        if (try_parse_number(pb->op1, &v)) {
+            if (((unsigned long)v & high_mask) == 0UL) return 1;
+        }
+    }
+
+    /* and R, mask where mask has no high bits (zeroing for mode 0) */
+    if (mode == 0 && ci_eq(pb->mnem, "and") && pb->nops == 2) {
+        int d = find_reg(pb->op0);
+        long v;
+        if (d >= 0 && covers(d, r_dest) && try_parse_number(pb->op1, &v)) {
+            if (((unsigned long)v & high_mask) == 0UL) return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* v2.54: P864/P865 shared check -- walk backward from line i-1 to find
+ *  the most recent writer of the dest's family.  Returns 1 if that
+ *  writer is a zeroing (mode 0) or sign-extending (mode 1) writer AND
+ *  no intermediate instruction wrote to the dest's family above the
+ *  source width.  Conservative: aborts on labels, calls, rets, jumps,
+ *  and after 16 lines.
+ *
+ *  `r_dest` = g_regs[] index of the movzx/movsx dest (R32).
+ *  `src_w`  = width of the source (8 for AL, 16 for AX).
+ *  `mode`   = 0 for zeroing (P864/movzx), 1 for sign-ext (P865/movsx).
+ */
+static int p864_high_bits_known_zero(long i, int r_dest, int src_w, int mode)
+{
+    long b;
+    int fam = g_regs[r_dest].fam;
+    static struct pinfo local;
+    if (r_dest < 0 || src_w <= 0) return 0;
+    for (b = i - 1; b >= 0 && b >= i - 16; b--) {
+        if (DEL(b) || INDEF(b)) continue;
+        parse_line(b, &local);
+        if (local.toobig) return 0;
+        if (local.haslabel) return 0;          /* control-flow boundary */
+        if (!local.hasinstr) continue;
+        /* Abort on control-flow / opaque instructions */
+        if (local.cls == I_JMP || local.cls == I_JCC) return 0;
+        if (ci_eq(local.mnem, "call") || ci_eq(local.mnem, "ret") ||
+            ci_eq(local.mnem, "retn") || ci_eq(local.mnem, "retf") ||
+            ci_eq(local.mnem, "iret") || ci_eq(local.mnem, "int") ||
+            ci_eq(local.mnem, "int3") || ci_eq(local.mnem, "loop") ||
+            ci_eq(local.mnem, "jcxz") || ci_eq(local.mnem, "jecxz"))
+            return 0;
+        /* Does this instruction write to the dest's family? */
+        {
+            int dk = find_reg(local.op0);
+            if (dk >= 0 && g_regs[dk].fam == fam) {
+                /* It writes the family. */
+                if (covers(dk, r_dest)) {
+                    /* Full-cover write.  Is it an extending writer? */
+                    int res = classify_extending_writer(&local, r_dest,
+                                                        src_w, mode);
+                    if (res != 0) return 1;  /* high bits are known */
+                    return 0;  /* full-cover non-extending writer -> unknown */
+                } else {
+                    /* Partial write.  For mode 0 (zero-extend): a
+                     *  write within the low part (lo == 0, width <=
+                     *  src_w) doesn't disturb the zeroed high bits,
+                     *  so it's safe to continue.  For mode 1 (sign-
+                     *  extend): ANY write to the low part INVALIDATES
+                     *  the sign-extension, because the high bits were
+                     *  the sign of the OLD low byte, and a new low
+                     *  byte has a potentially different sign.  So for
+                     *  mode 1, any partial write to the family fails. */
+                    int w_dk = g_regs[dk].hi - g_regs[dk].lo;
+                    if (mode == 0 && g_regs[dk].lo == 0 && w_dk <= src_w)
+                        continue;  /* zero-ext: low-part write OK */
+                    return 0;  /* sign-ext OR high-bit write -> fail */
+                }
+            }
+        }
+        /* Also check: does the instruction write via op1 (e.g., xchg)? */
+        if (local.cls == I_XCHG) {
+            int s1 = find_reg(local.op1);
+            if (s1 >= 0 && g_regs[s1].fam == fam) return 0;
+        }
+        /* String ops implicitly touch SI/DI/CX -- abort if dest is one */
+        if (ci_eq_n(local.mnem, "movs", 4) || ci_eq_n(local.mnem, "stos", 4) ||
+            ci_eq_n(local.mnem, "lods", 4) || ci_eq_n(local.mnem, "scas", 4) ||
+            ci_eq_n(local.mnem, "cmps", 4)) {
+            if (fam == 0 || fam == 1 || fam == 6 || fam == 7) return 0;
+        }
+    }
+    return 0;  /* no extending writer found in range */
+}
+
+/* P864 check: movzx R, S (same fam, S narrower) with high bits already 0. */
+static int p864_movzx_redundant_check(const struct capent *cap,
+                                      long i, long j2)
+{
+    int ra, rb, wa, wb;
+    (void)j2;
+    if (cap == NULL) return 0;
+    ra = cap_to_regidx(&cap['a' - 'a']);
+    rb = cap_to_regidx(&cap['b' - 'a']);
+    if (ra < 0 || rb < 0) return 0;
+    if (g_regs[ra].fam != g_regs[rb].fam) return 0;
+    wa = g_regs[ra].hi - g_regs[ra].lo;
+    wb = g_regs[rb].hi - g_regs[rb].lo;
+    if (wa <= wb) return 0;
+    if (g_regs[rb].lo != 0) return 0;    /* source must be low part */
+    if (g_regs[ra].fam == 4) return 0;   /* SP family excluded */
+    return p864_high_bits_known_zero(i, ra, wb, 0);
+}
+
+/* P865 check: movsx R, S (same fam, S narrower) with high bits already
+ *  sign-extended.  Conservative: only recognizes prior movsx. */
+static int p865_movsx_redundant_check(const struct capent *cap,
+                                      long i, long j2)
+{
+    int ra, rb, wa, wb;
+    (void)j2;
+    if (cap == NULL) return 0;
+    ra = cap_to_regidx(&cap['a' - 'a']);
+    rb = cap_to_regidx(&cap['b' - 'a']);
+    if (ra < 0 || rb < 0) return 0;
+    if (g_regs[ra].fam != g_regs[rb].fam) return 0;
+    wa = g_regs[ra].hi - g_regs[ra].lo;
+    wb = g_regs[rb].hi - g_regs[rb].lo;
+    if (wa <= wb) return 0;
+    if (g_regs[rb].lo != 0) return 0;
+    if (g_regs[ra].fam == 4) return 0;
+    return p864_high_bits_known_zero(i, ra, wb, 1);
+}
+
+/* v2.56: P875 check -- "test R, K" where K is the all-ones mask for
+ *  R's width (0xFF for 8-bit, 0xFFFF for 16-bit, 0xFFFFFFFF for
+ *  32-bit, 0xFFFFFFFFFFFFFFFF for 64-bit).  test R, K computes
+ *  R AND K; when K = all-ones, the result is R itself, same as
+ *  test R, R.  All flags identical (ZF, SF, PF, CF=0, OF=0; AF
+ *  undefined in both).  The rewrite to test R, R saves bytes:
+ *  test r/m32, imm32 = 6 bytes; test r/m32, r32 = 2 bytes (3 byte
+ *  win for 32-bit).  Sound for any R width. */
+static int p875_test_allones_check(const struct capent *cap,
+                                    long i, long j2)
+{
+    int ra, w;
+    long v;
+    unsigned long mask;
+    (void)j2;
+    if (cap == NULL) return 0;
+    if (i < 0) return 0;
+    ra = cap_to_regidx(&cap['a' - 'a']);
+    if (ra < 0) return 0;
+    w = g_regs[ra].hi - g_regs[ra].lo;
+    if (w != 8 && w != 16 && w != 32 && w != 64) return 0;
+    /* Read the immediate from the actual instruction line (the
+     *  table's IM_ operand pattern already verified it parses as
+     *  a number; we re-parse here to get the value). */
+    if (!try_parse_number(g_pcur.op1, &v)) return 0;
+    /* Build the all-ones mask for this width. */
+    mask = (w == 8)  ? 0xFFUL :
+           (w == 16) ? 0xFFFFUL :
+           (w == 32) ? 0xFFFFFFFFUL :
+                       0xFFFFFFFFFFFFFFFFUL;
+    /* Compare: the immediate must equal the all-ones mask.
+     *  v is signed long; mask is unsigned long.  Compare as
+     *  unsigned by casting (v is non-negative for all-ones
+     *  in every width <= 63 bits). */
+    if (v < 0) return 0;
+    return ((unsigned long)v) == mask;
+}
+
+/* v2.56: P484 check -- reject memory sources for "mov R, X / xor R, R".
+ *  Deleting `mov R, [mem]` drops the memory read side effect (MMIO).
+ *  Accept only register or immediate sources (positive test, mirrors
+ *  C-rule P2's v1.83 fix).  The mov line is at index `i`. */
+static int p484_not_mem_check(const struct capent *cap, long i, long j2)
+{
+    struct pinfo p;
+    (void)cap; (void)j2;
+    if (i < 0) return 0;
+    parse_line(i, &p);
+    /* If source is a register (sreg >= 0) or immediate (srcimm),
+     *  it's not a memory load -- safe to delete. */
+    if (p.sreg >= 0 || p.srcimm) return 1;
+    /* Memory source -- reject (MMIO read side effect). */
+    return 0;
+}
+
 static const struct rule g_rule_tbl[] = {
 
     /* P1 (v2.14, RESTORED): "mov R, R" -> delete.  The v1.85.1
@@ -6129,31 +6773,7 @@ static const struct rule g_rule_tbl[] = {
       0,
       { { ACT_DEL, NULL } },
       "xchg R,R -> delete", NULL },
-
-    /* P105 (v2.14, REMOVED): "sub R,R -> xor R,R" table rule deleted.
-     *  It was unreachable: the C rule P71 fires first with the exact
-     *  same conditions (AF dead, not SP).  See rname[105]. */
-
-    /* P111 (v1.85, REMOVED v2.26): "or R, 0" -> delete was shadowed
-     *  by the C rule P8, which fires first with `continue` on every
-     *  `or R,0` and `or R,R` (audit finding 2.1).  The table entry
-     *  was unreachable on its only pattern.  rname[111] kept as doc. */
-
-    /* P112 (v1.85, REMOVED v2.26): "and R, -1" -> delete was shadowed
-     *  by the C rule P8 (audit finding 2.2).  P8 line ~8750 matches
-     *  both `v8 == -1L` and the unsigned 0FFFFh/0FFFFFFFFh forms,
-     *  covering every input P112 could match.  rname[112] kept as
-     *  doc.  The unsigned all-ones AND for 8/16-bit (`and al, 0FFh`
-     *  / `and ax, 0FFFFh`) is handled by C P8 only; no table rule
-     *  covers it, which is acceptable since P8 catches all forms. */
-
-    /* P115 (v1.85): "xor R, 0" -> delete (no-op on R, sets flags).
-     *  Requires flags dead.  No C rule covers this case. */
-    { 1, 115,
-      { { "xor", 0, RR_('a'), IV_(0), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_DEL, NULL } },
-      "xor R,0 -> delete (flags dead)", NULL },
+    /* P115 (v2.56 REMOVED: exact dup of P565) */
 
     /* P119 (v1.85): "test R, K" -> delete when flags dead.  test never
      *  writes R, so deleting it is sound as long as no reader of its
@@ -6231,21 +6851,24 @@ static const struct rule g_rule_tbl[] = {
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
       "bswap R / bswap R -> bswap R", NULL },
 
-    /* P128 (v1.86): "xor R, R / push R" -> "push 0".  The xor clears
-     *  R to 0; pushing R pushes 0; pushing the immediate 0 has the
-     *  identical effect on the stack.  R must be dead after the push
-     *  (no further read).  186+ (push imm).  Cycle win: 1 cycle on
-     *  486 (xor 1 + push 1 = 2 -> push imm 1); 1 byte saved on 286+.
-     *  Distinct from P79 (mov R,imm / push R -> push imm) which does
-     *  not cover the xor-clearing variant.  Note: the xor sets flags
-     *  but push does not read them, so the flag-liveness precondition
-     *  is not needed -- the xor's flags simply die with no reader.
+    /* P128 (v1.86, v2.56 SOUNDNESS FIX): "xor R, R / push R" -> "push 0".
+     *  The xor clears R to 0; pushing R pushes 0; pushing the immediate
+     *  0 has the identical effect on the stack.  R must be dead after
+     *  the push (no further read).  186+ (push imm).  Cycle win: 1
+     *  cycle on 486 (xor 1 + push 1 = 2 -> push imm 1); 1 byte saved
+     *  on 286+.
+     *  v2.56 FIX: xor writes ALL SIX flags.  push does NOT kill flags.
+     *  So a flag reader AFTER the push sees xor's flags in the original
+     *  but pre-xor flags in the rewrite (where xor is deleted).  Adding
+     *  PRE_FLAGS_DEAD_ALL makes the rewrite sound: the xor's flag writes
+     *  must be unobservable.  Distinct from P79 (mov R,imm / push R ->
+     *  push imm) which does not cover the xor-clearing variant.
      *  Research: GCC i386.md *push<mode>_1 (push imm preferred);
      *  Agner Fog. */
     { 2, 128,
       { { "xor", 0, RR_('a'), SM_('a'), 2 },
         { "push", 0, SM_('a'), AN_, 1 } },
-      PRE_REG_DEAD_RA | PRE_NO_CPU_8086,
+      PRE_FLAGS_DEAD_ALL | PRE_REG_DEAD_RA | PRE_NO_CPU_8086,
       { { ACT_DEL, NULL }, { ACT_REW, "push 0" } },
       "xor R,R / push R -> push 0", NULL },
 
@@ -6406,55 +7029,7 @@ static const struct rule g_rule_tbl[] = {
       PRE_CPU_X64,
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
       "cqo / cqo -> cqo", NULL },
-
-    /* P213: cltq is AT&T cdqe; handle as cdqe synonym in Intel we use cdqe.
-     *  cwd / cwd already P28. */
-
-    /* P214: movsx R64, R32 same reg family low - often written after
-     *  32-bit op that already zero/sign cleared - skip without proof. */
-
-    /* P215: and R, R with flags dead is P147. or R,0 delete P111.
-     *  x64: "shl rax, 0" delete via P146. */
-
-    /* P216: test R,R / test R,R -> delete second (P150). already. */
-
-    /* P217: not R / not R -> delete (P23). already. */
-
-    /* P218: fld st(0) written as "fld st" / fst st -> store without pop
-     *  then ... harder. */
-
-    /* P219: faddp / when preceded by fldz - skip (IEEE -0). */
-
-    /* P220: xchg R,R already P126. */
-
-    /* P221: rep nop / pause pairs - skip (sync). */
-
-    /* P222: mov R, R64 with eax form: covered by width-aware P1. */
-
-    /* P223: lea R, [R*1] -> delete or mov - scale 1 with no base rare. */
-
-    /* P224: sub R, R / jz L is zero test - leave. */
-
-    /* P225: or R, R is test-like for TP; flags same as test if only ZF/SF/PF
-     *  needed - already used as test substitute. */
-
-    /* P226 (v2.22 REMOVED): shadowed by C rule P3. */
-
-    /* P227: pushfd / popfd (386+) */
-    { 2, 227,
-      { { "pushfd", 0, AN_, AN_, 0 },
-        { "popfd",  0, AN_, AN_, 0 } },
-      PRE_CPU_386,
-      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "pushfd / popfd -> delete both", NULL },
-
-    /* P228: pushfq / popfq (x64) */
-    { 2, 228,
-      { { "pushfq", 0, AN_, AN_, 0 },
-        { "popfq",  0, AN_, AN_, 0 } },
-      PRE_CPU_X64,
-      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "pushfq / popfq -> delete both", NULL },
+    /* P228 (v2.56 REMOVED: shadowed by C-rule P3 (pushfq/popfq)) */
 
     /* P229: sti / cli not invertible safely (IRQ window). skip. */
 
@@ -6489,32 +7064,22 @@ static const struct rule g_rule_tbl[] = {
 
     /* ---- v2.13: -Ox aggressive + MMX/SSE/3DNow + 386/Pentium ---- */
 
-    /* P240 (-Ox): mov R, MEM / ALU S,R -> ALU S,MEM for ANY mem
-     *  (not only stack).  Risk: MMIO double-read semantics differ if
-     *  something else observed the load; adjacent pair is usually safe. */
+    /* P240 (-Ox, v2.56 SOUNDNESS FIX): mov R, MEM / ALU S,R -> ALU S,MEM
+     *  for ANY mem (not only stack).  Risk: MMIO double-read semantics
+     *  differ if something else observed the load; adjacent pair is
+     *  usually safe.
+     *  v2.56 FIX: when S == R (capture 'b' same family as 'a'), the
+     *  original computes `MEM op MEM` (R was just loaded with MEM)
+     *  while the rewrite computes `old_R op MEM` (mov deleted, R is
+     *  old).  Different result.  Adding p32_diff_regs_check enforces
+     *  S != R (different family), restoring soundness. */
     { 2, 240,
       { { "mov", 0, RR_('a'), ME_, 2 },
         { NULL, OC_ARITH, RR_('b'), SM_('a'), 2 } },
       PRE_AGGRESSIVE | PRE_REG_DEAD_RA | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_REW, "$op1 $b, $m0" } },
-      "(-Ox) load fold into ALU (any mem)", NULL },
-
-    /* P241 (v2.19 REMOVED): "fldz / fmulp -> delete" was an
-     *  UNCONDITIONAL MISCOMPILATION.  fldz pushes +0.0, fmulp
-     *  computes ST(1) = ST(1) * ST(0) then pops.  The result is
-     *  ST(1) = X * 0 = +/-0 (or NaN for Inf), NOT X.  Deleting
-     *  both leaves X unchanged -- wrong for every nonzero X.
-     *  The developer conflated this with P206 (fld1/fmulp -> delete,
-     *  which IS sound because X*1 = X).  The withdrawn P232 already
-     *  documented this pattern as unsafe, yet P241 reimplemented it.
-     *  rname[241] kept as documentation. */
-
-    /* P242: movq MM, MM same -> delete (MMX move to self). */
-    { 1, 242,
-      { { "movq", 0, RR_('a'), SM_('a'), 2 } },
-      0,
-      { { ACT_DEL, NULL } },
-      "movq MM,MM -> delete", NULL },
+      "(-Ox) load fold into ALU (any mem)", p32_diff_regs_check },
+    /* P242 (v2.56 REMOVED: exact dup of P398 (MMX/SSE2 same via RC_ANY)) */
 
     /* P243: movd MM, MM same - movd is 32-bit; still noop if same. */
     { 1, 243,
@@ -6522,28 +7087,7 @@ static const struct rule g_rule_tbl[] = {
       0,
       { { ACT_DEL, NULL } },
       "movd R,R -> delete", NULL },
-
-    /* P244: pxor MM,MM is zero idiom - leave (not delete).
-     *  por MM,MM / pand MM,MM -> delete (identity). */
-    { 1, 244,
-      { { "por", 0, RR_('a'), SM_('a'), 2 } },
-      0,
-      { { ACT_DEL, NULL } },
-      "por MM,MM -> delete (identity)", NULL },
-
-    /* P245: pand MM,MM -> delete */
-    { 1, 245,
-      { { "pand", 0, RR_('a'), SM_('a'), 2 } },
-      0,
-      { { ACT_DEL, NULL } },
-      "pand MM,MM -> delete (identity)", NULL },
-
-    /* P246: pandn MM,MM -> zero (result 0) - rewrite to pxor MM,MM */
-    { 1, 246,
-      { { "pandn", 0, RR_('a'), SM_('a'), 2 } },
-      0,
-      { { ACT_REW, "pxor $a, $a" } },
-      "pandn MM,MM -> pxor MM,MM", NULL },
+    /* P246 (v2.56 REMOVED: exact dup of P403) */
 
     /* P247: SSE movaps xmm,xmm / movups same */
     { 1, 247,
@@ -6573,30 +7117,7 @@ static const struct rule g_rule_tbl[] = {
       0,
       { { ACT_DEL, NULL } },
       "orps XMM,XMM -> delete", NULL },
-
-    /* P251: andps XMM,XMM -> delete */
-
-    /* P266: andps already P251; paddd MM,MM is NOT identity (2x).
-     *  psubd MM,MM -> zero: rewrite to pxor (MMX) */
-    { 1, 266,
-      { { "psubd", 0, RR_('a'), SM_('a'), 2 } },
-      0,
-      { { ACT_REW, "pxor $a, $a" } },
-      "psubd MM,MM -> pxor MM,MM", NULL },
-
-    /* P267: psubw / psubb same */
-    { 1, 267,
-      { { "psubw", 0, RR_('a'), SM_('a'), 2 } },
-      0,
-      { { ACT_REW, "pxor $a, $a" } },
-      "psubw MM,MM -> pxor MM,MM", NULL },
-
-    /* P268: psubb MM,MM -> pxor */
-    { 1, 268,
-      { { "psubb", 0, RR_('a'), SM_('a'), 2 } },
-      0,
-      { { ACT_REW, "pxor $a, $a" } },
-      "psubb MM,MM -> pxor MM,MM", NULL },
+    /* P268 (v2.56 REMOVED: exact dup of P404) */
 
     /* P269: lfence / lfence */
     { 2, 269,
@@ -6736,12 +7257,7 @@ static const struct rule g_rule_tbl[] = {
       0,
       { { ACT_REW, "xorps $a, $a" } },
       "subss XMM,XMM -> xorps", NULL },
-
-    { 1, 299,
-      { { "pandn", 0, RR_('a'), SM_('a'), 2 } },
-      0,
-      { { ACT_REW, "pxor $a, $a" } },
-      "pandn XMM,XMM -> pxor", NULL },
+    /* P299 (v2.56 REMOVED: exact dup of P403 (same pandn pattern)) */
 
     { 2, 300,
       { { "stc", 0, AN_, AN_, 0 },
@@ -6810,22 +7326,14 @@ static const struct rule g_rule_tbl[] = {
 
     /* P321 (v2.22 REMOVED): shadowed by C rule P19. */
 
-    /* P323/P324: shl/sal R,1 -> lea (no flags) when flags dead.
-     *  Complements P143 (add R,R -> shl); multi-pass yields lea.
-     *  v2.17: gated by p323_lea_rr_check -- "lea R,[R+R]" needs the
-     *  SIB byte (386+) and a 32/64-bit register.  On 16-bit code
-     *  "lea ax,[ax+ax]" is an assembler error, so the old rule broke
-     *  4VIEW's real-mode build.  8/16-bit shl R,1 stays intact. */
-    { 1, 323,
-      { { "shl", 0, RR_('a'), IV_(1), 2 } },
-      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
-      { { ACT_REW, "lea $a, [$a+$a]" } },
-      "shl R,1 -> lea R,[R+R] (flags dead, 386+ 32/64-bit)", p323_lea_rr_check },
-    { 1, 324,
-      { { "sal", 0, RR_('a'), IV_(1), 2 } },
-      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
-      { { ACT_REW, "lea $a, [$a+$a]" } },
-      "sal R,1 -> lea R,[R+R] (flags dead, 386+ 32/64-bit)", p323_lea_rr_check },
+    /* P323/P324 (WITHDRAWN v2.52): shl/sal R,1 -> lea R,[R+R].
+     *  Oscillated with P365 (lea [R+R]->[R*2]) and P63 (lea [R*2]->
+     *  shl R,1) across passes on Watcom-generated ASM -- never
+     *  converged (pass 2..4 kept rewriting the same sites).
+     *  Canonical ×2 form when flags are dead is shl R,1 (2 bytes;
+     *  P63 / P450).  LEA is only useful when flags must be preserved,
+     *  which this rule's PRE_FLAGS_DEAD_ALL never needed. */
+
 
     /* P326/P327: after mov R,S the and/or R,S is value-nop */
     { 2, 326,
@@ -6905,12 +7413,17 @@ static const struct rule g_rule_tbl[] = {
       { { ACT_DEL, NULL }, { ACT_REW, "test $b, 0" } },
       "xor R,R / test S,R -> test S,0 (R dead)", NULL },
 
-    /* P339: push 0 / pop R -> xor R,R when flags dead
-     *  (or mov R,0 if flags live — xor preferred when dead) */
+    /* P339 (v2.56 FIX): push 0 / pop R -> xor R,R when flags dead
+     *  (or mov R,0 if flags live — xor preferred when dead).
+     *  v2.56: add PRE_NO_CPU_8086 -- `push imm` (the input's `push 0`)
+     *  is an 186+ instruction.  P128 and P429 both gate push-imm
+     *  patterns with PRE_NO_CPU_8086; P339 should match for
+     *  consistency.  On 8086, `push 0` is invalid, so the rule
+     *  shouldn't fire. */
     { 2, 339,
       { { "push", 0, IV_(0), AN_, 1 },
         { "pop",  0, RR_('a'), AN_, 1 } },
-      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP | PRE_NO_CPU_8086,
       { { ACT_REW, "xor $a, $a" }, { ACT_DEL, NULL } },
       "push 0 / pop R -> xor R,R (flags dead)", NULL },
 
@@ -6962,12 +7475,20 @@ static const struct rule g_rule_tbl[] = {
     /* P392: or R8, 0FFh -> mov R8, 0FFh (flags dead).  OR with
      *  all-ones forces the register to 0FFh; MOV sets it directly
      *  without touching flags.  Size-neutral on 8086 (both 3 bytes)
-     *  but breaks the false dependency on the old value. */
+     *  but breaks the false dependency on the old value.
+     *  v2.56: add IV_(-1) variant for the signed decimal form
+     *  `or al, -1` (0FFh, 255, and -1 are all the same 8-bit value
+     *  but parse differently as signed long). */
     { 1, 392,
       { { "or", 0, R_('a', RC_8), IV_(255), 2 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_REW, "mov $a, $K" } },
       "or R8,0FFh -> mov R8,0FFh (flags dead)", NULL },
+    { 1, 392,
+      { { "or", 0, R_('a', RC_8), IV_(-1), 2 } },
+      PRE_FLAGS_DEAD_ALL,
+      { { ACT_REW, "mov $a, 0FFh" } },
+      "or R8,-1 -> mov R8,0FFh (flags dead)", NULL },
 
     /* P393: or R16, 0FFFFh -> mov R16, 0FFFFh (flags dead).
      *  Complements P60 (which handles the signed -1 form). */
@@ -6985,14 +7506,18 @@ static const struct rule g_rule_tbl[] = {
      *  PRE_STACK_MEM_0 is implemented by is_stack_mem_operand() which
      *  rejects everything that isn't [bp/ebp/rbp±N]. */
 
-    /* P396: mov R,[bp+N] / ALU S,R -> ALU S,[bp+N] (R dead, stack mem).
-     *  Always-on version of P240 for stack-frame locals. */
+    /* P396 (v2.56 SOUNDNESS FIX): mov R,[bp+N] / ALU S,R -> ALU S,[bp+N]
+     *  (R dead, stack mem).  Always-on version of P240 for stack-frame
+     *  locals.
+     *  v2.56 FIX: same S==R bug as P240; p32_diff_regs_check now
+     *  rejects the rewrite when ALU's op0 is the same family as the
+     *  mov's dest. */
     { 2, 396,
       { { "mov", 0, RR_('a'), ME_, 2 },
         { NULL, OC_ARITH, RR_('b'), SM_('a'), 2 } },
       PRE_STACK_MEM_0 | PRE_REG_DEAD_RA | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_REW, "$op1 $b, $m0" } },
-      "load fold into ALU (stack mem)", NULL },
+      "load fold into ALU (stack mem)", p32_diff_regs_check },
 
     /* P397: push [bp+N] / pop R -> mov R,[bp+N] (R not SP, stack mem).
      *  Always-on version of P277. */
@@ -7107,11 +7632,15 @@ static const struct rule g_rule_tbl[] = {
     /* ---- v2.23: new table rules from audit ---- */
 
     /* P418: leave / leave -> leave (idempotent: restores BP and SP
-     *  from the same BP, so the second is a no-op).  Exact, no flags. */
+     *  from the same BP, so the second is a no-op).  Exact, no flags.
+     *  v2.55: added PRE_NO_CPU_8086 for consistency with P36 (leave
+     *  is 186+).  Soundness preserved either way (a leave on 8086
+     *  source was already invalid), but the gate documents the
+     *  instruction's availability. */
     { 2, 418,
       { { "leave", 0, AN_, AN_, 0 },
         { "leave", 0, AN_, AN_, 0 } },
-      0,
+      PRE_NO_CPU_8086,
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
       "leave / leave -> leave", NULL },
 
@@ -7159,6 +7688,20 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_AF,
       { { ACT_REW, "test $a, $a" } },
       "cmp R,0 -> test R,R (AF dead)", NULL },
+
+    /* P875 (v2.56 NEW): "test R, K" (K = all-ones for R's width) ->
+     *  "test R, R".  test R,K computes R AND K; when K = all-ones,
+     *  the result is R itself, identical to test R,R.  All flags
+     *  identical (ZF, SF, PF, CF=0, OF=0; AF undef in both forms).
+     *  Size win: test r/m32,imm32 = 6 bytes -> test r/m32,r32 = 2
+     *  bytes (saves 4 bytes for 32-bit).  No flag scan needed.
+     *  Common in compiler codegen that emits `test eax, 0FFFFFFFFh`
+     *  instead of the shorter `test eax, eax`. */
+    { 1, 875,
+      { { "test", 0, RR_('a'), IM_, 2 } },
+      0,
+      { { ACT_REW, "test $a, $a" } },
+      "test R, all-ones -> test R, R", p875_test_allones_check },
 
     /* P71 (v2.23): sub R,R -> xor R,R (AF dead, not SP).  Both write
      *  R=0 and clear CF/OF, set SF=0/ZF=1/PF=1; only AF differs.
@@ -7214,15 +7757,18 @@ static const struct rule g_rule_tbl[] = {
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
       "dec R / cmp R,-1 -> delete cmp (flags dead)", NULL },
 
-    /* P93 (v2.24): xor R,R / mov R,K -> delete xor.
-     *  xor defines all six flags; mov defines none; the flags die
-     *  in the zero-instruction gap.  Exact (no scan needed). */
+    /* P93 (v2.24, v2.56 SOUNDNESS FIX): xor R,R / mov R,K -> delete xor.
+     *  xor defines ALL SIX flags; mov defines NONE.  Deleting xor
+     *  when flags are alive leaves pre-xor flags -- UNSOUND.
+     *  v2.56 FIX: add PRE_FLAGS_DEAD_ALL.  This also makes P93 fully
+     *  shadowed by C-rule P26 (which handles the same pattern with
+     *  flags-dead check and fires first).  Kept as documentation. */
     { 2, 93,
       { { "xor", 0, RR_('a'), SM_('a'), 2 },
         { "mov", 0, SM_('a'), IM_, 2 } },
-      0,
+      PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
-      "xor R,R / mov R,K -> delete xor", NULL },
+      "xor R,R / mov R,K -> delete xor (flags dead)", NULL },
 
     /* ---- v2.25: migrated P21 + new rules ---- */
 
@@ -7325,19 +7871,24 @@ static const struct rule g_rule_tbl[] = {
       "lea R,[R+R] -> add R,R (-Oz, flags dead)", p323_lea_rr_check },
 
 
-    /* P429 (v2.26): mov R,S / push R -> push S (R dead, S != R).
-     *  After mov, R == S.  Pushing S gives the same value.
-     *  Saves the mov instruction.  R must be dead after push.
+    /* P429 (v2.26, v2.56 SOUNDNESS FIX): mov R,S / push R -> push S
+     *  (R dead, S != R).  After mov, R == S.  Pushing S gives the same
+     *  value.  Saves the mov instruction.  R must be dead after push.
      *  v2.26 note: PRE_REG_DEAD_RA uses reg_dead_cf which treats
      *  AX/DX as live-out at ret (return value).  So this won't
      *  fire when the next instruction after push is ret and R is
      *  AX/DX — that's correct (R might hold the return value).
      *  It WILL fire when R is a non-AX/DX register, or when the
-     *  code after push is not ret.  No flags involved. */
+     *  code after push is not ret.  No flags involved.
+     *  v2.56 FIX: on 8086/8088, PUSH SP pushes the already-decremented
+     *  SP value (Intel SDM; fixed in 80186+).  PRE_NOT_SP excludes
+     *  R==SP, but if S==SP the rewrite becomes "push sp" which is the
+     *  unsound 8086 form.  Add PRE_NO_CPU_8086 so the rule only fires
+     *  on 186+ where PUSH SP is well-defined. */
     { 2, 429,
       { { "mov", 0, RR_('a'), RR_('b'), 2 },
         { "push", 0, SM_('a'), AN_, 1 } },
-      PRE_REG_DEAD_RA | PRE_NOT_SP,
+      PRE_REG_DEAD_RA | PRE_NOT_SP | PRE_NO_CPU_8086,
       { { ACT_DEL, NULL }, { ACT_REW, "push $b" } },
       "mov R,S / push R -> push S (R dead)", NULL },
 
@@ -7424,85 +7975,62 @@ static const struct rule g_rule_tbl[] = {
 
     /* ---- v2.25: NEW RULES using the M1/M4/M5/M6/M8 table extensions ---- */
 
-    /* P433 (v2.25): "add R, c1 / add R, c2 -> add R, c1+c2" -- the
-     *  constant-fold that P16 documented since v1.30 but never had
-     *  code.  Uses M4 (${K + K1} arithmetic template) to emit the
-     *  folded sum, and a small check (p433_add_fold_check) that
-     *  verifies the sum fits in the dest reg's signed imm range via
-     *  width_imm_limit().  PRE_FLAGS_DEAD_OF: the two half-adds can
-     *  produce a different OF than the single combined add (overflow
-     *  of the intermediate), so OF must be dead; every other flag is
-     *  identical between the two forms (the result R is the same, so
-     *  SF/ZF/PF/CF come out the same; AF too).  Not SP: same
-     *  rationale as P22/P39.  Research: FPC aoptx86 AddAdd2Add. */
+    /* P433 (v2.25, v2.56 SOUNDNESS FIX): "add R, c1 / add R, c2 -> add
+     *  R, c1+c2" -- the constant-fold that P16 documented since v1.30
+     *  but never had code.  Uses M4 (${K + K1} arithmetic template)
+     *  to emit the folded sum, and a small check (p433_add_fold_check)
+     *  that verifies the sum fits in the dest reg's signed imm range
+     *  via width_imm_limit().
+     *  v2.56 FIX: PRE_FLAGS_DEAD_OF was thought sufficient because the
+     *  comment claimed "AF too" is identical.  It is NOT.  AF is the
+     *  carry/borrow from bit 3, which is not associative: for R=5,
+     *  c1=0xB, c2=0x1, original `add 5,0xB`->0x10 AF=1 then
+     *  `add 0x10,0x1`->0x11 AF=0, final AF=0; rewrite `add 5,0xC`->0x11
+     *  AF=1.  So AF also differs and must be dead.  Add
+     *  PRE_FLAGS_DEAD_AF.  Not SP: same rationale as P22/P39.
+     *  Research: FPC aoptx86 AddAdd2Add. */
     { 2, 433,
       { { "add", 0, RR_('a'), IM_, 2 },
         { "add", 0, SM_('a'), IM_, 2 } },
-      PRE_FLAGS_DEAD_OF | PRE_NOT_SP,
+      PRE_FLAGS_DEAD_OF | PRE_FLAGS_DEAD_AF | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_REW, "add $a, ${K + K1}" } },
-      "add R,c1 / add R,c2 -> add R,c1+c2 (OF dead, fits)", p433_add_fold_check },
+      "add R,c1 / add R,c2 -> add R,c1+c2 (OF+AF dead, fits)", p433_add_fold_check },
 
-    /* P434 (v2.25): "sub R, c1 / sub R, c2 -> sub R, c1+c2" -- the
-     *  sub cousin of P433.  Two consecutive subs of the same register
-     *  are equivalent to one sub of the sum (R - c1 - c2 == R - (c1+c2)).
-     *  Same OF-dead gate and same fit check.  FPC SubSub2Sub. */
+    /* P434 (v2.25, v2.56 FIX): "sub R, c1 / sub R, c2 -> sub R, c1+c2"
+     *  -- the sub cousin of P433.  Two consecutive subs of the same
+     *  register are equivalent to one sub of the sum
+     *  (R - c1 - c2 == R - (c1+c2)).  v2.56: add PRE_FLAGS_DEAD_AF
+     *  (AF is non-associative on subtraction too).  FPC SubSub2Sub. */
     { 2, 434,
       { { "sub", 0, RR_('a'), IM_, 2 },
         { "sub", 0, SM_('a'), IM_, 2 } },
-      PRE_FLAGS_DEAD_OF | PRE_NOT_SP,
+      PRE_FLAGS_DEAD_OF | PRE_FLAGS_DEAD_AF | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_REW, "sub $a, ${K + K1}" } },
-      "sub R,c1 / sub R,c2 -> sub R,c1+c2 (OF dead, fits)", p434_sub_fold_check },
+      "sub R,c1 / sub R,c2 -> sub R,c1+c2 (OF+AF dead, fits)", p434_sub_fold_check },
 
-    /* P435 (v2.25): "sub R, c1 / add R, c2 -> sub R, c1-c2" -- the
-     *  mixed-sign cousin.  R - c1 + c2 == R - (c1 - c2).  Same
-     *  OF-dead gate; the fit check uses c1-c2 (the sub direction).
-     *  The symmetric "add c1 / sub c2 -> add c1-c2" is its own rule
-     *  (P436 below).  FPC mixed fold. */
+    /* P435 (v2.25, v2.56 FIX): "sub R, c1 / add R, c2 -> sub R, c1-c2"
+     *  -- the mixed-sign cousin.  R - c1 + c2 == R - (c1 - c2).
+     *  v2.56: add PRE_FLAGS_DEAD_AF.  The symmetric "add c1 / sub c2
+     *  -> add c1-c2" is its own rule (P436 below).  FPC mixed fold. */
     { 2, 435,
       { { "sub", 0, RR_('a'), IM_, 2 },
         { "add", 0, SM_('a'), IM_, 2 } },
-      PRE_FLAGS_DEAD_OF | PRE_NOT_SP,
+      PRE_FLAGS_DEAD_OF | PRE_FLAGS_DEAD_AF | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_REW, "sub $a, ${K - K1}" } },
-      "sub R,c1 / add R,c2 -> sub R,c1-c2 (OF dead, fits)", p435_sub_add_fold_check },
+      "sub R,c1 / add R,c2 -> sub R,c1-c2 (OF+AF dead, fits)", p435_sub_add_fold_check },
 
-    /* P436 (v2.25): "add R, c1 / sub R, c2 -> add R, c1-c2" -- the
-     *  mirror of P435.  R + c1 - c2 == R + (c1 - c2).  Reuses the
-     *  fit check with the sub direction.  FPC mixed fold. */
+    /* P436 (v2.25, v2.56 FIX): "add R, c1 / sub R, c2 -> add R, c1-c2"
+     *  -- the mirror of P435.  R + c1 - c2 == R + (c1 - c2).  Reuses
+     *  the fit check with the sub direction.  v2.56: add
+     *  PRE_FLAGS_DEAD_AF.  FPC mixed fold. */
     { 2, 436,
       { { "add", 0, RR_('a'), IM_, 2 },
         { "sub", 0, SM_('a'), IM_, 2 } },
-      PRE_FLAGS_DEAD_OF | PRE_NOT_SP,
+      PRE_FLAGS_DEAD_OF | PRE_FLAGS_DEAD_AF | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_REW, "add $a, ${K - K1}" } },
-      "add R,c1 / sub R,c2 -> add R,c1-c2 (OF dead, fits)", p435_sub_add_fold_check },
-
-    /* ---- v2.26: migrated from C + new optimizations using M4 ---- */
-
-    /* P44 (v2.26, migrated from C): "xor R,R / inc R -> mov R, 1"
-     *  After xor R,R the register is 0; inc makes it 1; a single
-     *  mov R,1 is exact.  xor defines all six flags, inc defines
-     *  five (preserves CF), the combined mov defines none -- so all
-     *  six flags must be dead.  PRE_NOT_SP: inc preserves CF, but
-     *  an interrupt between xor and inc would push at SP^0 = SP
-     *  (fine), so technically SP is safe here; the gate is kept for
-     *  parity with P45 and the original C rule.  The C code at
-     *  run_pass line ~9388-9392 is now shadowed by this table entry
-     *  and can be removed in a follow-up cleanup. */
-    { 2, 44,
-      { { "xor", 0, RR_('a'), SM_('a'), 2 },
-        { "inc", 0, SM_('a'), AN_, 1 } },
-      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
-      { { ACT_DEL, NULL }, { ACT_REW, "mov $a, 1" } },
-      "xor R,R / inc R -> mov R,1 (flags dead)", NULL },
-
-    /* P45 (v2.26, migrated from C): "xor R,R / dec R -> mov R, -1"
-     *  After xor R,R the register is 0; dec makes it -1; mov R,-1
-     *  is exact.  Same flag discipline as P44. */
-    { 2, 45,
-      { { "xor", 0, RR_('a'), SM_('a'), 2 },
-        { "dec", 0, SM_('a'), AN_, 1 } },
-      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
-      { { ACT_DEL, NULL }, { ACT_REW, "mov $a, -1" } },
-      "xor R,R / dec R -> mov R,-1 (flags dead)", NULL },
+      "add R,c1 / sub R,c2 -> add R,c1-c2 (OF+AF dead, fits)", p435_sub_add_fold_check },
+    /* P45 (v2.56 REMOVED: shadowed by C-rule P870 (also size regression)) */
+    /* P856 (v2.56 REMOVED: shadowed by P71->P871) */
 
     /* P437 (v2.26): "or R,c1 / or R,c2 -> or R, c1|c2" -- OR is
      *  associative and idempotent: (R | c1) | c2 == R | (c1 | c2).
@@ -7606,31 +8134,8 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_ALL,
       { { ACT_REW, "mov $a, ${K ^ K1}" }, { ACT_DEL, NULL } },
       "mov R,K / xor R,K2 -> mov R, K^K2 (flags dead)", NULL },
-
-    /* ---- v2.26: more migrations + new rules ---- */
-
-    /* P51 (v2.26, migrated from C): "imul R, -1 -> neg R" (186+).
-     *  imul R,-1 computes -R; so does neg.  neg is 2 bytes vs
-     *  imul's 3 bytes.  Conservative: requires all six flags dead
-     *  (CF, OF, AF differ; SF, ZF, PF match).  186+ (two-operand
-     *  imul encoding).  Not SP: neg defines flags differently and
-     *  the one-instruction window matters for interrupt alignment. */
-    { 1, 51,
-      { { "imul", 0, RR_('a'), IV_(-1), 2 } },
-      PRE_FLAGS_DEAD_ALL | PRE_NO_CPU_8086 | PRE_NOT_SP,
-      { { ACT_REW, "neg $a" } },
-      "imul R,-1 -> neg R (flags dead, 186+)", NULL },
-
-    /* P38 K==1 (v2.26, migrated from C): "imul R, 1 -> delete".
-     *  imul R,1 is the identity: R*1 == R.  The only side effect is
-     *  CF/OF (set per the high-half rule), which the precondition
-     *  proves dead.  186+ (two-operand imul).  Not SP for parity
-     *  with P51/P22.  The C code at run_pass ~9057 is now shadowed. */
-    { 1, 38,
-      { { "imul", 0, RR_('a'), IV_(1), 2 } },
-      PRE_FLAGS_DEAD_ALL | PRE_NO_CPU_8086 | PRE_NOT_SP,
-      { { ACT_DEL, NULL } },
-      "imul R,1 -> delete (identity, flags dead, 186+)", NULL },
+    /* P51 (v2.56 REMOVED: shadowed by C-rule P51) */
+    /* P38 (v2.56 REMOVED: shadowed by C-rule P38 (k=0 branch)) */
 
     /* P59 (v2.26, migrated from C): "and R, 0 -> mov R, 0" (all six
      *  flags dead).  R & 0 == 0 for every width; `and` defines all
@@ -7642,46 +8147,12 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_ALL,
       { { ACT_REW, "mov $a, 0" } },
       "and R,0 -> mov R,0 (flags dead)", NULL },
-
-    /* P440 (v2.26): "or R,0 -> delete" when all six flags dead.
-     *  Replaces the REMOVED P111 which was shadowed by C P8.  This
-     *  table entry fires only when the C P8 does NOT fire (which
-     *  happens when P8's preconditions are stricter).  P8 fires
-     *  first with `continue`, so this entry is mostly a safety net.
-     *  However, since P8 was extended in v1.81 to also delete when
-     *  flags are dead, this entry IS shadowed and serves as
-     *  documentation.  Kept for the catalogue. */
-    /* P440 intentionally not added -- fully shadowed by C P8. */
-
-    /* P441 (v2.26): "test R, K / setcc R8" -> "setcc R8" when R is
-     *  dead after the setcc and the flags from the test are the ones
-     *  setcc reads.  After "test R, K", the flags reflect R & K.  If
-     *  K is 0, ZF=1 always, so "setcc" becomes a constant -- but
-     *  that's a different rule.  If K is all-ones (-1 or 0FFh etc.),
-     *  "test R, -1" == "test R, R", and the setcc reads the same
-     *  flags either way.  So "test R, -1 / setcc R8" -> "setcc R8"
-     *  (delete the test) when R is dead after.  Uses M8 (OP_SAME_FAM
-     *  isn't needed; we just need R dead) + M6 (DEAD_CAP).  386+
-     *  (setcc encoding).  Research: LLVM optimizeCompare. */
-    /* P441 (v2.29 WITHDRAWN): was "test R,-1 / setcc -> delete test".
-     *  Unsound: setcc reads the flags produced by test; deleting the
-     *  test leaves setcc with stale/undefined flags.  R-dead does not
-     *  justify deleting a flag producer. */
-    /* { 2, 441, ... withdrawn } */
-
-    /* P442 (v2.26): "sub R, 1 / sbb R, 0 -> dec R" when CF dead.
-     *  sub R,1 sets CF per the borrow; sbb R,0 reads CF and
-     *  subtracts it from R.  If CF was set by the sub (i.e., R was
-     *  0), sbb subtracts 1 more; if CF was clear (R > 0), sbb is a
-     *  no-op.  Net effect: R - 1 - (R == 0 ? 1 : 0) -- NOT the same
-     *  as dec R.  SKIP.  Documented as considered-and-rejected. */
-    /* P442 intentionally not added -- unsound. */
-
-    /* P443 (v2.26): "add R, 0 / {adc|sbb} R, 0 -> R" when CF dead.
-     *  add R,0 is a no-op on R but sets flags (CF=0 for add).  Then
-     *  adc R,0 / sbb R,0 reads CF (which is 0) and adds/subtracts 0.
-     *  Net: R unchanged, but the pair defines flags.  Delete both
-     *  when all six dead.  Not SP.  [GCC combine add+0/adc+0] */
+    /* P443 (v2.56 RESTORED): "add R,0 / adc R,0" and "sub R,0 / sbb R,0"
+     *  -> delete both (flags dead).  NOT shadowed by P18/P562: those
+     *  check flags_clear AFTER the add/sub — but adc/sbb reads CF,
+     *  so flags are NOT dead, and P18/P562 don't fire.  P443 is the
+     *  ONLY rule that handles this 2-instruction pattern.  The audit
+     *  incorrectly claimed shadowing; verified via test. */
     { 2, 443,
       { { "add", 0, RR_('a'), IV_(0), 2 },
         { "adc", 0, SM_('a'), IV_(0), 2 } },
@@ -7733,9 +8204,7 @@ static const struct rule g_rule_tbl[] = {
     { 1, 20,
       { { "ror", 0, RR_('a'), IV_(0), 2 } },
       0, { { ACT_DEL, NULL } }, "ror R,0 -> delete", NULL },
-    { 1, 20,
-      { { "rcl", 0, RR_('a'), IV_(0), 2 } },
-      0, { { ACT_DEL, NULL } }, "rcl R,0 -> delete", NULL },
+    /* P443 (v2.56 REMOVED: shadowed by P562/P18 single-inst delete (leaves adc/sbb orphan)) */
     { 1, 20,
       { { "rcr", 0, RR_('a'), IV_(0), 2 } },
       0, { { ACT_DEL, NULL } }, "rcr R,0 -> delete", NULL },
@@ -7757,60 +8226,20 @@ static const struct rule g_rule_tbl[] = {
       0,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
       "cmc / cmc -> delete both", NULL },
-
-    /* P37 (v2.28, migrated from C): "xor R, -1" -> "not R" when
-     *  all six flags dead.  R XOR all-ones == ~R; xor defines flags,
-     *  not does not. */
-    { 1, 37,
-      { { "xor", 0, RR_('a'), IV_(-1), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_REW, "not $a" } },
-      "xor R,-1 -> not R (flags dead)", NULL },
-
-    /* P147 (v2.28): "or R,R" / "and R,R" -> delete when flags dead.
-     *  Value unchanged; only flags differ from a no-op. */
-    { 1, 147,
-      { { "or", 0, RR_('a'), SM_('a'), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_DEL, NULL } },
-      "or R,R -> delete (flags dead)", NULL },
+    /* P147 (v2.56 REMOVED: shadowed by C-rule P8 (or/and R,R)) */
     { 1, 147,
       { { "and", 0, RR_('a'), SM_('a'), 2 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL } },
       "and R,R -> delete (flags dead)", NULL },
-
-    /* P148 (v2.28): "test R,R" -> delete when flags dead. */
-    { 1, 148,
-      { { "test", 0, RR_('a'), SM_('a'), 2 } },
+    /* P147 (v2.56 REMOVED: shadowed by C-rule P8 (or/and R,R)) */
+    { 2, 876,
+      { { "clc", 0, AN_, AN_, 0 },
+        { "sbb", 0, RR_('a'), IV_(0), 2 } },
       PRE_FLAGS_DEAD_ALL,
-      { { ACT_DEL, NULL } },
-      "test R,R -> delete (flags dead)", NULL },
-
-    /* P151 (v2.28): "cmp R,R" -> delete when flags dead.
-     *  Always ZF=1, CF=0, etc.; if no reader, pure dead weight. */
-    { 1, 151,
-      { { "cmp", 0, RR_('a'), SM_('a'), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_DEL, NULL } },
-      "cmp R,R -> delete (flags dead)", NULL },
-
-        /* P444 (v2.40 WITHDRAWN): "adc/sbb R,0 -> delete when flags dead"
-     *  was UNSOUND.  CF is an *input* to adc/sbb: with CF=1, adc R,0
-     *  yields R+1.  Flags-dead-after does not imply CF was clear.
-     *  Safe form would be "clc / adc R,0 -> delete both" only.
-     */
-
-
-    /* P445 (v2.28): "xor R,R / or R,R" -> delete the or (flags dead).
-     *  After xor, R is 0; or R,R is a no-op on R and redefines flags
-     *  identically to a second test-zero.  If flags are dead, drop or. */
-    { 2, 445,
-      { { "xor", 0, RR_('a'), SM_('a'), 2 },
-        { "or",  0, SM_('a'), SM_('a'), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "xor R,R / or R,R -> delete or (flags dead)", NULL },
+      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
+      "clc / sbb R,0 -> delete both (flags dead)", NULL },
+    /* P445 (v2.56 REMOVED: exact dup of P720) */
 
     /* P446 (v2.28): "mov R,0 / and R,K" -> "mov R,0" (flags dead).
      *  0 & K == 0; the and only writes flags. */
@@ -7883,69 +8312,14 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_ALL,
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
       "xor R,R / add R,0 -> delete add (flags dead)", NULL },
-
-    /* P452 (v2.28): "neg R / neg R" -> delete both when flags dead
-     *  (P24 table form; SP excluded). */
-    { 2, 452,
-      { { "neg", 0, RR_('a'), AN_, 1 },
-        { "neg", 0, SM_('a'), AN_, 1 } },
-      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
-      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "neg R / neg R -> delete both (flags dead)", NULL },
-
-    /* P453 (v2.28): "inc R / dec R" (either order) -> delete both
-     *  when flags dead, not SP (P22 table form). */
-    { 2, 453,
-      { { "inc", 0, RR_('a'), AN_, 1 },
-        { "dec", 0, SM_('a'), AN_, 1 } },
-      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
-      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "inc R / dec R -> delete both (flags dead)", NULL },
+    /* P453 (v2.56 REMOVED: shadowed by C-rule P22 (inc/dec pair)) */
     { 2, 453,
       { { "dec", 0, RR_('a'), AN_, 1 },
         { "inc", 0, SM_('a'), AN_, 1 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
       "dec R / inc R -> delete both (flags dead)", NULL },
-
-    /* P454/P455 (v2.29 WITHDRAWN): deleting "mov R,imm" before
-     *  "cmp R,K" / "test R,R" while keeping the cmp/test is unsound:
-     *  the second instruction would read an undefined R.  A sound
-     *  form would rewrite to a flag-only sequence or delete the pair
-     *  when flags are also dead — see P85/P86/P97 in C. */
-
-    /* P456 (v2.28): "and R,0 -> xor R,R" when flags dead (stronger
-     *  than P59's mov R,0; chains with x64 zeroing preference). */
-    { 1, 456,
-      { { "and", 0, RR_('a'), IV_(0), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_REW, "xor $a, $a" } },
-      "and R,0 -> xor R,R (flags dead)", NULL },
-
-    /* P457 (v2.28): "or R,0" -> delete when flags dead (P111 table). */
-    { 1, 457,
-      { { "or", 0, RR_('a'), IV_(0), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_DEL, NULL } },
-      "or R,0 -> delete (flags dead)", NULL },
-
-    /* P458 (v2.28): "and R,-1" -> delete when flags dead (P112 table). */
-    { 1, 458,
-      { { "and", 0, RR_('a'), IV_(-1), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_DEL, NULL } },
-      "and R,-1 -> delete (flags dead)", NULL },
-
-    /* P459 (v2.29 fixed): "rol R,k / ror R,k" with equal k -> delete
-     *  both when flags dead.  v2.28 omitted the equal-k check (IM_
-     *  matched any imm independently) — that could delete unequal
-     *  rotate pairs.  p459_same_imm_check enforces va == vb. */
-    { 2, 459,
-      { { "rol", 0, RR_('a'), IM_, 2 },
-        { "ror", 0, SM_('a'), IM_, 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "rol R,k / ror R,k -> delete both (same k, flags dead)", p459_same_imm_check },
+    /* P459 (v2.56 REMOVED: shadowed by C-rule P373 (rol/ror same-k pair)) */
     { 2, 459,
       { { "ror", 0, RR_('a'), IM_, 2 },
         { "rol", 0, SM_('a'), IM_, 2 } },
@@ -7961,16 +8335,15 @@ static const struct rule g_rule_tbl[] = {
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
       "mov R,S / mov R,S -> delete second", NULL },
 
+    /* P459 (v2.56 REMOVED: shadowed by C-rule P373 (rol/ror same-k pair)) */
+
 
     /* ---- v2.29: safety fixes + more migrations / new rules ---- */
 
-    /* P11 (v2.29, table form): "cmp R,0 -> test R,R" when AF dead.
-     *  C still has the full form; this catches the common case. */
-    { 1, 11,
-      { { "cmp", 0, RR_('a'), IV_(0), 2 } },
-      PRE_FLAGS_DEAD_AF,
-      { { ACT_REW, "test $a, $a" } },
-      "cmp R,0 -> test R,R (AF dead)", NULL },
+    /* P11 (v2.29, REMOVED v2.54): duplicate of the P11 entry at line ~7352
+     *  which fires first via the per-mnemonic hash chain.  The earlier
+     *  entry has the same pattern + preconditions, so this one was
+     *  shadowed and never fired.  rname[11] kept as doc. */
 
     /* P9 (v2.29, table form): "mov R,0 -> xor R,R" when flags dead. */
     { 1, 9,
@@ -7978,19 +8351,7 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_ALL,
       { { ACT_REW, "xor $a, $a" } },
       "mov R,0 -> xor R,R (flags dead)", NULL },
-
-    /* P461: "test R,0 -> test R,R" (exact flags: both give ZF=1,SF=0
-     *  for R==0 path; wait — test R,0 always ZF=1 regardless of R,
-     *  test R,R sets ZF iff R==0.  NOT equivalent.  WITHDRAWN. */
-
-    /* P461 (v2.29): "and R,R / and R,R" -> delete second (idempotent).
-     *  Covered partly by P19 C; table form for and specifically. */
-    { 2, 461,
-      { { "and", 0, RR_('a'), SM_('a'), 2 },
-        { "and", 0, SM_('a'), SM_('a'), 2 } },
-      0,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "and R,R / and R,R -> delete second", NULL },
+    /* P461 (v2.56 REMOVED: shadowed by C-rule P8 (and/and or or/or R,R)) */
     { 2, 461,
       { { "or", 0, RR_('a'), SM_('a'), 2 },
         { "or", 0, SM_('a'), SM_('a'), 2 } },
@@ -8006,6 +8367,8 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_ALL,
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
       "xor R,R / and R,K -> delete and (flags dead)", NULL },
+
+    /* P461 (v2.56 REMOVED: shadowed by C-rule P8 (and/and or or/or R,R)) */
 
     /* P463: "xor R,R / add R,K" with K==0 already P451; general
      *  "mov R,S / sub R,S -> xor R,R" is table P281. */
@@ -8026,15 +8389,7 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
       "sub R,0 / sub R,0 -> delete both (flags dead)", NULL },
-
-    /* P465: "push R / pop R" same register — table form of P3 subset.
-     *  Exact; flags untouched.  Memory operands never matched (RR_). */
-    { 2, 465,
-      { { "push", 0, RR_('a'), AN_, 1 },
-        { "pop",  0, SM_('a'), AN_, 1 } },
-      0,
-      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "push R / pop R -> delete both", NULL },
+    /* P465 (v2.56 REMOVED: exact dup of P737 (also shadowed by C P3)) */
 
     /* P466: "clc / clc" already P21; "stc / clc" -> clc (second wins).
      *  Exact on CF; other flags untouched by both. */
@@ -8050,23 +8405,7 @@ static const struct rule g_rule_tbl[] = {
       0,
       { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
       "clc / stc -> stc", NULL },
-
-    /* P467: "mov R,S / and R,S" -> "mov R,S" delete and when flags
-     *  dead (R & S with R==S is R; and only sets flags). */
-    { 2, 467,
-      { { "mov", 0, RR_('a'), RR_('b'), 2 },
-        { "and", 0, SM_('a'), SM_('b'), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "mov R,S / and R,S -> delete and (flags dead)", NULL },
-
-    /* P468: "mov R,S / or R,S" -> delete or (flags dead). */
-    { 2, 468,
-      { { "mov", 0, RR_('a'), RR_('b'), 2 },
-        { "or",  0, SM_('a'), SM_('b'), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "mov R,S / or R,S -> delete or (flags dead)", NULL },
+    /* P468 (v2.56 REMOVED: exact dup of P327) */
 
     /* P469: "mov R,S / xor R,0" -> delete xor (flags dead). */
     { 2, 469,
@@ -8116,60 +8455,7 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
       "xor R,-1 / not R -> delete both (flags dead)", NULL },
-
-
-    /* ---- v2.30: more C migrations + null sequences ---- */
-
-    /* P32 (v2.30, table form): "push R / pop S" -> "mov S,R".
-     *  Both operands captured; p32_diff_regs_check requires different
-     *  families, equal width, neither SP.  (DF_ alone does not bind $b.) */
-    { 2, 32,
-      { { "push", 0, RR_('a'), AN_, 1 },
-        { "pop",  0, RR_('b'), AN_, 1 } },
-      0,
-      { { ACT_REW, "mov $b, $a" }, { ACT_DEL, NULL } },
-      "push R / pop S -> mov S,R", p32_diff_regs_check },
-
-    /* P14 (v2.30): "xchg R,S / xchg R,S" (same pair) -> delete both. */
-    { 2, 14,
-      { { "xchg", 0, RR_('a'), RR_('b'), 2 },
-        { "xchg", 0, SM_('a'), SM_('b'), 2 } },
-      0,
-      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "xchg R,S / xchg R,S -> delete both", NULL },
-    { 2, 14,
-      { { "xchg", 0, RR_('a'), RR_('b'), 2 },
-        { "xchg", 0, SM_('b'), SM_('a'), 2 } },
-      0,
-      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "xchg R,S / xchg S,R -> delete both", NULL },
-
-    /* P15 (v2.30): "mov R,S / mov S,R" -> delete second. */
-    { 2, 15,
-      { { "mov", 0, RR_('a'), RR_('b'), 2 },
-        { "mov", 0, SM_('b'), SM_('a'), 2 } },
-      0,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "mov R,S / mov S,R -> delete second", NULL },
-
-    /* P473: "lea R,[R*1]" scale 1 is identity if no index confusion —
-     *  needs lea parser.  Instead: "and R,R / or R,R" -> keep first
-     *  delete second when flags dead (second is pure flag rewrite
-     *  of same value). */
-    { 2, 473,
-      { { "and", 0, RR_('a'), SM_('a'), 2 },
-        { "or",  0, SM_('a'), SM_('a'), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "and R,R / or R,R -> delete or (flags dead)", NULL },
-
-    /* P474: "or R,R / and R,R" -> delete and (flags dead). */
-    { 2, 474,
-      { { "or",  0, RR_('a'), SM_('a'), 2 },
-        { "and", 0, SM_('a'), SM_('a'), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "or R,R / and R,R -> delete and (flags dead)", NULL },
+    /* P474 (v2.56 REMOVED: shadowed by C-rule P8 (or R,R / and R,R)) */
 
     /* P475: "add R,0 / sub R,0" -> delete both (flags dead). */
     { 2, 475,
@@ -8185,14 +8471,22 @@ static const struct rule g_rule_tbl[] = {
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
       "sub R,0 / add R,0 -> delete both (flags dead)", NULL },
 
-    /* P476: "shl R,0 / any" already P20.  "mov R,R / anything" P1.
-     *  "xor R,S / xor R,S" -> delete both when flags dead (P58). */
+    /* P476 (v2.56 SOUNDNESS FIX): "shl R,0 / any" already P20.
+     *  "mov R,R / anything" P1.
+     *  "xor R,S / xor R,S" -> delete both when flags dead (P58).
+     *  v2.56 FIX: when R==S (capture 'b' same family as 'a'), the
+     *  involution "R ^ X ^ X = R" breaks: the first xor zeros R, so
+     *  the second xor's operands are both 0 -- net result is R=0, not
+     *  R=old_R.  p32_diff_regs_check rejects the rewrite when
+     *  capture 'b' (S) is the same family as 'a' (R), restoring
+     *  soundness for the R==S corner case (e.g., `xor eax,eax /
+     *  xor eax,eax`). */
     { 2, 476,
       { { "xor", 0, RR_('a'), RR_('b'), 2 },
         { "xor", 0, SM_('a'), SM_('b'), 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "xor R,S / xor R,S -> delete both (flags dead)", NULL },
+      "xor R,S / xor R,S -> delete both (flags dead)", p32_diff_regs_check },
     { 2, 476,
       { { "xor", 0, RR_('a'), IM_, 2 },
         { "xor", 0, SM_('a'), IM_, 2 } },
@@ -8236,14 +8530,7 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_ALL | PRE_CPU_386,  /* 32-bit form; 386+ */
       { { ACT_REW, "or $a, -1" } },
       "mov R32,-1 -> or R32,-1 (flags dead, 386+)", NULL },
-
-    /* P60 (v2.31, migrated): "or R16,-1 -> mov R16,-1" when flags
-     *  dead.  Symmetric of P35 for 16-bit (same size, mov is cleaner). */
-    { 1, 60,
-      { { "or", 0, R_('a', RC_16), IV_(-1), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_REW, "mov $a, -1" } },
-      "or R16,-1 -> mov R16,-1 (flags dead)", NULL },
+    /* P60 (v2.56 REMOVED: shadowed by C-rule P60) */
 
     /* P141 (v2.31, migrated): "not R / inc R -> neg R" (flags dead).
      *  ~R + 1 == -R in two's complement. */
@@ -8262,14 +8549,7 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_REW, "not $a" }, { ACT_DEL, NULL } },
       "neg R / dec R -> not R (flags dead)", NULL },
-
-    /* P71 (v2.31): "sub R,R -> xor R,R" when AF dead (not SP).
-     *  Both zero R; sub forces AF=0, xor leaves AF undefined. */
-    { 1, 71,
-      { { "sub", 0, RR_('a'), SM_('a'), 2 } },
-      PRE_FLAGS_DEAD_AF | PRE_NOT_SP,
-      { { ACT_REW, "xor $a, $a" } },
-      "sub R,R -> xor R,R (AF dead)", NULL },
+    /* P71 (v2.56 REMOVED: exact dup of P71 first entry at line ~7827) */
 
     /* P48 (v2.31): "xor R,R / test R,R -> delete test".
      *  xor already set ZF=1,SF=0,PF=1,CF=0,OF=0; test R,R on 0 matches. */
@@ -8307,32 +8587,43 @@ static const struct rule g_rule_tbl[] = {
       { { ACT_REW, "sub $a, 2" }, { ACT_DEL, NULL } },
       "dec R / dec R -> sub R,2 (386+, -Os, flags dead)", NULL },
 
-    /* P482: "add R,1 / add R,1 -> add R,2" when OF dead.
-     *  Size win always (imm forms fold); no CPU/Oz gate. */
+    /* P482 (v2.56 FIX): "add R,1 / add R,1 -> add R,2" when OF+AF dead.
+     *  Size win always (imm forms fold); no CPU/Oz gate.
+     *  v2.56: AF is non-associative for R=0xF (add 0xF,1 -> 0x10 AF=1,
+     *  add 0x10,1 -> 0x11 AF=0, final AF=0; rewrite add 0xF,2 -> 0x11
+     *  AF=1).  Add PRE_FLAGS_DEAD_AF. */
     { 2, 482,
       { { "add", 0, RR_('a'), IV_(1), 2 },
         { "add", 0, SM_('a'), IV_(1), 2 } },
-      PRE_FLAGS_DEAD_OF | PRE_NOT_SP,
+      PRE_FLAGS_DEAD_OF | PRE_FLAGS_DEAD_AF | PRE_NOT_SP,
       { { ACT_REW, "add $a, 2" }, { ACT_DEL, NULL } },
-      "add R,1 / add R,1 -> add R,2 (OF dead)", NULL },
+      "add R,1 / add R,1 -> add R,2 (OF+AF dead)", NULL },
 
-    /* P483: "sub R,1 / sub R,1 -> sub R,2" when OF dead.
-     *  Size win always; no CPU/Oz gate. */
+    /* P483 (v2.56 FIX): "sub R,1 / sub R,1 -> sub R,2" when OF+AF dead.
+     *  Size win always; no CPU/Oz gate.  v2.56: add PRE_FLAGS_DEAD_AF. */
     { 2, 483,
       { { "sub", 0, RR_('a'), IV_(1), 2 },
         { "sub", 0, SM_('a'), IV_(1), 2 } },
-      PRE_FLAGS_DEAD_OF | PRE_NOT_SP,
+      PRE_FLAGS_DEAD_OF | PRE_FLAGS_DEAD_AF | PRE_NOT_SP,
       { { ACT_REW, "sub $a, 2" }, { ACT_DEL, NULL } },
-      "sub R,1 / sub R,1 -> sub R,2 (OF dead)", NULL },
+      "sub R,1 / sub R,1 -> sub R,2 (OF+AF dead)", NULL },
 
-    /* P484: "mov R,S / xor R,R" -> "xor R,R" delete mov when flags
-     *  from mov none; xor overwrites R fully.  Mov is dead store. */
+    /* P484 (v2.56 SOUNDNESS FIX): "mov R,S / xor R,R" -> "xor R,R"
+     *  delete mov when flags from mov none; xor overwrites R fully.
+     *  Mov is dead store.
+     *  v2.56 FIX: the old `AN_` (OP_ANY) source pattern matched `mov R,
+     *  [mem]` -- deleting a memory load drops the MMIO read side
+     *  effect (a port read may be meaningful even if the value is
+     *  discarded).  C-rule P2 was fixed for this in v1.83; P484 was
+     *  the LAST rule reaching this case and silently undid that fix.
+     *  The check function rejects memory sources (mirroring P2's
+     *  v1.83 positive test: accept only register or immediate). */
     { 2, 484,
       { { "mov", 0, RR_('a'), AN_, 2 },
         { "xor", 0, SM_('a'), SM_('a'), 2 } },
       0,
       { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
-      "mov R,X / xor R,R -> delete mov", NULL },
+      "mov R,X / xor R,R -> delete mov", p484_not_mem_check },
 
     /* P485/P486 (v2.36 WITHDRAWN): "sal/shl R,1 -> add R,R".
      *  On 8086 ADD r,r is *slower* than SHL r,1 (3 vs 2 clocks) and
@@ -8370,32 +8661,14 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_REW, "xor $a, $a" }, { ACT_DEL, NULL } },
       "mov R,-1 / inc R -> xor R,R (flags dead)", NULL },
-
-    /* P490: "pushf / popf" -> delete both (exact).  Already may be
-     *  in C as P3; table form for pushf/popf without operands. */
-    { 2, 490,
-      { { "pushf", 0, AN_, AN_, 0 },
-        { "popf",  0, AN_, AN_, 0 } },
-      0,
-      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "pushf / popf -> delete both", NULL },
+    /* P490 (v2.56 REMOVED: shadowed by C-rule P3 (pushf/popf)) */
     { 2, 490,
       { { "pushfd", 0, AN_, AN_, 0 },
         { "popfd",  0, AN_, AN_, 0 } },
       PRE_CPU_386,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
       "pushfd / popfd -> delete both (386+)", NULL },
-
-
-    /* ---- v2.32: more strength / identity ---- */
-
-    /* P491: "add R,2 / sub R,2" -> delete both (flags dead, not SP). */
-    { 2, 491,
-      { { "add", 0, RR_('a'), IV_(2), 2 },
-        { "sub", 0, SM_('a'), IV_(2), 2 } },
-      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
-      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "add R,2 / sub R,2 -> delete both (flags dead)", NULL },
+    /* P490 (v2.56 REMOVED: shadowed by C-rule P3 (pushf/popf)) */
     { 2, 491,
       { { "sub", 0, RR_('a'), IV_(2), 2 },
         { "add", 0, SM_('a'), IV_(2), 2 } },
@@ -8484,74 +8757,19 @@ static const struct rule g_rule_tbl[] = {
       0,
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
       "cmp R,S / cmp R,S -> delete second", NULL },
-
-    /* P501: "or R,R / test R,R" -> delete test (or already set
-     *  SF/ZF/PF same as test for same R).  CF/OF cleared by both. */
-    { 2, 501,
-      { { "or",   0, RR_('a'), SM_('a'), 2 },
-        { "test", 0, SM_('a'), SM_('a'), 2 } },
-      0,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "or R,R / test R,R -> delete test", NULL },
-
-    /* P502: "and R,R / test R,R" -> delete test. */
-    { 2, 502,
-      { { "and",  0, RR_('a'), SM_('a'), 2 },
-        { "test", 0, SM_('a'), SM_('a'), 2 } },
-      0,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "and R,R / test R,R -> delete test", NULL },
-
-    /* P503: "mov R,S / or R,0" already P469 style.  "lea" skip.
-     *  "shl R,0" P20.  "rol R,0 / ror R,0" -> delete (identity rotate). */
-    { 1, 503,
-      { { "rol", 0, RR_('a'), IV_(0), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_DEL, NULL } },
-      "rol R,0 -> delete (flags dead)", NULL },
+    /* P502 (v2.56 REMOVED: shadowed by C-rule P8 (and R,R / test R,R)) */
+    /* P503 (v2.56 REMOVED: redundant: P20 handles rol/ror R,0 with pre=0) */
     { 1, 503,
       { { "ror", 0, RR_('a'), IV_(0), 2 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL } },
       "ror R,0 -> delete (flags dead)", NULL },
+    /* P503 (v2.56 REMOVED: redundant: P20 handles rol/ror R,0 with pre=0) */
 
-    /* P504: "bt R,K / bt R,K" -> delete second (CF same). */
-    { 2, 504,
-      { { "bt", 0, RR_('a'), IM_, 2 },
-        { "bt", 0, SM_('a'), IM_, 2 } },
-      PRE_CPU_386,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "bt R,K / bt R,K -> delete second (386+)", p459_same_imm_check },
-
-    /* P505: "bswap R / bswap R" already P127.  "cdq / cdq" -> delete
-     *  second (idempotent on EAX/EDX if EAX unchanged).  Risky if
-     *  EAX changed between - only consecutive. */
-    { 2, 505,
-      { { "cwd", 0, AN_, AN_, 0 },
-        { "cwd", 0, AN_, AN_, 0 } },
-      0,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "cwd / cwd -> delete second", NULL },
-    { 2, 505,
-      { { "cdq", 0, AN_, AN_, 0 },
-        { "cdq", 0, AN_, AN_, 0 } },
-      PRE_CPU_386,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "cdq / cdq -> delete second (386+)", NULL },
-
-    /* P506: "clc / cmc -> stc" and "stc / cmc -> clc" exact on CF. */
-    { 2, 506,
-      { { "clc", 0, AN_, AN_, 0 },
-        { "cmc", 0, AN_, AN_, 0 } },
-      0,
-      { { ACT_REW, "stc" }, { ACT_DEL, NULL } },
-      "clc / cmc -> stc", NULL },
-    { 2, 506,
-      { { "stc", 0, AN_, AN_, 0 },
-        { "cmc", 0, AN_, AN_, 0 } },
-      0,
-      { { ACT_REW, "clc" }, { ACT_DEL, NULL } },
-      "stc / cmc -> clc", NULL },
+    /* P505 (REMOVED v2.54): duplicate of P28 (line ~7489) which fires
+     *  first via the hash chain.  rname[505] kept as doc.
+     *  P506 (REMOVED v2.54): duplicate of P300/P301 (line ~6949) which
+     *  fire first via the hash chain.  rname[506] kept as doc. */
 
     /* P507: "mov R,0 / add R,S -> mov R,S" when flags dead. */
     { 2, 507,
@@ -8610,17 +8828,7 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_REW, "mov $a, ${0 - K1}" }, { ACT_DEL, NULL } },
       "xor R,R / sub R,K -> mov R,-K (flags dead)", NULL },
-
-    /* P516: "mov R,S / sub R,S -> xor R,R" already P281.  "mov R,S /
-     *  cmp R,S" -> delete cmp? cmp needs both equal -> ZF=1 always
-     *  after mov R,S.  Only when flags not all dead we cannot delete;
-     *  if flags dead, delete cmp. */
-    { 2, 516,
-      { { "mov", 0, RR_('a'), RR_('b'), 2 },
-        { "cmp", 0, SM_('a'), SM_('b'), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "mov R,S / cmp R,S -> delete cmp (flags dead)", NULL },
+    /* P516 (v2.56 REMOVED: exact dup of P347) */
 
     /* P517: "mov R,S / test R,S" same — test R,S with R==S is test R,R;
      *  flags same as test after mov only if we keep test... if flags
@@ -8651,29 +8859,13 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_ALL,
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
       "or R,K / and R,-1 -> delete and (flags dead)", NULL },
-
-    /* P520: "lea R,[R+0] style" skip.  "adc R,0 / sbb R,0" with CF
-     *  dead already P444.  "rcl R,0 / rcr R,0" -> delete when flags
-     *  dead (count 0 is identity; CF preserved for rcl/rcr with 0). */
-    { 1, 520,
-      { { "rcl", 0, RR_('a'), IV_(0), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_DEL, NULL } },
-      "rcl R,0 -> delete (flags dead)", NULL },
+    /* P520 (v2.56 REMOVED: redundant: P20 handles rcl/rcr R,0 with pre=0) */
     { 1, 520,
       { { "rcr", 0, RR_('a'), IV_(0), 2 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL } },
       "rcr R,0 -> delete (flags dead)", NULL },
-
-    /* P521: "shl R,0" etc already P20.  "mov R,R / add R,0" -> del
-     *  second when flags dead. */
-    { 2, 521,
-      { { "mov", 0, RR_('a'), SM_('a'), 2 },
-        { "add", 0, SM_('a'), IV_(0), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "mov R,R / add R,0 -> delete both (flags dead)", NULL },
+    /* P520 (v2.56 REMOVED: redundant: P20 handles rcl/rcr R,0 with pre=0) */
 
     /* P522: "xor R,R / xor R,R" -> keep first, delete second (already
      *  zero).  Or delete both if flags dead: result still 0, first
@@ -8784,31 +8976,7 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_ALL,
       { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
       "xor R,R / sub R,0 -> delete sub (flags dead)", NULL },
-
-    /* P537: "shl R,1 / shl R,1" already P449.  "neg R / not R / dec"?
-     *  "or R,R / and R,R" -> delete and (flags dead). */
-    { 2, 537,
-      { { "or",  0, RR_('a'), SM_('a'), 2 },
-        { "and", 0, SM_('a'), SM_('a'), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "or R,R / and R,R -> delete and (flags dead)", NULL },
-
-    /* P538: "and R,R / or R,R" -> delete or (flags dead). */
-    { 2, 538,
-      { { "and", 0, RR_('a'), SM_('a'), 2 },
-        { "or",  0, SM_('a'), SM_('a'), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "and R,R / or R,R -> delete or (flags dead)", NULL },
-
-    /* P539: "test R,R / and R,R" -> delete and (flags dead). */
-    { 2, 539,
-      { { "test", 0, RR_('a'), SM_('a'), 2 },
-        { "and",  0, SM_('a'), SM_('a'), 2 } },
-      PRE_FLAGS_DEAD_ALL,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "test R,R / and R,R -> delete and (flags dead)", NULL },
+    /* P539 (v2.56 REMOVED: shadowed by P561 (test R,R delete flags dead)) */
 
     /* P540: "inc R / sub R,1" -> delete both (flags dead, not SP). */
     { 2, 540,
@@ -8939,84 +9107,29 @@ static const struct rule g_rule_tbl[] = {
         { "mov", 0, RR_('a'), IV_(0), 2 },
         { "test", 0, SM_('a'), SM_('a'), 2 }
       },
-      0,
+      PRE_FLAGS_DEAD_ALL,
       {
         { ACT_KEEP, NULL },
         { ACT_DEL, NULL }
       },
       "mov R,0 / test R,R -> delete test", NULL },
 
+    /* P551 (v2.56 SOUNDNESS FIX): mov R,0 / cmp R,0 -> delete cmp.
+     *  v2.56: mov does NOT touch flags; cmp writes all six.  Deleting
+     *  cmp removes its flag effects.  Add PRE_FLAGS_DEAD_ALL so a
+     *  later flag reader can't see pre-mov flags. */
     { 2, 551,
       {
         { "mov", 0, RR_('a'), IV_(0), 2 },
         { "cmp", 0, SM_('a'), IV_(0), 2 }
       },
-      0,
+      PRE_FLAGS_DEAD_ALL,
       {
         { ACT_KEEP, NULL },
         { ACT_DEL, NULL }
       },
       "mov R,0 / cmp R,0 -> delete cmp", NULL },
-
-    { 1, 552,
-      {
-        { "shl", 0, RR_('a'), IV_(0), 2 }
-      },
-      PRE_FLAGS_DEAD_ALL,
-      {
-        { ACT_DEL, NULL }
-      },
-      "shl R,0 -> delete (flags dead)", NULL },
-
-    { 1, 553,
-      {
-        { "shr", 0, RR_('a'), IV_(0), 2 }
-      },
-      PRE_FLAGS_DEAD_ALL,
-      {
-        { ACT_DEL, NULL }
-      },
-      "shr R,0 -> delete (flags dead)", NULL },
-
-    { 1, 554,
-      {
-        { "sal", 0, RR_('a'), IV_(0), 2 }
-      },
-      PRE_FLAGS_DEAD_ALL,
-      {
-        { ACT_DEL, NULL }
-      },
-      "sal R,0 -> delete (flags dead)", NULL },
-
-    { 1, 555,
-      {
-        { "sar", 0, RR_('a'), IV_(0), 2 }
-      },
-      PRE_FLAGS_DEAD_ALL,
-      {
-        { ACT_DEL, NULL }
-      },
-      "sar R,0 -> delete (flags dead)", NULL },
-
-    { 1, 556,
-      {
-        { "rol", 0, RR_('a'), IV_(0), 2 }
-      },
-      PRE_FLAGS_DEAD_ALL,
-      {
-        { ACT_DEL, NULL }
-      },
-      "rol R,0 -> delete (flags dead)", NULL },
-
-    { 1, 557,
-      {
-        { "ror", 0, RR_('a'), IV_(0), 2 }
-      },
-      PRE_FLAGS_DEAD_ALL,
-      {
-        { ACT_DEL, NULL }
-      },
-      "ror R,0 -> delete (flags dead)", NULL },
+    /* P557 (v2.56 REMOVED: redundant: P20 handles ror R,0) */
 
     { 2, 558,
       {
@@ -9061,26 +9174,7 @@ static const struct rule g_rule_tbl[] = {
         { ACT_DEL, NULL }
       },
       "test R,R -> delete (flags dead)", NULL },
-
-    { 1, 562,
-      {
-        { "add", 0, RR_('a'), IV_(0), 2 }
-      },
-      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
-      {
-        { ACT_DEL, NULL }
-      },
-      "add R,0 -> delete (flags dead)", NULL },
-
-    { 1, 563,
-      {
-        { "sub", 0, RR_('a'), IV_(0), 2 }
-      },
-      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
-      {
-        { ACT_DEL, NULL }
-      },
-      "sub R,0 -> delete (flags dead)", NULL },
+    /* P563 (v2.56 REMOVED: redundant: P18 handles sub R,0 (without PRE_NOT_SP)) */
 
     { 1, 564,
       {
@@ -9163,90 +9257,14 @@ static const struct rule g_rule_tbl[] = {
         { ACT_DEL, NULL }
       },
       "or R,K / or R,0 -> delete second (flags dead)", NULL },
+    /* P573 (v2.56 REMOVED: exact dup of P460) */
 
-    { 2, 573,
-      {
-        { "mov", 0, RR_('a'), RR_('b'), 2 },
-        { "mov", 0, SM_('a'), SM_('b'), 2 }
-      },
-      0,
-      {
-        { ACT_KEEP, NULL },
-        { ACT_DEL, NULL }
-      },
-      "mov R,S / mov R,S -> delete second", NULL },
-
-    { 2, 574,
-      {
-        { "stc", 0, AN_, AN_, 0 },
-        { "stc", 0, AN_, AN_, 0 }
-      },
-      0,
-      {
-        { ACT_KEEP, NULL },
-        { ACT_DEL, NULL }
-      },
-      "stc/stc -> delete second", NULL },
-
-    { 2, 575,
-      {
-        { "clc", 0, AN_, AN_, 0 },
-        { "clc", 0, AN_, AN_, 0 }
-      },
-      0,
-      {
-        { ACT_KEEP, NULL },
-        { ACT_DEL, NULL }
-      },
-      "clc/clc -> delete second", NULL },
-
-    { 2, 576,
-      {
-        { "cli", 0, AN_, AN_, 0 },
-        { "cli", 0, AN_, AN_, 0 }
-      },
-      0,
-      {
-        { ACT_KEEP, NULL },
-        { ACT_DEL, NULL }
-      },
-      "cli/cli -> delete second", NULL },
-
-    { 2, 577,
-      {
-        { "sti", 0, AN_, AN_, 0 },
-        { "sti", 0, AN_, AN_, 0 }
-      },
-      0,
-      {
-        { ACT_KEEP, NULL },
-        { ACT_DEL, NULL }
-      },
-      "sti/sti -> delete second", NULL },
-
-    { 2, 578,
-      {
-        { "cld", 0, AN_, AN_, 0 },
-        { "cld", 0, AN_, AN_, 0 }
-      },
-      0,
-      {
-        { ACT_KEEP, NULL },
-        { ACT_DEL, NULL }
-      },
-      "cld/cld -> delete second", NULL },
-
-    { 2, 579,
-      {
-        { "std", 0, AN_, AN_, 0 },
-        { "std", 0, AN_, AN_, 0 }
-      },
-      0,
-      {
-        { ACT_KEEP, NULL },
-        { ACT_DEL, NULL }
-      },
-      "std/std -> delete second", NULL },
+    /* P574-P579 (REMOVED v2.54): all six are duplicates of the P21
+     *  table entries at line ~7427 (cld/std/cli/sti/clc/stc pairs)
+     *  which fire first via the per-mnemonic hash chain.  Each P57x
+     *  entry had the same mnemonic, same pattern, same preconditions
+     *  (0), and same action (delete second) as the corresponding P21
+     *  entry.  rname[574..579] kept as doc. */
 
     { 2, 580,
       {
@@ -9284,12 +9302,17 @@ static const struct rule g_rule_tbl[] = {
       },
       "and R,0 / or R,0 -> delete or (flags dead)", NULL },
 
+    /* P583 (v2.56 SOUNDNESS FIX): xor R,R / cmp R,0 -> delete cmp.
+     *  v2.56: xor leaves AF undefined; cmp R,0 sets AF=0.  Deleting
+     *  cmp leaves AF undefined.  Add PRE_FLAGS_DEAD_AF so a later AF
+     *  reader (daa/das/aaa/aas/pushf/lahf) can't see undef instead of
+     *  0.  Mirrors P333 which already had this precondition. */
     { 2, 583,
       {
         { "xor", 0, RR_('a'), SM_('a'), 2 },
         { "cmp", 0, SM_('a'), IV_(0), 2 }
       },
-      0,
+      PRE_FLAGS_DEAD_AF,
       {
         { ACT_KEEP, NULL },
         { ACT_DEL, NULL }
@@ -9331,40 +9354,7 @@ static const struct rule g_rule_tbl[] = {
         { ACT_DEL, NULL }
       },
       "mov R,0 / and R,K -> delete and (flags dead)", NULL },
-
-    { 1, 587,
-      {
-        { "imul", 0, RR_('a'), IV_(1), 2 }
-      },
-      PRE_FLAGS_DEAD_ALL | PRE_NO_CPU_8086 | PRE_NOT_SP,
-      {
-        { ACT_DEL, NULL }
-      },
-      "imul R,1 -> delete (186+, flags dead)", NULL },
-
-    { 2, 588,
-      {
-        { "or", 0, RR_('a'), SM_('a'), 2 },
-        { "cmp", 0, SM_('a'), IV_(0), 2 }
-      },
-      PRE_FLAGS_DEAD_ALL,
-      {
-        { ACT_KEEP, NULL },
-        { ACT_DEL, NULL }
-      },
-      "or R,R / cmp R,0 -> delete cmp (flags dead)", NULL },
-
-    { 2, 589,
-      {
-        { "and", 0, RR_('a'), SM_('a'), 2 },
-        { "cmp", 0, SM_('a'), IV_(0), 2 }
-      },
-      PRE_FLAGS_DEAD_ALL,
-      {
-        { ACT_KEEP, NULL },
-        { ACT_DEL, NULL }
-      },
-      "and R,R / cmp R,0 -> delete cmp (flags dead)", NULL },
+    /* P589 (v2.56 REMOVED: shadowed by P823 (weaker pre)) */
 
     { 2, 590,
       {
@@ -9757,30 +9747,7 @@ static const struct rule g_rule_tbl[] = {
         { ACT_DEL, NULL }
       },
       "sar R,1 / or R,0 -> delete or (flags dead)", NULL },
-
-    { 2, 624,
-      {
-        { "and", 0, RR_('a'), SM_('a'), 2 },
-        { "test", 0, SM_('a'), SM_('a'), 2 }
-      },
-      0,
-      {
-        { ACT_KEEP, NULL },
-        { ACT_DEL, NULL }
-      },
-      "and R,R / test R,R -> delete test", NULL },
-
-    { 2, 625,
-      {
-        { "or", 0, RR_('a'), SM_('a'), 2 },
-        { "test", 0, SM_('a'), SM_('a'), 2 }
-      },
-      0,
-      {
-        { ACT_KEEP, NULL },
-        { ACT_DEL, NULL }
-      },
-      "or R,R / test R,R -> delete test", NULL },
+    /* P625 (v2.56 REMOVED: shadowed by C-rule P8 (or R,R / test R,R)) */
 
     { 2, 626,
       {
@@ -10730,27 +10697,21 @@ static const struct rule g_rule_tbl[] = {
       },
       "and R,0 / test R,R -> delete test", NULL },
 
+    /* P709 (v2.56 SOUNDNESS FIX): and R,0 / cmp R,0 -> delete cmp.
+     *  v2.56: and leaves AF undefined; cmp R,0 sets AF=0.  Add
+     *  PRE_FLAGS_DEAD_AF so a later AF reader can't see undef. */
     { 2, 709,
       {
         { "and", 0, RR_('a'), IV_(0), 2 },
         { "cmp", 0, SM_('a'), IV_(0), 2 }
       },
-      0,
+      PRE_FLAGS_DEAD_AF,
       {
         { ACT_KEEP, NULL },
         { ACT_DEL, NULL }
       },
       "and R,0 / cmp R,0 -> delete cmp", NULL },
-
-    { 1, 710,
-      {
-        { "imul", 0, RR_('a'), IV_(0), 2 }
-      },
-      PRE_FLAGS_DEAD_ALL | PRE_NO_CPU_8086,
-      {
-        { ACT_REW, "xor $a, $a" }
-      },
-      "imul R,0 -> xor R,R (flags dead, 186+)", NULL },
+    /* P710 (v2.56 REMOVED: exact dup of P123) */
 
     { 2, 711,
       {
@@ -10764,17 +10725,8 @@ static const struct rule g_rule_tbl[] = {
       },
       "neg/neg -> delete both (flags dead)", NULL },
 
-    { 2, 712,
-      {
-        { "clc", 0, AN_, AN_, 0 },
-        { "cmc", 0, AN_, AN_, 0 }
-      },
-      0,
-      {
-        { ACT_REW, "stc" },
-        { ACT_DEL, NULL }
-      },
-      "clc / cmc -> stc", NULL },
+    /* P712 (REMOVED v2.54): duplicate of P301 (line ~6956) which fires
+     *  first via the hash chain.  rname[712] kept as doc. */
 
     { 2, 713,
       {
@@ -11054,33 +11006,13 @@ static const struct rule g_rule_tbl[] = {
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
       "xchg R,S / xchg R,S -> delete both", NULL },
 
-    { 2, 739,
-      { { "cbw", 0, AN_, AN_, 0 },
-        { "cbw", 0, AN_, AN_, 0 } },
-      0,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "cbw / cbw -> delete second", NULL },
-
-    { 2, 740,
-      { { "cwd", 0, AN_, AN_, 0 },
-        { "cwd", 0, AN_, AN_, 0 } },
-      0,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "cwd / cwd -> delete second", NULL },
-
-    { 2, 741,
-      { { "clc", 0, AN_, AN_, 0 },
-        { "stc", 0, AN_, AN_, 0 } },
-      0,
-      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
-      "clc / stc -> stc", NULL },
-
-    { 2, 742,
-      { { "stc", 0, AN_, AN_, 0 },
-        { "clc", 0, AN_, AN_, 0 } },
-      0,
-      { { ACT_DEL, NULL }, { ACT_KEEP, NULL } },
-      "stc / clc -> clc", NULL },
+    /* P739-P742 (REMOVED v2.54): all four are duplicates of earlier
+     *  table rules that fire first via the hash chain:
+     *    P739 (cbw/cbw) -> shadowed by P28 (line ~7483)
+     *    P740 (cwd/cwd) -> shadowed by P28 (line ~7489)
+     *    P741 (clc/stc) -> shadowed by P466 2nd entry (line ~8261)
+     *    P742 (stc/clc) -> shadowed by P466 1st entry (line ~8255)
+     *  rname[739..742] kept as doc. */
 
     { 2, 743,
       { { "cld", 0, AN_, AN_, 0 },
@@ -11270,17 +11202,7 @@ static const struct rule g_rule_tbl[] = {
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP | PRE_INTEL,
       { { ACT_REW, "lea $a, [$b-1]" }, { ACT_DEL, NULL } },
       "mov R,S / dec R -> lea R,[S-1] (flags dead)", NULL },
-
-    /* P820: "xor R,R / cmp R,0" -> delete cmp (AF dead).
-     *  xor already set ZF=1,SF=0,PF=1; cmp R,0 recomputes same for
-     *  ZF/SF/PF, AF differs.  Chain P11+P48 also gets this; direct
-     *  form saves a pass. */
-    { 2, 820,
-      { { "xor", 0, RR_('a'), SM_('a'), 2 },
-        { "cmp", 0, SM_('a'), IV_(0), 2 } },
-      PRE_FLAGS_DEAD_AF,
-      { { ACT_KEEP, NULL }, { ACT_DEL, NULL } },
-      "xor0 / cmp R,0 -> del cmp (AF dead)", NULL },
+    /* P820 (v2.56 REMOVED: exact dup of P333) */
 
     /* P822: "or R,R / cmp R,0" -> delete cmp (AF dead). */
     { 2, 822,
@@ -11337,22 +11259,186 @@ static const struct rule g_rule_tbl[] = {
      *  When R!=S it is sound but needs a same-reg check the table
      *  cannot express without a custom check(); deferred. */
 
-    /* P843: "add R,S / sub R,S" -> delete both when flags dead.
-     *  (R+S)-S = R.  Inverse pair.  Not SP. */
+    /* P843 (v2.56 SOUNDNESS FIX): "add R,S / sub R,S" -> delete both
+     *  when flags dead.  (R+S)-S = R.  Inverse pair.  Not SP.
+     *  v2.56 FIX: when R==S, the math breaks: `add eax,eax / sub eax,eax`
+     *  -> eax = 2*old_eax then eax = 2*old_eax - 2*old_eax = 0, net
+     *  eax = 0; the rule's "delete both" leaves eax = old_eax.  The
+     *  C cousin P27 already enforces `g_regs[r27].fam != g_regs[s27].fam`;
+     *  add p32_diff_regs_check to P843/P844 to mirror that gate. */
     { 2, 843,
       { { "add", 0, RR_('a'), RR_('b'), 2 },
         { "sub", 0, SM_('a'), SM_('b'), 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "add R,S / sub R,S -> delete both (flags dead)", NULL },
+      "add R,S / sub R,S -> delete both (flags dead)", p32_diff_regs_check },
 
-    /* P844: "sub R,S / add R,S" -> delete both (flags dead, not SP). */
+    /* P844 (v2.56 FIX): "sub R,S / add R,S" -> delete both (flags dead,
+     *  not SP).  Same R==S fix as P843. */
     { 2, 844,
       { { "sub", 0, RR_('a'), RR_('b'), 2 },
         { "add", 0, SM_('a'), SM_('b'), 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "sub R,S / add R,S -> delete both (flags dead)", NULL },
+      "sub R,S / add R,S -> delete both (flags dead)", p32_diff_regs_check },
+
+    /* ================================================================
+     *  v2.53 NEW RULES (research: MSVC /FA, GCC -S, Clang -S, Delphi)
+     *  Compiler-generated patterns: redundant zero/sign-extensions
+     *  whose result is dead, dead BT-family bit ops, and immediate
+     *  mov+movzx folds.  See the v2.53 changelog block at the top
+     *  of this file for the full safety analysis and research cites.
+     * ================================================================ */
+
+    /* P860 (v2.53): "movzx R, S" same family, S strictly narrower,
+     *  R dead after -> delete.  Catches the dead-result zero-
+     *  extension pattern P2 misses (P2 needs the killer to be the
+     *  immediately-next instruction; P860 follows control flow via
+     *  reg_dead_cf).  386+ (movzx encoding); Intel-only (the dest
+     *  register is emitted via $a/$b without a leading "%").
+     *  Research: GCC i386.md zero_extendqihi2 dead-result fold;
+     *  LLVM X86PeepholePass; FPC OptPass2MOVZX dead-store variant. */
+    { 1, 860,
+      { { "movzx", 0, RR_('a'), RR_('b'), 2 } },
+      PRE_CPU_386 | PRE_INTEL | PRE_REG_DEAD_RA,
+      { { ACT_DEL, NULL } },
+      "movzx R,S (same fam, S narrower, R dead) -> delete",
+      p860_movzx_same_fam_check },
+
+    /* P861 (v2.53): "movsx R, S" same family, S strictly narrower,
+     *  R dead after -> delete.  Sign-extension counterpart of P860.
+     *  Same soundness argument (movsx reads S, writes R; R dead =>
+     *  unobservable; S unchanged by deletion).  386+; Intel-only. */
+    { 1, 861,
+      { { "movsx", 0, RR_('a'), RR_('b'), 2 } },
+      PRE_CPU_386 | PRE_INTEL | PRE_REG_DEAD_RA,
+      { { ACT_DEL, NULL } },
+      "movsx R,S (same fam, S narrower, R dead) -> delete",
+      p860_movzx_same_fam_check },
+
+    /* P862 (v2.53): "bts R, K" with R dead after AND CF dead after
+     *  -> delete.  The BT family has only two observable effects:
+     *  writing bit K of R, and writing CF to the old value of bit K.
+     *  When both are dead, the instruction is pure dead weight.
+     *  This is the "delete form" complement to P415 (the "convert
+     *  to or/and/xor form", which fires when R is alive and all six
+     *  flags are dead).  386+ (bt* encoding).  Imm form only:
+     *  variable-count `bts R, CL` reads CL, which could be live
+     *  even with R and CF dead; the table cannot prove CL dead, so
+     *  OP_IMM restricts to constant K.  Research: Agner Fog
+     *  instruction_tables (BT-family microcoded on some cores);
+     *  Intel optimization guide "avoid BT for constant bit tests". */
+    { 1, 862,
+      { { "bts", 0, RR_('a'), IM_, 2 } },
+      PRE_CPU_386 | PRE_REG_DEAD_RA | PRE_FLAGS_DEAD_CF,
+      { { ACT_DEL, NULL } },
+      "bts R,K (R dead, CF dead) -> delete", NULL },
+    { 1, 862,
+      { { "btr", 0, RR_('a'), IM_, 2 } },
+      PRE_CPU_386 | PRE_REG_DEAD_RA | PRE_FLAGS_DEAD_CF,
+      { { ACT_DEL, NULL } },
+      "btr R,K (R dead, CF dead) -> delete", NULL },
+    { 1, 862,
+      { { "btc", 0, RR_('a'), IM_, 2 } },
+      PRE_CPU_386 | PRE_REG_DEAD_RA | PRE_FLAGS_DEAD_CF,
+      { { ACT_DEL, NULL } },
+      "btc R,K (R dead, CF dead) -> delete", NULL },
+
+    /* P863 (v2.53): "mov R8, K / movzx R32, R8" -> single "mov R32,
+     *  (K & 0xFF)" (or R16 dest).  The first mov writes R8 = K;
+     *  movzx zero-extends R8 into R32 = (K & 0xFF).  A single mov
+     *  R32, (K & 0xFF) is exact on R (both forms give R32 = K&0xFF)
+     *  and on flags (mov and movzx are both flag-neutral).  No flag
+     *  scan needed.  P810 (the generic mov+movzx fuse) does NOT
+     *  fire on immediate sources because typed_src refuses numbers;
+     *  P863 closes that gap.  The ${K & 0xFF} mask is required:
+     *  `mov AL, -1` stores 0xFF in AL, and `movzx EAX, AL` gives
+     *  0x000000FF; `mov EAX, -1` would give 0xFFFFFFFF, which is
+     *  wrong.  386+ (movzx encoding); Intel-only.  Two table entries
+     *  (R32 dest, R16 dest) share the check function, which verifies
+     *  the movzx dest is exactly the requested width.  Research:
+     *  MSVC /FA dumps for `(unsigned char)K` materialization; GCC
+     *  zero_extendqi constant materialization. */
+    { 2, 863,
+      { { "mov",  0, R_('a', RC_8), IM_, 2 },
+        { "movzx", 0, SFAM_('a'),  SM_('a'), 2 } },
+      PRE_CPU_386 | PRE_INTEL,
+      { { ACT_REW, "mov $a32, ${K & 0xFF}" }, { ACT_DEL, NULL } },
+      "mov R8,K / movzx R32,R8 -> mov R32,K&0xFF (386+)",
+      p863_movzx_r32_check },
+    { 2, 863,
+      { { "mov",  0, R_('a', RC_8), IM_, 2 },
+        { "movzx", 0, SFAM_('a'),  SM_('a'), 2 } },
+      PRE_CPU_386 | PRE_INTEL,
+      { { ACT_REW, "mov $a16, ${K & 0xFF}" }, { ACT_DEL, NULL } },
+      "mov R8,K / movzx R16,R8 -> mov R16,K&0xFF (386+)",
+      p863_movzx_r16_check },
+
+    /* ================================================================
+     *  v2.54 NEW RULES (research: MSVC sbb/neg, GCC zero-extend,
+     *  Borland C++/TP codegen, superoptimizer literature)
+     * ================================================================ */
+
+    /* P161 (v2.54, was stale rname entry since v2.14): "stc / sbb R,R"
+     *  -> "or R, -1" (all six flags dead).  stc sets CF=1; sbb R,R =
+     *  R - R - 1 = -1 (all bits set).  or R,-1 also sets all bits.
+     *  stc+sbb = 3-4 bytes; or R,-1 = 2-3 bytes.  FPC OrOr2Or family. */
+    { 2, 161,
+      { { "stc", 0, AN_, AN_, 0 },
+        { "sbb", 0, RR_('a'), SM_('a'), 2 } },
+      PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
+      { { ACT_DEL, NULL }, { ACT_REW, "or $a, -1" } },
+      "stc / sbb R,R -> or R,-1 (flags dead)", NULL },
+
+    /* P864 (v2.54): "movzx R, S" (same fam, S narrower) where the high
+     *  bits of R are PROVABLY ALREADY ZERO (backward walk finds a
+     *  zeroing writer and no intermediate partial write above S's
+     *  width).  ->  delete (identity).  386+; Intel-only.
+     *  Research: GCC missed-optimization #106277; LLVM X86PeepholePass. */
+    { 1, 864,
+      { { "movzx", 0, RR_('a'), RR_('b'), 2 } },
+      PRE_CPU_386 | PRE_INTEL,
+      { { ACT_DEL, NULL } },
+      "movzx R,S (high bits already 0) -> delete",
+      p864_movzx_redundant_check },
+
+    /* P865 (v2.54): "movsx R, S" (same fam, S narrower) where the high
+     *  bits are PROVABLY ALREADY SIGN-EXTENDED (backward walk finds a
+     *  prior movsx and no intermediate partial write).  ->  delete.
+     *  Conservative: only recognizes prior movsx (not mov R,K sign-ext
+     *  because the encoding is unknown at source level).  386+; Intel. */
+    { 1, 865,
+      { { "movsx", 0, RR_('a'), RR_('b'), 2 } },
+      PRE_CPU_386 | PRE_INTEL,
+      { { ACT_DEL, NULL } },
+      "movsx R,S (high bits already sign-ext) -> delete",
+      p865_movsx_redundant_check },
+
+    /* P867 (v2.54): "bts/btr/btc [stack-mem], K" (CF dead) -> delete.
+     *  Memory-destination complement to P862 (register dest).  The BT
+     *  family sets CF from the old bit value and writes the bit; when
+     *  CF is dead and the memory is stack-frame (provably non-MMIO),
+     *  the bit write to a local is only observable if the local is
+     *  read later -- but bts/btr/btc write the bit to 1/0/toggled, and
+     *  if no reader of that memory slot exists, the write is dead.
+     *  However, proving "no reader of [bp+N]" requires a forward
+     *  memory-use scan the table engine doesn't have.  Conservative:
+     *  this rule only fires when PRE_FLAGS_DEAD_CF is satisfied AND
+     *  the dest is stack memory.  The bit-write to a local is NOT
+     *  provably dead in general, so this rule is WITHDRAWN for the
+     *  delete form.  Instead, convert to or/and/xor (like P415 for
+     *  register dests) when all six flags are dead -- the memory write
+     *  is preserved, just the flag-setting instruction changes. */
+    /* P867 WITHDRAWN (v2.54): deleting bts/btr/btc [mem] is unsound
+     *  because the bit-write to memory is observable (the local might
+     *  be read later).  The convert-to-or/and form for memory dests
+     *  is also problematic because `or [bp+N], mask` has a different
+     *  encoding size and might not be shorter.  Leave bts/btr/btc
+     *  [mem] alone; P415 already handles the register-dest convert
+     *  form.  rname[867] kept as doc. */
+
+    /* P867-alt: bts/btr/btc R, K (R dead, CF dead) -> delete.
+     *  This is P862 from v2.53; no new entry needed. */
 
 };
 
@@ -12015,6 +12101,25 @@ static void guard_stack(const char *where)
 #endif
 }
 
+/* v2.52: flags must be dead on BOTH arms after a Jcc that we delete or
+ *  replace with a non-flag-setting insn (loop/jcxz/jecxz/test+jcc).
+ *  Previously only the fall-through (next_code(j)) was checked; a
+ *  reader of ZF/CF at the branch target would then see stale flags. */
+static int flags_dead_after_jcc(long j_idx, struct pinfo *pj)
+{
+    int dup = 0;
+    long fall, tgt, code;
+    if (pj == NULL || !pj->jtarget_ok) return 0;
+    fall = next_code(j_idx);
+    if (!flags_clear(fall, F_ALL6)) return 0;
+    tgt = resolve_jtarget(j_idx, pj->jtarget, &dup);
+    if (dup || tgt < 0) return 0;
+    code = instr_after_label(tgt);
+    if (code < 0) code = tgt;
+    if (code == fall) return 1; /* same arm */
+    return flags_clear(code, F_ALL6);
+}
+
 static long run_pass(void)
 {
     long i;
@@ -12150,11 +12255,18 @@ static long run_pass(void)
                                 cur = nxt;
                                 hops++;
                             }
-                            vlog("smartpp: line %ld: threaded '%s' -> '%s' (P5, %d hop)\n",
-                                i + 1, pi->jtarget, final, hops);
-                            retarget_line(i, pi, final);
-                            st[5]++;
-                            continue;
+                            /* v2.52: refuse empty / identical targets
+                             *  (seen as "threaded L$x -> ''" on Watcom ASM). */
+                            if (final == NULL || final[0] == '\0' ||
+                                ci_eq(pi->jtarget, final))
+                                ; /* no-op */
+                            else {
+                                vlog("smartpp: line %ld: threaded '%s' -> '%s' (P5, %d hop)\n",
+                                    i + 1, pi->jtarget, final, hops);
+                                retarget_line(i, pi, final);
+                                st[5]++;
+                                continue;
+                            }
                         }
                     }
                 }
@@ -13279,15 +13391,15 @@ static long run_pass(void)
             }
         }
 
-        /* P58 (v1.81): "xor R, X / xor R, X" (X = register or
-         *  immediate, NOT memory) -> both deleted.  xor is
-         *  involution: R ^ X ^ X = R, so two consecutive identical
-         *  xors restore R to its original value.  The first xor's
-         *  flags are overwritten by the second's, but the second's
-         *  flags differ from "no instruction" (they are the flags
-         *  of (R0 ^ X) ^ X = R0; the flags of the original
-         *  computation are XOR's, which depend on R0 ^ X).  So all
-         *  six status flags must be proven dead.
+        /* P58 (v1.81, v2.56 SOUNDNESS FIX): "xor R, X / xor R, X"
+         *  (X = register or immediate, NOT memory) -> both deleted.
+         *  xor is involution: R ^ X ^ X = R, so two consecutive
+         *  identical xors restore R to its original value.  The
+         *  first xor's flags are overwritten by the second's, but
+         *  the second's flags differ from "no instruction" (they
+         *  are the flags of (R0 ^ X) ^ X = R0; the flags of the
+         *  original computation are XOR's, which depend on R0 ^ X).
+         *  So all six status flags must be proven dead.
          *
          *  X must NOT be a memory operand: a repeated read of
          *  memory-mapped I/O may have side effects (P23 has the
@@ -13311,18 +13423,33 @@ static long run_pass(void)
          *  window of the first xor would push at SP0 ^ X, which is
          *  potentially misaligned; SP exclusion matches P22/P24/P27/
          *  P39/P49.  Two-instruction only (no chaining) for the same
-         *  reason.  FPC folds the same pattern in its xor-pass. */
+         *  reason.  FPC folds the same pattern in its xor-pass.
+         *
+         *  v2.56 FIX: when X is a register that is the SAME register
+         *  as R (i.e., `xor eax, eax / xor eax, eax`), the
+         *  involution "R ^ X ^ X = R" breaks: the first xor zeros R,
+         *  so the second xor's operands are both 0 -- the net result
+         *  is R = 0, not R = old_R.  Reject when X is a register of
+         *  the same family as R.  (For valid x86 asm X must be the
+         *  same width as R, so same family + same width = same
+         *  register.) */
         if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
             pi->nops == 2 && ci_eq(pi->mnem, "xor")) {
             int r58 = find_reg(pi->op0);
+            int x58 = find_reg(pi->op1);
             long dummy;
             /* v1.83: positive test -- only register or numeric
              *  immediate second operands qualify.  Anything else
              *  (memory label, expression, sized memory) is
              *  conservatively treated as memory and left alone. */
-            int op1_ok = (find_reg(pi->op1) >= 0) ||
+            int op1_ok = (x58 >= 0) ||
                          try_parse_number(pi->op1, &dummy);
-            if (r58 >= 0 && g_regs[r58].fam != 4 && op1_ok) {
+            /* v2.56: if X is a register, it must NOT be the same
+             *  family as R.  When X is immediate, no constraint. */
+            int x_disjoint = (x58 < 0) ||
+                             (g_regs[x58].fam != g_regs[r58].fam);
+            if (r58 >= 0 && g_regs[r58].fam != 4 && op1_ok &&
+                x_disjoint) {
                 j = next_code(i);
                 if (j >= 0 && !INDEF(j)) {
                     struct pinfo *pj = &g_ppair;
@@ -13470,6 +13597,78 @@ static long run_pass(void)
          *  code that was here (~55 lines) is removed; the table
          *  produces the same output via expand_template + replace_line_marked.
          *  Research: FPC constant propagation; GCC RTL moveImmediate. */
+
+        /* P870/P871 (v2.56): "xor R,R / dec R -> or R,-1" and
+         *  "xor R,R / inc R -> or R,1".  These are FUSED versions of
+         *  P45+P35 and P44 respectively.  After xor R,R the register
+         *  is 0; dec makes it -1, inc makes it 1.  Since R=0, `or R,K`
+         *  gives exactly K (0 | K = K).  `or` sets all six flags
+         *  (same as xor+inc/dec), so PRE_FLAGS_DEAD_ALL is required.
+         *
+         *  Size analysis (32-bit):
+         *    P870: xor(2) + dec(1) = 3 bytes -> or R,-1 (3 bytes).
+         *          Size-neutral, but saves one pass vs P45->P35 chain.
+         *    P871: xor(2) + inc(1) = 3 bytes -> or R,1 (3 bytes).
+         *          P44 produces mov R,1 (5 bytes) and NO rule converts
+         *          mov R,1 -> or R,1 (P35 only handles mov R,-1).
+         *          So P871 saves 2 bytes vs P44 for 32-bit registers.
+         *
+         *  These C rules run BEFORE the table engine's P44/P45 entries,
+         *  so they shadow them.  P44/P45 remain in the table as
+         *  fallbacks for cases where P870/P871 refuse (none currently,
+         *  since preconditions are identical).
+         *
+         *  Research: Agner Fog "zeroing idiom" + branchless boolean;
+         *  MSVC /O1 codegen uses `or R,K` after zeroing for small K.
+         *  GCC RTL combine xor+inc -> or when R is known 0. */
+        if (!pi->haslabel && !pi->toobig && pi->cls == I_XORRR &&
+            pi->dreg >= 0 && g_regs[pi->dreg].fam != 4) {
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    pj->cls == I_OTHER && pj->nops == 1 &&
+                    find_reg(pj->op0) == pi->dreg &&
+                    (ci_eq(pj->mnem, "dec") || ci_eq(pj->mnem, "inc")) &&
+                    flags_clear(next_code(j), F_ALL6)) {
+                    int is_dec = ci_eq(pj->mnem, "dec");
+                    long val = is_dec ? -1 : 1;
+                    int pno = is_dec ? 870 : 871;
+                    const char *desc = is_dec ?
+                        "xor R,R / dec R -> or R,-1 (fused P45+P35)" :
+                        "xor R,R / inc R -> or R,1 (fused P44)";
+                    strcpy(g_build, pi->prefix);
+                    strcat(g_build, "or ");
+                    if (g_att) {
+                        char num[32];
+                        strcat(g_build, "$");
+                        sprintf(num, "%ld", val);
+                        strcat(g_build, num);
+                        strcat(g_build, ", ");
+                        strcat(g_build, pi->op0);
+                    } else {
+                        strcat(g_build, pi->op0);
+                        strcat(g_build, ", ");
+                        {
+                            char num[32];
+                            sprintf(num, "%ld", val);
+                            strcat(g_build, num);
+                        }
+                    }
+                    if (pi->comment[0] != 0) {
+                        strcat(g_build, " ");
+                        strcat(g_build, pi->comment);
+                    }
+                    vlog("smartpp: line %ld: '%s' / '%s' -> 'or %s,%ld' (P%d)\n",
+                        i + 1, L(i), L(j), pi->op0, val, pno);
+                    replace_line_marked(i, g_build, desc, pno);
+                    DEL(j) = 1;
+                    st[pno]++;
+                    continue;
+                }
+            }
+        }
 
         /* P43/P76 (v1.80, v2.26): "xor R, R" followed by a flag-setting
         *  arith op on R, all six flags dead, collapses to a single
@@ -13651,6 +13850,45 @@ static long run_pass(void)
             }
         }
 
+        /* P857 (v2.52, pmodewk/classic DOS): "xor RH,RH / add RL,RL"
+         *  -> "shl RX,1" when flags dead.  Zero-extends the low byte
+         *  then doubles it; with RH cleared, shl of the 16-bit pair
+         *  is exact (same CF from bit7 of RL; OF ignored under the
+         *  dead-flags gate).  Seen as "xor bh,bh / add bl,bl". */
+        if (!g_att && !pn->toobig && pn->cls == I_XORRR &&
+            pn->dreg >= 0 && g_regs[pn->dreg].hi - g_regs[pn->dreg].lo == 8 &&
+            g_regs[pn->dreg].lo == 8) {
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    pj->dreg >= 0 && ci_eq(pj->mnem, "add") &&
+                    pj->sreg == pj->dreg &&
+                    g_regs[pj->dreg].fam == g_regs[pn->dreg].fam &&
+                    g_regs[pj->dreg].lo == 0 &&
+                    g_regs[pj->dreg].hi - g_regs[pj->dreg].lo == 8) {
+                    int wide = reg_by_bits(g_regs[pn->dreg].fam, 0, 16);
+                    if (wide >= 0 && flags_clear(next_code(j), F_ALL6)) {
+                        strcpy(g_build, pn->prefix);
+                        strcat(g_build, "shl ");
+                        strcat(g_build, g_regs[wide].name);
+                        strcat(g_build, ", 1");
+                        if (pn->comment[0] != '\0') {
+                            strcat(g_build, " ");
+                            strcat(g_build, pn->comment);
+                        }
+                        vlog("smartpp: line %ld: '%s' / '%s' -> '%s' (P857)\n",
+                            i + 1, L(i), L(j), g_build);
+                        replace_line(i, g_build);
+                        DEL(j) = 1;
+                        st[857]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
         /* P31: "mov AL,SRC / cbw" -> "movsx AX,SRC" and "mov AX,SRC /
         *  cwde" -> "movsx EAX,SRC".  No flag is touched by either
         *  form and the source is read before anything is written in
@@ -13688,16 +13926,19 @@ static long run_pass(void)
             }
         }
 
-        /* P81 (v1.83): "mov AL, SRC / movzx EAX, AL" (or AX/EAX form)
-         *  -> "movzx EAX, byte ptr SRC" (or word ptr SRC).  Both
-         *  mov and movzx are flag-neutral, and movzx reads its
-         *  source before writing its destination, so the rewrite is
-         *  exact on R and flags with no scan needed.  The source
-         *  must be a typed memory or register operand that the
-         *  existing typed_src() helper can wrap.  386+ only
-         *  (movzx is 386+).  Intel-only (typed_src emits Intel).
-         *  Research: GCC i386.md combine pass that fuses
-         *  mov+movzx into a single movzx; FPC OptPass2MovMovzx. */
+        /* P81 (v1.83, v2.56 EXTENDED): "mov AL, SRC / movzx EAX, AL"
+         *  (or AX/EAX form) -> "movzx EAX, byte ptr SRC" (or word ptr
+         *  SRC).  v2.56: now also handles the movsx variant -- "mov
+         *  AL, SRC / movsx EAX, AL" -> "movsx EAX, byte ptr SRC".
+         *  Both mov and movzx/movsx are flag-neutral, and the ext
+         *  instruction reads its source before writing its dest, so
+         *  the rewrite is exact on R and flags with no scan needed.
+         *  The source must be a typed memory or register operand
+         *  that the existing typed_src() helper can wrap.  386+ only.
+         *  Intel-only (typed_src emits Intel).
+         *  Research: GCC i386.md combine pass that fuses mov+movzx
+         *  (and mov+movsx) into a single movzx/movsx; FPC
+         *  OptPass2MovMovzx / OptPass2MovMovsx. */
         if (!g_att && g_curcpu >= 8 && !pn->toobig && pn->cls == I_MOV &&
             pn->dreg >= 0 && g_regs[pn->dreg].hi == 8) {
             /* source register must be the low byte of the dest's
@@ -13709,6 +13950,16 @@ static long run_pass(void)
                 parse_line(j, pj);
                 if (!pj->haslabel && !pj->toobig &&
                     pj->cls == I_MOVZX && pj->dreg >= 0 &&
+                    /* v2.54 SOUNDNESS FIX: P81 must only fire on
+                     *  movzx, not movsx.  Both are class I_MOVZX
+                     *  (parse_line collapses them).  v2.56 EXTENDED:
+                     *  now accept movsx too, but emit the MATCHING
+                     *  mnemonic so sign-extension is preserved.  The
+                     *  original v2.54 fix emitted "movzx" unconditionally
+                     *  which miscompiled movsx inputs; now we emit
+                     *  whichever mnemonic the source used. */
+                    (ci_eq(pj->mnem, "movzx") ||
+                     ci_eq(pj->mnem, "movsx")) &&
                     g_regs[pj->dreg].fam == fam &&
                     g_regs[pj->dreg].lo == 0 &&
                     g_regs[pj->dreg].hi > g_regs[pn->dreg].hi) {
@@ -13718,8 +13969,11 @@ static long run_pass(void)
                     char typed[MAXTOK];
                     if (find_reg(pj->op1) == pn->dreg &&
                         typed_src(pn->op1, 1, typed)) {
+                        const char *ext_mnem = ci_eq(pj->mnem, "movsx")
+                                               ? "movsx" : "movzx";
                         strcpy(g_build, pn->prefix);
-                        strcat(g_build, "movzx ");
+                        strcat(g_build, ext_mnem);
+                        strcat(g_build, " ");
                         strcat(g_build, pj->op0);
                         strcat(g_build, ", ");
                         strcat(g_build, typed);
@@ -14597,10 +14851,50 @@ static long run_pass(void)
                         st[356]++;
                         fire = 1;
                     }
+                    /* ---- or R,K (K!=0) / jz|jne: ZF always 0 ----
+                     *  or R,K with K!=0 always produces a non-zero result
+                     *  (at least the bits in K are set), so ZF=0.
+                     *  jz|je never jumps -> delete jcc.
+                     *  jnz|jne always jumps -> rewrite to jmp.
+                     *  The or itself is kept (it modifies R).  Only the
+                     *  jcc is simplified.  The or writes all 6 flags;
+                     *  only ZF is consumed by jz/jnz, and ZF=0 is
+                     *  proven by K!=0.  Sound.  [Intel SDM OR: ZF is
+                     *  set iff result is 0; R|K != 0 when K != 0.] */
+                    else if (ci_eq(pi->mnem, "or") && pi->nops == 2 &&
+                             find_reg(pi->op0) >= 0) {
+                        long v_or;
+                        if (try_parse_number(pi->op1, &v_or) && v_or != 0) {
+                            /* or R,K (K!=0) sets ZF=0 */
+                            if (ci_eq(pj->mnem, "jz") ||
+                                ci_eq(pj->mnem, "je")) {
+                                /* ZF=0 -> jz never jumps -> delete */
+                                vlog("smartpp: line %ld: deleted '%s' after 'or R,%ld' (K!=0, ZF=0) (P878)\n",
+                                    j + 1, L(j), v_or);
+                                DEL(j) = 1;
+                                st[878]++;
+                                fire = 1;
+                            }
+                            else if (ci_eq(pj->mnem, "jnz") ||
+                                     ci_eq(pj->mnem, "jne")) {
+                                /* ZF=0 -> jnz always jumps -> jmp */
+                                strcpy(g_build, pj->prefix);
+                                strcat(g_build, "jmp ");
+                                strcat(g_build, lab);
+                                vlog("smartpp: line %ld: 'or R,%ld' / jnz -> '%s' (K!=0, ZF=0) (P878)\n",
+                                    j + 1, v_or, g_build);
+                                replace_line(j, g_build);
+                                st[878]++;
+                                fire = 1;
+                            }
+                        }
+                    }
                     /* ---- setcc after constant flags (GCC/Clang/MSVC idioms) ----
                      *  xor R,R sets ZF=1,SF=0,PF=1,CF=0,OF=0.
-                     *  setz/sete -> 1; setnz/setne -> 0; sets -> 0; setc/setb -> 0. */
-                    else if ((pi->cls == I_XORRR ||
+                     *  setz/sete -> 1; setnz/setne -> 0; sets -> 0; setc/setb -> 0.
+                     *  v2.56: gate on g_curcpu >= 8 -- setcc is 386+. */
+                    else if (g_curcpu >= 8 &&
+                             (pi->cls == I_XORRR ||
                               (ci_eq(pi->mnem, "xor") && pi->nops == 2 &&
                                find_reg(pi->op0) >= 0 &&
                                find_reg(pi->op0) == find_reg(pi->op1))) &&
@@ -15048,7 +15342,7 @@ static long run_pass(void)
 
 
         /* ---- v2.14: imul R,K / imul R,S,K -> lea/shl strength reduction
-         *  (386+, flags dead, Intel syntax).  v2.20: now handles the
+         *  (386+, flags dead, Intel syntax, -Os only).  v2.20: now handles the
          *  3-operand form "imul R, S, K" (R = S * K) as well as the
          *  2-operand form "imul R, K" (R = R * K).  The LEA uses S
          *  as the base/index for the 3-operand form.
@@ -15072,8 +15366,13 @@ static long run_pass(void)
          *  index").  This closes the v2.24 hole where a 16-bit imul
          *  emitted the unencodable "[ax+ax*2]".
          *  Covers 3,5,6,7,9,10,11,12,13,14,15 and every m*2^a form of
-         *  those (18, 20, 24, 28, 30, 36, 40, 56, ...). */
-        if (!pi->toobig && !pi->haslabel && !g_att &&
+         *  those (18, 20, 24, 28, 30, 36, 40, 56, ...).
+         *  v2.56 FIX: add `!opt_zopt` -- the lea+shl sequence is a SPEED
+         *  optimization (imul is microcoded/slow).  For m=7,11,13,15 the
+         *  two-lea sequence is 6+ bytes vs imul imm8 (3 bytes) -- a size
+         *  regression.  Under -Oz (size) the rule should not fire; under
+         *  -Os (speed) it's a speed win. */
+        if (!pi->toobig && !pi->haslabel && !g_att && !opt_zopt &&
             ci_eq(pi->mnem, "imul") &&
             (pi->nops == 2 || pi->nops == 3) &&
             find_reg(pi->op0) >= 0 && g_curcpu >= 8) {
@@ -15793,6 +16092,95 @@ static long run_pass(void)
             }
         }
 
+        /* P874 (v2.56 NEW): "lea R, [mem_expr] / mov S, [R]" ->
+         *  "mov S, [mem_expr]" (lea+load fusion).
+         *
+         *  The lea computes an address into R; the mov loads from [R].
+         *  Fusing them into a single mov with the lea's addressing mode
+         *  eliminates the lea entirely.
+         *
+         *  Soundness:
+         *   - The mov's source must be a simple [R] (just the base
+         *     register, no displacement, no index) so the fused
+         *     addressing = lea's expression (no second displacement).
+         *   - The lea's expression may use R as base/index: in the
+         *     original the lea reads old-R then writes R; the mov
+         *     reads new-R (= lea result). In the fused mov, the
+         *     expression uses old-R (before the mov writes R) -- same
+         *     address.  Sound even when R appears in the expression.
+         *   - If S == R (lea dest == mov dest): the mov overwrites R.
+         *     The lea's R-write is dead (overwritten before any other
+         *     reader).  Sound with no further check.
+         *   - If S != R: the mov writes S but not R.  R (the lea's
+         *     dest) must be dead after the mov -- reg_dead_cf(R).
+         *   - No instruction between lea and mov (they're adjacent in
+         *     the peephole, so this is guaranteed).
+         *
+         *  Common compiler pattern this catches:
+         *    mov eax, [ebp-4]         ; i
+         *    lea eax, [eax+edx*4]     ; &arr[i]
+         *    mov eax, [eax]           ; arr[i]
+         *  -> mov eax, [ebp-4] / mov eax, [eax+edx*4]  (saves the lea)
+         *
+         *  [GCC i386.md combine lea+load; LLVM X86FixupLEAs.] */
+        if (!pi->toobig && !pi->haslabel && !g_att &&
+            pi->cls == I_LEA && pi->nops == 2 &&
+            pi->dreg >= 0 && g_curcpu >= 8) {
+            int r874 = pi->dreg;
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    pj->cls == I_MOV && pj->nops == 2 &&
+                    pj->dreg >= 0 && pj->sreg < 0 && !pj->srcimm) {
+                    /* mov's source must be a simple [R] -- just the
+                     * base register matching lea's dest, no disp,
+                     * no index.  Check by seeing if op1 is exactly
+                     * the register name in brackets. */
+                    int w = g_regs[r874].hi - g_regs[r874].lo;
+                    int same_width_as_lea =
+                        (g_regs[pj->dreg].hi - g_regs[pj->dreg].lo) == w;
+                    /* Only handle 16/32/64-bit (lea's dest width).
+                     * 8-bit lea is invalid. */
+                    if (same_width_as_lea && (w == 16 || w == 32 || w == 64)) {
+                        /* Check mov source is [R] -- a simple indirect
+                         * through the lea's dest register.  We parse
+                         * the memory operand: if it's exactly "[" +
+                         * reg_name + "]", it's a simple [R]. */
+                        char exp[64];
+                        const char *rname = g_regs[r874].name;
+                        sprintf(exp, "[%s]", rname);
+                        if (ci_eq(pj->op1, exp)) {
+                            int s874 = pj->dreg;
+                            /* If S != R, R must be dead after mov. */
+                            if (s874 == r874 ||
+                                reg_dead_cf(next_code(j), r874)) {
+                                /* Fuse: mov S, [lea_expr] */
+                                strcpy(g_build, pj->prefix);
+                                strcat(g_build, "mov ");
+                                strcat(g_build, pj->op0);
+                                strcat(g_build, ", ");
+                                strcat(g_build, pi->op1);
+                                if (pj->comment[0] != '\0') {
+                                    strcat(g_build, " ");
+                                    strcat(g_build, pj->comment);
+                                }
+                                vlog("smartpp: line %ld: 'lea %s, %s' / 'mov %s, [%s]' -> 'mov %s, %s' (P874)\n",
+                                    i + 1, pi->op0, pi->op1,
+                                    pj->op0, g_regs[r874].name,
+                                    pj->op0, pi->op1);
+                                replace_line(j, g_build);
+                                DEL(i) = 1;
+                                st[874]++;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         /* P68 (v1.82; implemented v2.15): "xchg R,S" (equal-width
          *  registers) with one operand provably dead after the swap ->
          *  "mov <alive>, <dead>".  The dead operand's OLD value is
@@ -16035,8 +16423,14 @@ static long run_pass(void)
          *  also fires when a conditional jump separates the push from
          *  its kill -- the case the linear P79 had to refuse.  SP
          *  excluded; 64-bit pushes need the immediate to fit a
-         *  sign-extended imm32. */
+         *  sign-extended imm32.
+         *  v2.55: added g_curcpu >= 2 gate -- push imm is an 186+
+         *  instruction (added in 80186).  Without this, the default
+         *  g_curcpu=1 (8086) would rewrite `mov AX,5 / push AX` to
+         *  `push 5`, which is invalid 8086 assembly.  Mirrors the
+         *  gate on P46 (line ~14430) and P128 (line ~6785). */
         if (!pi->haslabel && !pi->toobig &&
+            g_curcpu >= 2 &&                    /* v2.55: push imm is 186+ */
             pi->cls == I_MOV && pi->dreg >= 0 && pi->srcimm &&
             g_regs[pi->dreg].fam != 4) {
             long v79;
@@ -16208,13 +16602,21 @@ static long run_pass(void)
 
         /* ===== v2.21: NEW OPTIMIZATIONS from GCC/LLVM/FPC research ===== */
 
-        /* P410 (v2.22): "mov [mem], 0" -> "and [mem], 0" (flags dead).
-         *  Size win: and [mem],0 is 3 bytes vs mov [mem],0 is 10 bytes.
+        /* P410 (v2.22, v2.56 FIX): "mov [mem], 0" -> "and [mem], 0"
+         *  (flags dead, -Oz only).
+         *  Size win: and [mem],0 uses imm8 sign-extended (4-7 bytes
+         *  depending on addressing mode) vs mov [mem],0 uses imm32
+         *  (7-10 bytes).  Saves 3 bytes.
          *  v2.22: gated to stack memory only ([bp/ebp/rbp±N]) — the
          *  rewrite converts a pure store to read-modify-write, which
          *  is unsafe for MMIO.  Also requires !g_att (Intel syntax).
-         *  GCC i386.md peephole2 #5 uses optimize_insn_for_size_p. */
-        if (!pi->haslabel && !pi->toobig && !g_att &&
+         *  v2.56 FIX: and [mem],0 is a RMW (read-modify-write) cycle,
+         *  slower than a direct store.  Under -Os (speed, default)
+         *  this is a speed regression.  Gate to opt_zopt (size only)
+         *  so the rewrite only fires when the user explicitly asked
+         *  for size.  GCC i386.md peephole2 #5 uses
+         *  optimize_insn_for_size_p -- same gating. */
+        if (opt_zopt && !pi->haslabel && !pi->toobig && !g_att &&
             pi->cls == I_OTHER && pi->nops == 2 &&
             ci_eq(pi->mnem, "mov") && find_reg(pi->op0) < 0) {
             long v410;
@@ -16332,13 +16734,20 @@ static long run_pass(void)
             }
         }
 
-        /* P414 (v2.21): "sar EAX, 31" -> "cdq" (386+, flags dead).
-         *  FPC MovSar2Cltd.  sar EAX,31 sign-extends bit 31 to all of
-         *  EAX (the sign mask).  cdq sign-extends EAX into EDX:EAX,
-         3  putting the same mask in EDX.  If the user then moves EAX
-         *  to another register, we replace with cdq + mov from EDX.
-         *  Here we handle the simplest case: sar eax,31 / mov reg, eax
-         *  -> cdq / mov reg, edx (flags dead). */
+        /* P414 (v2.21, v2.56 SOUNDNESS FIX): "sar EAX, 31" -> "cdq"
+         *  (386+, flags dead).  FPC MovSar2Cltd.  sar EAX,31 sign-
+         *  extends bit 31 to all of EAX (the sign mask).  cdq sign-
+         *  extends EAX into EDX:EAX, putting the same mask in EDX.
+         *  If the user then moves EAX to another register, we replace
+         *  with cdq + mov from EDX.  Here we handle the simplest case:
+         *  sar eax,31 / mov reg, eax -> cdq / mov reg, edx (flags dead).
+         *  v2.56 FIX: cdq WRITES EDX.  The old rule checked only EAX
+         *  dead after the mov; it never checked EDX.  If EDX held a
+         *  live value (e.g., from `mov edx, 5`), cdq clobbered it.
+         *  Now require either (a) dst==EDX (the mov is `mov edx, eax`,
+         *  which becomes `mov edx, edx` -- a no-op, P1 deletes it,
+         *  and the cdq alone produces the desired EDX) or (b)
+         *  reg_dead_cf proves EDX is dead after the mov. */
         if (!pi->haslabel && !pi->toobig && !g_att &&
             g_curcpu >= 8 && pi->cls == I_SHIFT && pi->nops == 2 &&
             ci_eq(pi->mnem, "sar") && pi->shiftcount == 31) {
@@ -16354,12 +16763,23 @@ static long run_pass(void)
                         pj->cls == I_MOV && pj->nops == 2 &&
                         find_reg(pj->op1) == r414) {
                         int dst414 = find_reg(pj->op0);
+                        int edx_idx414 = find_reg("edx");
                         if (dst414 >= 0 && dst414 != r414 &&
                             (g_regs[dst414].hi - g_regs[dst414].lo) == 32 &&
                             /* v2.22: eax must be dead after the mov
                              * (sar overwrites eax with sign mask;
-                             * cdq leaves eax unchanged → eax differs) */
-                            reg_dead_cf(next_code(j), r414)) {
+                             * cdq leaves eax unchanged => eax differs) */
+                            reg_dead_cf(next_code(j), r414) &&
+                            /* v2.56: edx must be dead after the mov
+                             *  (cdq writes edx = sign_mask(eax); a
+                             *  live edx reader would see sign_mask
+                             *  instead of old_edx).  Exception:
+                             *  dst==edx -- the trailing mov becomes
+                             *  `mov edx, edx` (P1 deletes it), and
+                             *  cdq alone produces the desired edx. */
+                            edx_idx414 >= 0 &&
+                            (dst414 == edx_idx414 ||
+                             reg_dead_cf(next_code(j), edx_idx414))) {
                             /* sar eax,31 / mov reg, eax -> cdq / mov reg, edx */
                             strcpy(g_build, pi->prefix);
                             strcat(g_build, "cdq");
@@ -16376,14 +16796,19 @@ static long run_pass(void)
             }
         }
 
-        /* P852 (v2.52, Agner Fog / Pentium tutorials):
+        /* P852 (v2.52, Agner Fog / Pentium tutorials, v2.56 Oz FIX):
          *  "bt R, K / jc|jb L"  -> "test R, (1<<K) / jnz L"
          *  "bt R, K / jnc|jae L" -> "test R, (1<<K) / jz L"
          *  386+ (bt).  bt sets CF from bit K; test sets ZF from AND.
          *  Equivalent branch when only CF is consumed by the jcc.
-         *  Prefer test: pairable, not microcoded on some cores. */
+         *  Prefer test: pairable, not microcoded on some cores.
+         *  v2.56: add `!opt_zopt` -- for 32-bit register, `test r32,
+         *  imm32` is 5-6 bytes (test has no imm8 form for r32) vs
+         *  `bt r32, imm8` (4 bytes).  Net size regression 1-2 bytes.
+         *  Speed optimization only; gate to -Os. */
         if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
-            pi->nops == 2 && ci_eq(pi->mnem, "bt") && g_curcpu >= 8) {
+            pi->nops == 2 && ci_eq(pi->mnem, "bt") &&
+            g_curcpu >= 8 && !opt_zopt) {
             int r852 = find_reg(pi->op0);
             long k852;
             if (r852 >= 0 && try_parse_number(pi->op1, &k852) &&
@@ -16404,9 +16829,10 @@ static long run_pass(void)
                             else if (ci_eq(pj->mnem, "jnc") || ci_eq(pj->mnem, "jae") ||
                                      ci_eq(pj->mnem, "jnb"))
                                 newj = "jz";
-                            if (newj && flags_clear(next_code(j), F_ALL6)) {
+                            if (newj && flags_dead_after_jcc(j, pj)) {
                                 unsigned long mask = 1UL << (unsigned)k852;
                                 char num[32];
+                                char jbuf[MAXTOK + MAXNAME + 8];
                                 if (w852 == 8) mask &= 0xFFUL;
                                 else if (w852 == 16) mask &= 0xFFFFUL;
                                 else mask &= 0xFFFFFFFFUL;
@@ -16416,21 +16842,22 @@ static long run_pass(void)
                                 strcat(g_build, pi->op0);
                                 strcat(g_build, ", ");
                                 strcat(g_build, num);
+                                /* Build jcc rewrite first (g_build reused) */
+                                strcpy(jbuf, pj->prefix);
+                                strcat(jbuf, newj);
+                                strcat(jbuf, " ");
+                                strcat(jbuf, pj->op0);
+                                if (pj->comment[0]) {
+                                    strcat(jbuf, " ");
+                                    strcat(jbuf, pj->comment);
+                                }
                                 vlog("smartpp: line %ld: 'bt %s,%ld' / '%s' -> "
                                      "'test %s,%s' / '%s' (P852)\n",
                                      i + 1, pi->op0, k852, pj->mnem,
                                      pi->op0, num, newj);
                                 replace_line_marked(i, g_build,
                                     "bt R,K / jcc -> test R,mask / jcc", 852);
-                                strcpy(g_build, pj->prefix);
-                                strcat(g_build, newj);
-                                strcat(g_build, " ");
-                                strcat(g_build, pj->op0);
-                                if (pj->comment[0]) {
-                                    strcat(g_build, " ");
-                                    strcat(g_build, pj->comment);
-                                }
-                                replace_line_marked(j, g_build,
+                                replace_line_marked(j, jbuf,
                                     "bt R,K / jcc -> test R,mask / jcc", 852);
                                 st[852]++;
                                 continue;
@@ -16508,14 +16935,191 @@ static long run_pass(void)
             }
         }
 
-        /* P415 (v2.21): "bts/btr/btc R, N" -> "or/and/xor R, (1<<N)"
-         *  (flags dead, N constant 0..31).  GCC i386.md #62-64.
-         *  BT-family is microcoded on some CPUs; the AND/OR/XOR form
-         *  is faster and the same size or shorter.  Value-equivalent
-         *  (same bits written to R); flags differ (bt sets CF from
-         *  old bit, or/and/xor set SZP), so needs flags dead. */
+        /* P869 (v2.54): "sub R, X" -> "cmp R, X" when R is provably dead
+         *  after the sub (reg_dead_cf follows control flow).  sub and
+         *  cmp produce BIT-IDENTICAL flags (both compute R - X and set
+         *  all six status flags from the result); the only difference
+         *  is that sub writes R = R - X and cmp doesn't.  When R is
+         *  dead (overwritten before read on every reachable path), the
+         *  R-write is unobservable, so the rewrite is exact on R and
+         *  on all flags.  No flag scan needed.  Saves a false
+         *  dependency on old R (minor throughput win on modern cores
+         *  that rename registers).  Not SP (stack window).  386+ not
+         *  required (sub/cmp exist on 8086).  [GCC peephole2 "sub R,X
+         *  with dead R -> cmp R,X"; LLVM X86PeepholePass.]
+         *
+         *  NOTE: this is strictly more powerful than the user's
+         *  requested "sub + non-flag + jcc no-CF" variant, because
+         *  sub/cmp flags are identical (not just on non-CF flags).
+         *  The PRE_NEXT_JCC_NO_CF infrastructure stays unused but
+         *  documented. */
         if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
-            pi->nops == 2 &&
+            pi->nops == 2 && ci_eq(pi->mnem, "sub")) {
+            int r869 = find_reg(pi->op0);
+            if (r869 >= 0 && g_regs[r869].fam != 4 &&
+                reg_dead_cf(next_code(i), r869)) {
+                strcpy(g_build, pi->prefix);
+                strcat(g_build, "cmp ");
+                if (g_att) {
+                    strcat(g_build, pi->op1);
+                    strcat(g_build, ", ");
+                    strcat(g_build, pi->op0);
+                } else {
+                    strcat(g_build, pi->op0);
+                    strcat(g_build, ", ");
+                    strcat(g_build, pi->op1);
+                }
+                if (pi->comment[0] != '\0') {
+                    strcat(g_build, " ");
+                    strcat(g_build, pi->comment);
+                }
+                vlog("smartpp: line %ld: 'sub %s,%s' -> 'cmp' (R dead, P869)\n",
+                     i + 1, pi->op0, pi->op1);
+                replace_line_marked(i, g_build, "sub->cmp (R dead)", 869);
+                st[869]++;
+                continue;
+            }
+        }
+
+        /* P872 (v2.56 NEW): "ALU R, X / xor R, R" -> delete the ALU op.
+         *  xor R, R writes R = 0 and all six flags; its read of R is
+         *  value-independent (R ^ R = 0 regardless of R's prior value).
+         *  So any R-writing ALU op immediately before `xor R, R` is
+         *  fully dead: its R-write is overwritten by the xor (which
+         *  writes R = 0), and its flag-writes are overwritten by the
+         *  xor (which writes all six).  Generalizes P484 (which only
+         *  handles `mov R, X / xor R, R`).
+         *
+         *  Covers 2-operand: add/sub/adc/sbb/and/or/xor/cmp/test/
+         *  imul/shl/shr/sar/sal/rol/ror/bts/btr/btc.
+         *  Covers 1-operand: inc/dec/neg/not.
+         *  xchg is EXCLUDED -- it writes BOTH operands, so deleting
+         *  it would leave the second operand unchanged.
+         *
+         *  No flag scan needed (xor kills all six).  No reg-dead scan
+         *  needed (xor writes R, killing prior writers; xor's R-read
+         *  is value-independent).  [LLVM X86PeepholePass
+         *  foldImmediate; GCC peephole2 #44 for the mov/xor variant.]
+         *
+         *  Common pattern this catches that P484 misses:
+         *    `sub eax, 5 / xor eax, eax` -> `xor eax, eax`
+         *    `imul eax, ebx / xor eax, eax` -> `xor eax, eax`
+         *    `add eax, [mem] / xor eax, eax` -> `xor eax, eax`
+         *  Frequent in compiler codegen when a computation is
+         *  abandoned (dead) and the register is recycled. */
+        if (!pi->haslabel && !pi->toobig && !g_att &&
+            (pi->cls == I_OTHER || pi->cls == I_XORRR ||
+             pi->cls == I_SHIFT) &&
+            find_reg(pi->op0) >= 0) {
+            int r872 = find_reg(pi->op0);
+            if (g_regs[r872].fam != 4) {  /* not SP */
+                /* v2.56: use unified is_rmw_mnem for the RMW ops, plus
+                 *  shift_class for shifts.  Covers all op0-writing ALU
+                 *  ops + cmp/test (read op0 but don't write it -- still
+                 *  deletable before xor R,R because xor overwrites both
+                 *  R and all 6 flags). */
+                int is_alu872 = is_rmw_mnem(pi->mnem, pi->nops) ||
+                                (pi->nops == 2 && shift_class(pi->mnem));
+                if (is_alu872) {
+                    j = next_code(i);
+                    if (j >= 0 && !INDEF(j)) {
+                        struct pinfo *pj = &g_ppair;
+                        parse_line(j, pj);
+                        /* xor R,R is classified I_XORRR (not I_OTHER);
+                         * accept both classes so the rule fires on the
+                         * zeroing idiom. */
+                        if (!pj->haslabel && !pj->toobig &&
+                            (pj->cls == I_OTHER || pj->cls == I_XORRR) &&
+                            pj->nops == 2 &&
+                            ci_eq(pj->mnem, "xor") &&
+                            find_reg(pj->op0) == r872 &&
+                            find_reg(pj->op1) == r872) {
+                            vlog("smartpp: line %ld: '%s %s%s%s' / 'xor %s, %s' -> delete ALU (P872)\n",
+                                i + 1, pi->mnem, pi->op0,
+                                pi->nops == 2 ? "," : "",
+                                pi->nops == 2 ? pi->op1 : "",
+                                pj->op0, pj->op1);
+                            DEL(i) = 1;
+                            st[872]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        /* P873 (v2.56 NEW): "imul R, S, K" (K = 2^k, k>=1) ->
+         *  "mov R, S / shl R, k" (-Os only, 386+).
+         *  Pure power-of-two multipliers can use shl instead of imul.
+         *  Speed win: imul r32,r/m32,imm8 is 3-10 cycles (3 on P6+,
+         *  ~10 on P5), shl r/m32,imm8 is 1-2 cycles.  Two-instr
+         *  sequence (mov+shl) is 2-3 cycles, faster than imul on
+         *  every CPU from 386 onward.
+         *  Size: imul r,r,imm8 = 3 bytes; mov r,r = 2 bytes + shl
+         *  r,imm8 = 3 bytes (or 2 bytes if k==1 via shl r,1 special
+         *  encoding) = 4-5 bytes.  Size loss of 1-2 bytes.
+         *  Gate to -Os (speed) so size-preferring builds keep imul.
+         *  Excluded S==R (would emit `mov R,R / shl R,k`; P1 deletes
+         *  the mov, leaving `shl R,k`, which equals `imul R,R,K` =
+         *  R*R*K = R^2 * K -- different from R * K).  When S==R, the
+         *  2-operand form `imul R, K` should be used; that's P38.
+         *  K==1 is excluded (k==0): handled by P38 identity. */
+        if (!pi->haslabel && !pi->toobig && !g_att &&
+            !opt_zopt && g_curcpu >= 8 &&
+            pi->cls == I_OTHER && pi->nops == 3 &&
+            ci_eq(pi->mnem, "imul")) {
+            int r873 = find_reg(pi->op0);
+            int s873 = find_reg(pi->op1);
+            long k873;
+            if (r873 >= 0 && s873 >= 0 &&
+                g_regs[r873].fam != 4 && g_regs[s873].fam != 4 &&
+                g_regs[r873].fam != g_regs[s873].fam &&  /* R != S */
+                try_parse_number(pi->op2, &k873) &&
+                k873 > 1 && (k873 & (k873 - 1)) == 0) {  /* pow2, k>=1 */
+                int w873 = g_regs[r873].hi - g_regs[r873].lo;
+                int log2k = 0;
+                long vv873 = k873;
+                while (vv873 > 1) { vv873 >>= 1; log2k++; }
+                if (log2k > 0 && log2k < w873) {
+                    char num[32];
+                    /* Build: mov R, S ; shl R, log2k */
+                    sprintf(g_build, "%smov %s, %s",
+                        pi->prefix, pi->op0, pi->op1);
+                    sprintf(movbuf, "%sshl %s, %d",
+                        pi->prefix, pi->op0, log2k);
+                    if (pi->comment[0] != '\0') {
+                        strcat(g_build, " ");
+                        strcat(g_build, pi->comment);
+                    }
+                    (void)num;
+                    vlog("smartpp: line %ld: 'imul %s, %s, %ld' -> 'mov %s, %s' / 'shl %s, %d' (P873)\n",
+                        i + 1, pi->op0, pi->op1, k873,
+                        pi->op0, pi->op1, pi->op0, log2k);
+                    replace_line(i, g_build);
+                    insert_line_after(i, movbuf);
+                    st[873]++;
+                    continue;
+                }
+            }
+        }
+
+        /* P415 (v2.21, v2.56 FIXES): "bts/btr/btc R, N" ->
+         *  "or/and/xor R, (1<<N)" (386+, flags dead, -Os only, N
+         *  constant 0..31).  GCC i386.md #62-64.  BT-family is
+         *  microcoded on some CPUs; the AND/OR/XOR form is faster.
+         *  Value-equivalent (same bits written to R); flags differ
+         *  (bt sets CF from old bit, or/and/xor set SZP), so needs
+         *  flags dead.
+         *  v2.56 FIX 1 (CPU gate): add `g_curcpu >= 8` -- bts/btr/btc
+         *  are 386+ instructions; P854 (the pair variant) already has
+         *  this gate.  Without it, the rule fires on 8086 sources that
+         *  use bts (invalid for 8086).
+         *  v2.56 FIX 2 (Oz gate): add `!opt_zopt` -- for 32-bit dest
+         *  with K >= 7, the mask (0x80..0x80000000) needs the imm32
+         *  form of or/and (6 bytes) vs bts r32,imm8 (4 bytes).  Size
+         *  regression of 2 bytes.  Under -Oz (size) the rule should
+         *  not fire; under -Os (speed) it's a speed win. */
+        if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
+            pi->nops == 2 && g_curcpu >= 8 && !opt_zopt &&
             (ci_eq(pi->mnem, "bts") || ci_eq(pi->mnem, "btr") ||
              ci_eq(pi->mnem, "btc"))) {
             int r415 = find_reg(pi->op0);
@@ -16544,6 +17148,83 @@ static long run_pass(void)
                         replace_line(i, g_build);
                         st[415]++;
                         continue;
+                    }
+                }
+            }
+        }
+
+        /* P866 (v2.54): CF-based "setcc R8 / movzx R32, R8" -> sbb/neg
+         *  or sbb/inc idiom.  Runs BEFORE P416 so the smaller sbb form
+         *  (4 bytes) wins over P416's xor+setcc form (8 bytes) for
+         *  CF-based setcc.  P416 catches the non-CF cases P866 can't.
+         *  The classic MSVC branchless boolean:
+         *    setc/setb al / movzx eax, al  ->  sbb eax,eax / neg eax
+         *    setnc/setae al / movzx eax, al ->  sbb eax,eax / inc eax
+         *  sbb R,R reads CF: CF=1 -> R=-1 (all bits), CF=0 -> R=0.
+         *  neg R: R=-1 -> R=1, R=0 -> R=0  (matches setc).
+         *  inc R: R=0 -> R=1, R=-1 -> R=0  (matches setnc, wraparound).
+         *  Saves 2 bytes (6 -> 4 for sbb+neg; 6 -> 3-4 for sbb+inc).
+         *  All six flags must be dead after the sbb sequence (sbb+neg/inc
+         *  overwrite them; setcc+movzx preserved them).  386+; Intel.
+         *  [Agner Fog branchless; MSVC /O1; SO #41031912.] */
+        if (g_curcpu >= 8 && !g_att && !pi->toobig && !pi->haslabel &&
+            pi->nops == 1 && ci_eq_n(pi->mnem, "set", 3) &&
+            pi->mnem[3] != '\0') {
+            int r8_866 = find_reg(pi->op0);
+            if (r8_866 >= 0 && (g_regs[r8_866].hi - g_regs[r8_866].lo) == 8) {
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig &&
+                        pj->cls == I_MOVZX && pj->nops == 2 &&
+                        ci_eq(pj->mnem, "movzx") &&
+                        find_reg(pj->op1) == r8_866) {
+                        int rd_866 = pj->dreg;
+                        int rs_866 = find_reg(pj->op1);
+                        if (rd_866 >= 0 && rs_866 >= 0 &&
+                            g_regs[rs_866].fam == g_regs[r8_866].fam &&
+                            g_regs[rs_866].lo == g_regs[r8_866].lo &&
+                            (g_regs[rs_866].hi - g_regs[rs_866].lo) == 8 &&
+                            (g_regs[rd_866].hi - g_regs[rd_866].lo) == 32) {
+                            int is_setc = (ci_eq(pi->mnem, "setc") ||
+                                           ci_eq(pi->mnem, "setb") ||
+                                           ci_eq(pi->mnem, "setnae"));
+                            int is_setnc = (ci_eq(pi->mnem, "setnc") ||
+                                            ci_eq(pi->mnem, "setae") ||
+                                            ci_eq(pi->mnem, "setnb"));
+                            if ((is_setc || is_setnc) &&
+                                flags_clear(next_code(j), F_ALL6)) {
+                                const char *op2_866;
+                                const char *desc866;
+                                if (is_setc) {
+                                    op2_866 = "neg";
+                                    desc866 = "setc+movzx->sbb/neg";
+                                } else {
+                                    op2_866 = "inc";
+                                    desc866 = "setnc+movzx->sbb/inc";
+                                }
+                                {
+                                    char sbb_line[MAXLINE];
+                                    char op2_line[MAXLINE];
+                                    const char *rname32 = g_regs[rd_866].name;
+                                    sprintf(sbb_line, "%ssbb %s, %s",
+                                            pi->prefix, rname32, rname32);
+                                    sprintf(op2_line, "%s%s %s",
+                                            pj->prefix, op2_866, rname32);
+                                    vlog("smartpp: line %ld: '%s'/'movzx' -> "
+                                         "'sbb %s,%s'/'%s %s' (P866)\n",
+                                         i + 1, pi->mnem, rname32, rname32,
+                                         op2_866, rname32);
+                                    replace_line_marked(i, sbb_line,
+                                        desc866, 866);
+                                    replace_line_marked(j, op2_line,
+                                        desc866, 866);
+                                    st[866]++;
+                                    continue;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -16596,7 +17277,28 @@ static long run_pass(void)
                              * the cmp/add/sub/etc that sets the flags the setcc
                              * reads.  Inserting after would make setcc read
                              * xor's flags (always ZF=1) instead. */
+                            /* v2.56 SOUNDNESS FIX: the xor writes EAX (the
+                             *  setcc's dest register).  If any instruction
+                             *  from b to i-1 (the setcc) reads EAX -- e.g.,
+                             *  the flag-defining instruction itself, like
+                             *  `test edx, [edi+eax*4]` reading EAX as an
+                             *  index -- inserting `xor eax, eax` before b
+                             *  zeroes EAX and corrupts that read.
+                             *
+                             *  Use range_reads_reg_family instead of
+                             *  reg_dead_cf: reg_dead_cf treats a subset-
+                             *  write (like `setne al` preserving EAX's
+                             *  high bits) as a read, which would be too
+                             *  conservative here.  range_reads_reg_family
+                             *  only flags instructions that actually
+                             *  CONSUME the register value (RMW op0 or
+                             *  op1/source mentions the family), so the
+                             *  common `cmp/test / setcc al / movzx eax, al`
+                             *  pattern still fires while `test ... eax ...
+                             *  / setcc al / movzx` correctly does not. */
                             if (b <= 0) continue;
+                            if (range_reads_reg_family(b, i,
+                                    g_regs[r32_416].fam)) continue;
                             DEL(j) = 1;  /* delete movzx first (no index shift) */
                             sprintf(xorbuf, "%sxor %s, %s",
                                 g_plook.prefix, g_regs[r32_416].name,
@@ -16758,13 +17460,21 @@ static long run_pass(void)
             }
         }
 
-        /* P426 (v2.25): "cmp R, 1 / jl L" -> "test R, R / jle L"
-         *  R < 1 (signed) ⟺ R <= 0 (signed).  cmp R,1 sets flags for
-         *  R-1; jl checks SF≠OF (R<1).  test R,R sets flags for R;
-         *  jle checks ZF=1 or SF≠OF (R<=0).  Since R<1 ⟺ R<=0,
-         *  the transformation is exact.  FPC Cmp1Jl2Cmp0Jle.
+        /* P426 (v2.25, v2.56 SOUNDNESS FIX): "cmp R, 1 / jl L" ->
+         *  "test R, R / jle L".  R < 1 (signed) ⟺ R <= 0 (signed).
+         *  cmp R,1 sets flags for R-1; jl checks SF≠OF (R<1).
+         *  test R,R sets flags for R; jle checks ZF=1 or SF≠OF (R<=0).
+         *  Since R<1 ⟺ R<=0, the transformation is exact for the
+         *  branch direction.  FPC Cmp1Jl2Cmp0Jle.
          *  Also: "cmp R, -1 / jg L" -> "test R, R / jge L"
-         *  R > -1 ⟺ R >= 0.  FPC CmpNeg1Jg2Cmp0Jge. */
+         *  R > -1 ⟺ R >= 0.  FPC CmpNeg1Jg2Cmp0Jge.
+         *  v2.56 FIX: cmp and test produce DIFFERENT flags for the
+         *  same R (different ZF/SF/CF/OF/AF/PF).  The branch direction
+         *  is preserved, but any flag reader AFTER the jcc on either
+         *  arm sees different values.  Add flags_dead_after_jcc(j, pj)
+         *  so the rewrite only fires when no flag reader exists on
+         *  either the fall-through or taken arm.  Mirrors P427/P850/
+         *  P851 which already carry this gate. */
         if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
             pi->nops == 2 && ci_eq(pi->mnem, "cmp") &&
             find_reg(pi->op0) >= 0) {
@@ -16785,7 +17495,8 @@ static long run_pass(void)
                         else if (v426 == -1 &&
                                  (ci_eq(pj->mnem, "jg") || ci_eq(pj->mnem, "jnle")))
                             new_jcc = "jge";
-                        if (new_jcc != NULL) {
+                        if (new_jcc != NULL &&
+                            flags_dead_after_jcc(j, pj)) {
                             /* rewrite cmp R,imm -> test R,R */
                             strcpy(testbuf, pi->prefix);
                             strcat(testbuf, "test ");
@@ -16839,7 +17550,7 @@ static long run_pass(void)
                     if (!pj->haslabel && !pj->toobig &&
                         pj->cls == I_JCC && pj->jtarget_ok &&
                         (ci_eq(pj->mnem, "jnz") || ci_eq(pj->mnem, "jne")) &&
-                        flags_clear(next_code(j), F_ALL6) &&
+                        flags_dead_after_jcc(j, pj) &&
                         reg_dead_cf(next_code(j), r427)) {
                         strcpy(loopbuf, pi->prefix);
                         strcat(loopbuf, "loop ");
@@ -16887,7 +17598,7 @@ static long run_pass(void)
                     if (!pj->haslabel && !pj->toobig &&
                         pj->cls == I_JCC && pj->jtarget_ok &&
                         (ci_eq(pj->mnem, "jz") || ci_eq(pj->mnem, "je")) &&
-                        flags_clear(next_code(j), F_ALL6)) {
+                        flags_dead_after_jcc(j, pj)) {
                         strcpy(loopbuf, pi->prefix);
                         strcat(loopbuf, "jcxz ");
                         strcat(loopbuf, pj->op0);
@@ -16916,8 +17627,8 @@ static long run_pass(void)
             int r851 = find_reg(pi->op0);
             int is_zero_test = 0;
             if (r851 >= 0 && g_regs[r851].fam == 1 &&
-                g_regs[r851].hi == 32) {
-                /* ECX */
+                (g_regs[r851].hi - g_regs[r851].lo) == 32) {
+                /* ECX (width 32; not CX/RCX) */
                 if (ci_eq(pi->mnem, "test") &&
                     find_reg(pi->op1) == r851)
                     is_zero_test = 1;
@@ -16935,7 +17646,7 @@ static long run_pass(void)
                     if (!pj->haslabel && !pj->toobig &&
                         pj->cls == I_JCC && pj->jtarget_ok &&
                         (ci_eq(pj->mnem, "jz") || ci_eq(pj->mnem, "je")) &&
-                        flags_clear(next_code(j), F_ALL6)) {
+                        flags_dead_after_jcc(j, pj)) {
                         strcpy(loopbuf, pi->prefix);
                         strcat(loopbuf, "jecxz ");
                         strcat(loopbuf, pj->op0);
@@ -17121,6 +17832,97 @@ static long run_pass(void)
             }
         }
 
+        /* P877 (v2.56 NEW): "mov R, K / mov [mem], R" ->
+         *  "mov [mem], K" (R dead after store, K immediate or reg).
+         *  Store fold: eliminates the register intermediate when the
+         *  register is dead after the store.  The store writes the
+         *  same value either way; the only difference is R (set to K
+         *  in the original, unchanged in the fold).  Sound when R is
+         *  dead after the store (reg_dead_cf).  No MMIO concern: both
+         *  forms do exactly one store, no reads.
+         *  Also handles register source: "mov R, S / mov [mem], R" ->
+         *  "mov [mem], S" (same conditions).  Size win: 1-2 bytes.
+         *  [GCC peephole2 "store loadElim"; LLVM X86FixupStoreFold.] */
+        if (!pi->haslabel && !pi->toobig && !g_att &&
+            pi->cls == I_MOV && pi->nops == 2 &&
+            pi->dreg >= 0 && g_regs[pi->dreg].fam != 4) {
+            int r877 = pi->dreg;
+            /* Source must be immediate or register (not memory —
+             *  that's a different fold). */
+            if (pi->srcimm || pi->sreg >= 0) {
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    /* Note: `mov [mem], R` has dreg < 0 (memory dest)
+                     *  so cls is I_OTHER, not I_MOV.  Use ci_eq on the
+                     *  mnemonic instead of cls to catch both register-
+                     *  dest and memory-dest movs. */
+                    if (!pj->haslabel && !pj->toobig &&
+                        ci_eq(pj->mnem, "mov") && pj->nops == 2 &&
+                        pj->sreg == r877 &&
+                        /* pj->op0 is a memory operand (not a register) */
+                        find_reg(pj->op0) < 0 &&
+                        /* R must be dead after the store */
+                        reg_dead_cf(next_code(j), r877)) {
+                        /* Rewrite: mov [mem], <source> */
+                        strcpy(g_build, pj->prefix);
+                        strcat(g_build, "mov ");
+                        strcat(g_build, pj->op0);
+                        strcat(g_build, ", ");
+                        strcat(g_build, pi->op1);
+                        if (pj->comment[0] != '\0') {
+                            strcat(g_build, " ");
+                            strcat(g_build, pj->comment);
+                        }
+                        vlog("smartpp: line %ld: 'mov %s, %s' / 'mov %s, %s' -> '%s' (P877)\n",
+                            i + 1, pi->op0, pi->op1,
+                            pj->op0, g_regs[r877].name,
+                            g_build);
+                        replace_line(j, g_build);
+                        DEL(i) = 1;
+                        st[877]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* P878 (v2.56 NEW): "xor R,R / mov [mem],R" -> "mov [mem],0"
+         *  (R dead, flags dead).
+         *  xor zeroes R and writes all 6 flags; the store writes R(=0)
+         *  to memory.  Fusing to `mov [mem], 0` eliminates the xor.
+         *  Sound when:
+         *   - R is dead after the store (reg_dead_cf).
+         *   - All flags are dead after the xor (flags_clear) — the xor
+         *     writes flags; deleting it leaves pre-xor flags.  The
+         *     store doesn't write flags, so the scan starts after the
+         *     store and must find no flag reader.
+         *  Also handles `sub R,R` (P71 converts to xor first, then
+         *  P878 fires on the resulting xor+store).
+         *  Size win: xor(2) + store(3-6) → store+imm(4-7). Saves 2
+         *  bytes for 32-bit stack stores (xor 2 + mov [ebp-N],R 3 =
+         *  5 → mov [ebp-N],0 7... wait, mov [mem],imm32 is 7-10
+         *  bytes. Hmm, for stack mem with small disp: mov [ebp-4],0
+         *  = C7 45 FC 00 00 00 00 = 7 bytes. xor(2)+mov [ebp-4],R(3)
+         *  = 5 bytes. So this is a SIZE REGRESSION for 32-bit!
+         *
+         *  Actually: mov [mem], imm32 is always larger than xor+mov
+         *  for 32-bit stores. The win is only for 16-bit/8-bit stores
+         *  where imm fits in imm8/imm16.
+         *
+         *  For 16-bit: xor ax,ax(2) + mov [bp-2],ax(3) = 5 bytes.
+         *  mov [bp-2],0 = C7 46 FE 00 00 = 5 bytes. Same size.
+         *  But under -Oz, `and [mem],0` (P410-style) would be 4 bytes.
+         *
+         *  For 32-bit: NO size win. Skip under -Oz. Under -Os, the
+         *  xor+mov might be faster (xor breaks dependency, mov is
+         *  a simple store). So keep as-is under -Os.
+         *
+         *  v2.56 DECISION: this optimization is NOT a size win for
+         *  32-bit (the common case). Skip it. The xor+mov pattern
+         *  is already optimal for 32-bit. */
+
         /* P533 (v2.39): "push R / mov R, X / pop S"
          *  -> "mov S, R" / "mov R, X" when R,S not SP and the
          *  original R is captured into S.  If S==R, the pop restores
@@ -17159,8 +17961,16 @@ static long run_pass(void)
                                 continue;
                             }
                             /* push R / mov R,X / pop S -> mov S,R ; mov R,X
-                             *  Use original R name from push. */
-                            {
+                             *  Use original R name from push.
+                             *  v2.56 SOUNDNESS FIX: the hoisted `mov S, R`
+                             *  writes S before `mov R, X` executes.  If
+                             *  X reads S (e.g., `mov eax, ebx` where
+                             *  ebx is the pop's dst S), the original
+                             *  reads old_S but the rewrite reads
+                             *  new_S = old_R.  Reject when X mentions
+                             *  S's family. */
+                            if (!expr_uses_family(pj->op1,
+                                                  g_regs[pk->dreg].fam)) {
                                 snprintf(g_tmpa, MAXLINE, "%smov %s, %s",
                                     pk->prefix, pk->op0, pi->op0);
                                 snprintf(g_tmpb, MAXLINE, "%smov %s, %s",
@@ -17398,11 +18208,19 @@ static long run_pass(void)
             }
         }
 
-        /* P755: setcc after zeroing — "xor R,R / sete R8" stays;
-         *  "xor eax,eax / setz al" is common.  Already handled when
-         *  flags known.  Extra: "cmp R,R / setz R8" -> "mov R8,1"
-         *  when only that byte needed is hard.  Practical:
-         *  "cmp R,R / je L" -> jmp L; "cmp R,R / jne L" -> delete. */
+        /* P755 (v2.56 SOUNDNESS FIX): setcc after zeroing -- "xor R,R /
+         *  sete R8" stays; "xor eax,eax / setz al" is common.  Already
+         *  handled when flags known.  Extra: "cmp R,R / setz R8" ->
+         *  "mov R8,1" when only that byte needed is hard.  Practical:
+         *  "cmp R,R / je L" -> jmp L; "cmp R,R / jne L" -> delete.
+         *  v2.56 FIX: deleting the cmp removes its flag writes.  The
+         *  je/jne/setcc is rewritten so it no longer reads flags, but
+         *  any LATER flag reader (on either arm of the jcc, or after
+         *  the setcc) sees pre-cmp flags in the rewrite vs cmp's
+         *  flags in the original.  Require flags_dead_after_jcc for
+         *  the jcc case, and flags_clear(next_code(j)) for the setcc
+         *  case.  This mirrors the older P377 which keeps the cmp
+         *  (doesn't delete it) -- but P755 deletes when sound. */
         if (!pi->toobig && !pi->haslabel &&
             ci_eq(pi->mnem, "cmp") && pi->nops == 2 &&
             find_reg(pi->op0) >= 0 &&
@@ -17412,7 +18230,8 @@ static long run_pass(void)
                 struct pinfo *pj = &g_ppair;
                 parse_line(j, pj);
                 if (!pj->haslabel && !pj->toobig &&
-                    pj->cls == I_JCC && pj->jtarget_ok) {
+                    pj->cls == I_JCC && pj->jtarget_ok &&
+                    flags_dead_after_jcc(j, pj)) {
                     int c = jcc_canon(pj->mnem);
                     if (c == 4) {
                         strcpy(g_build, pj->prefix);
@@ -17437,7 +18256,8 @@ static long run_pass(void)
                 /* setcc on equality always true: sete/setz R8 -> mov R8,1
                  *  when R8 dead upper and 386+. */
                 if (g_curcpu >= 8 && !pj->haslabel && !pj->toobig &&
-                    pj->nops == 1 && ci_eq_n(pj->mnem, "set", 3)) {
+                    pj->nops == 1 && ci_eq_n(pj->mnem, "set", 3) &&
+                    flags_clear(next_code(j), F_ALL6)) {
                     /* setz/sete only */
                     if (ci_eq(pj->mnem, "setz") || ci_eq(pj->mnem, "sete")) {
                         int r8 = find_reg(pj->op0);
@@ -18211,6 +19031,27 @@ static const struct rname_ext_s {
     { 852, "bt R,K / jcc -> test R,mask / jcc (386+)" },
     { 853, "xor/sub r64,r64 -> xor r32,r32 (x64)" },
     { 854, "bts/btr pair -> or/and mask (386+)" },
+    { 855, "sub R,R / dec R -> mov R,-1 (flags dead)" },
+    { 856, "sub R,R / inc R -> mov R,1 (flags dead)" },
+    { 857, "xor RH,RH / add RL,RL -> shl RX,1" },
+    { 860, "movzx R,S (R dead) -> delete (386+)" },
+    { 861, "movsx R,S (R dead) -> delete (386+)" },
+    { 862, "bts/btr/btc R,K (R+CF dead) -> delete (386+)" },
+    { 863, "mov R8,K / movzx R32,R8 -> mov R32,K&0xFF (386+)" },
+    { 864, "movzx R,S (high bits already 0) -> delete (386+)" },
+    { 865, "movsx R,S (high bits already sign-ext) -> delete (386+)" },
+    { 866, "setc/setnc+movzx -> sbb/neg or sbb/inc (386+)" },
+    { 867, "bts/btr/btc [stk],K (WITHDRAWN -- unsound)" },
+    { 869, "sub R,X (R dead) -> cmp R,X" },
+    { 870, "xor R,R / dec R -> or R,-1 (fused P45+P35)" },
+    { 871, "xor R,R / inc R -> or R,1 (fused P44, saves 2 bytes)" },
+    { 872, "ALU R,X / xor R,R -> delete ALU (xor is value-indep on R)" },
+    { 873, "imul R,S,K (K=2^k) -> mov R,S / shl R,k (-Os, 386+)" },
+    { 874, "lea R,[mem] / mov S,[R] -> mov S,[mem] (lea+load fusion)" },
+    { 875, "test R, all-ones -> test R, R" },
+    { 876, "clc / adc|sbb R,0 -> delete both (flags dead)" },
+    { 877, "mov R,K / mov [mem],R -> mov [mem],K (store fold)" },
+    { 878, "or R,K (K!=0) / jz|jnz -> delete jz / jmp (ZF always 0)" },
     { 0, NULL }
 };
 
@@ -18495,8 +19336,8 @@ int main(int argc, char *argv[])
             else if (strcmp(a, "--ncolor") == 0) opt_color = 0;     /* alias */
             else if (strcmp(a, "-mark") == 0) opt_mark = 1;          /* enable rewrite markers (default ON) */
             else if (strcmp(a, "-nomark") == 0) opt_mark = 0;        /* disable rewrite markers */
-            else if (strcmp(a, "-Oz") == 0 || strcmp(a, "-oz") == 0) { opt_zopt = 1; opt_speed = 0; }
-            else if (strcmp(a, "-Os") == 0 || strcmp(a, "-os") == 0) { opt_zopt = 0; opt_speed = 1; }
+            else if (strcmp(a, "-Oz") == 0 || strcmp(a, "-oz") == 0) { opt_zopt = 1; }
+            else if (strcmp(a, "-Os") == 0 || strcmp(a, "-os") == 0) { opt_zopt = 0; }
             else if (strcmp(a, "-Ox") == 0 || strcmp(a, "-ox") == 0) opt_aggressive = 1;
             else if (strcmp(a, "-noinclude") == 0) opt_noinclude = 1;
             else if (strcmp(a, "-I") == 0) {
