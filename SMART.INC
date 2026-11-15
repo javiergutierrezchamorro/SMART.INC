@@ -1289,15 +1289,15 @@ movsx MACRO reg, val
     ELSEIFIDNI <reg>, <bx>
         mov al, val
         cbw
-        mov bx, ax              ; warning: clobbers AX
+        mov bx, ax              ; clobbers AX (pre-386 limitation)
     ELSEIFIDNI <reg>, <cx>
         mov al, val
         cbw
-        mov cx, ax              ; warning: clobbers AX
+        mov cx, ax              ; clobbers AX (pre-386 limitation)
     ELSEIFIDNI <reg>, <dx>
         mov al, val
         cbw
-        mov dx, ax              ; warning: clobbers AX
+        mov dx, ax              ; clobbers AX (pre-386 limitation)
     ELSE
         .ERR <movsx: destination not supported, use AX/BX/CX/DX>
     ENDIF
