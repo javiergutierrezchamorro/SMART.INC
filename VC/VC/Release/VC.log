@@ -1,4 +1,5 @@
 ﻿  SMARTPP.C
+D:\PROYECTOS\SMART.INC\SMARTPP.C(15685,30): warning C4101: 'nb': variable local sin referencia
   Generando código
   Previous IPDB not found, fall back to full compilation.
   All 171 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.

@@ -18,6 +18,16 @@
 *  Review pass: P891 restricted to width==64; P884/P885 require
 *  strict narrower source; P892 removed (duplicate of existing
 *  and R,-1 rule).
+*  v2.60: Completed candidates 1, 4 and 8 under speed (-Os / !opt_zopt):
+*  P901 complete (setcc+movzx -> xor r32,r32 + setcc when flags+wide dead),
+*  P380 already covered the LEA tree for 3/5/7/9/11/13/15/... (candidate 4),
+*  P380/P907 now also strength-reduces imul*31 and imul*63 via shl/sub
+*  through a dead scratch (faster than microcoded imul, even if larger).
+*  P900 and P902 remain as previously added.  Candidates 2/5/6/7 stay
+*  researched-only.
+*  v2.60b: seven additional simple rules P908-P914 (setcc+and1,
+*  setcc+idempotent, mov0+setcc, residual identity LEA, 8-bit or/and
+*  ->test, bt*R,0 dead, duplicate test R,R).
 *=====================================================================
 *  SMART.INC can only optimize inside a macro expansion: a macro
 *  sees its own arguments, never the surrounding instruction flow
@@ -1758,7 +1768,7 @@
 #define SMARTPP_HAS_ISATTY 0
 #endif
 
-#define SMARTPP_VERSION "2.57"
+#define SMARTPP_VERSION "2.60b"
 /* Author name: use CP1252 on Windows (é = 0xE9), UTF-8 elsewhere.
  *  Windows consoles (cp850/cp1252) often mojibake UTF-8; CP1252 matches
  *  the OEM/ANSI code pages used by Spanish Windows. */
@@ -15664,6 +15674,44 @@ static long run_pass(void)
                     st[380]++;
                     continue;
                 }
+                /* v2.60: Mersenne factors 31 and 63 under speed (-Os).
+                 *  31 = (R<<5) - R, 63 = (R<<6) - R.  Sequence is larger
+                 *  in bytes than imul imm8 but much faster on modern
+                 *  cores (imul is microcoded).  Only when !opt_zopt. */
+                else if ((m == 31 || m == 63) && a == 0) {
+                    int shamt = (m == 31) ? 5 : 6;
+                    int t = find_dead_scratch(next_code(i), dst_r, w);
+                    if (t >= 0 && g_regs[t].fam != g_regs[src_r].fam) {
+                        char nb[16];
+                        /* mov T, src */
+                        sprintf(g_build, "%smov %s, %s", pi->prefix,
+                                g_regs[t].name, src_name);
+                        if (pi->comment[0] != 0) {
+                            strcat(g_build, " ");
+                            strcat(g_build, pi->comment);
+                        }
+                        vlog("smartpp: line %ld: 'imul %s, %ld' -> shl/sub form (P380/P907 speed)\n",
+                             i + 1, pi->op0, v);
+                        replace_line(i, g_build);
+                        /* shl T, shamt */
+                        sprintf(g_build, "%sshl %s, %d", pi->prefix,
+                                g_regs[t].name, shamt);
+                        insert_line_after(i, g_build);
+                        /* sub T, src */
+                        sprintf(g_build, "%ssub %s, %s", pi->prefix,
+                                g_regs[t].name, src_name);
+                        insert_line_after(i + 1, g_build);
+                        /* mov dest, T  (if dest != T) */
+                        if (dst_r != t) {
+                            sprintf(g_build, "%smov %s, %s", pi->prefix,
+                                    pi->op0, g_regs[t].name);
+                            insert_line_after(i + 2, g_build);
+                        }
+                        st[380]++;
+                        st[907]++;
+                        continue;
+                    }
+                }
                 else {
                     /* v2.16: table-driven two-lea factors -- 7, 11, 13,
                      *  15 (as before) plus 17, 19, 21, 25, 27, 37, 41,
@@ -19049,39 +19097,12 @@ static long run_pass(void)
             }
         }
 
-        /* P898 (Phase C, -Ox only): imul R, 31 -> sequence of lea/sub
-         *  when a dead scratch exists and flags are dead.
-         *  31 = 32-1 = (R<<5) - R.  Form:
-         *    lea T, [R*2] ; lea T, [T*8] ; lea T, [T*2] ; sub T, R
-         *  or simpler when possible.  Size is often larger, therefore
-         *  restricted to -Ox.  For safety we only emit a well-known
-         *  short form when scratch is available and width is 32/64. */
-        if (opt_aggressive && !pi->toobig && !pi->haslabel && !g_att &&
-            ci_eq(pi->mnem, "imul") && pi->nops == 2 &&
-            find_reg(pi->op0) >= 0 && g_curcpu >= 8) {
-            long v;
-            int dst = find_reg(pi->op0);
-            int w = g_regs[dst].hi - g_regs[dst].lo;
-            if ((w == 32 || (w == 64 && g_curcpu >= 128)) &&
-                g_regs[dst].fam != 4 &&
-                try_parse_number(pi->op1, &v) && v == 31 &&
-                flags_clear(next_code(i), F_ALL6)) {
-                int scr = find_dead_scratch(next_code(i), dst, w);
-                if (scr >= 0) {
-                    /* R*31 = (R<<5) - R.  Emit:
-                     *   mov T, R / shl T, 5 / sub T, R / mov R, T
-                     *  but that can be large.  Simpler accepted form
-                     *  under -Ox only: leave the imul (no rewrite)
-                     *  unless we can prove a clear win.  For now we
-                     *  only count a hit when we can replace with a
-                     *  shorter equivalent that the assembler accepts.
-                     *  Conservative decision: do not rewrite 31/63
-                     *  automatically; the size risk is real.
-                     *  Documented as researched but not auto-applied. */
-                    (void)scr;
-                }
-            }
-        }
+        /* P898 (Phase C, -Ox only, RESEARCHED ONLY): imul R, 31 strength
+         *  reduction.  31 = 32-1 = (R<<5)-R.  A multi-instruction LEA/sub
+         *  sequence is usually larger than the 3-byte imul r,imm8 form
+         *  and is therefore not auto-applied.  Kept as documentation of
+         *  the research; no rewrite is emitted.  (Previous stub that
+         *  allocated a scratch and then did nothing was removed.) */
 
         /* P899 (Phase B): "lea R, [S + disp] / mov T, R" (R dead) ->
          *  "mov T, [S + disp]" when the lea is a pure address
@@ -19113,6 +19134,348 @@ static long run_pass(void)
                     replace_line(j, g_build);
                     DEL(i) = 1;
                     st[899]++;
+                    continue;
+                }
+            }
+        }
+
+        /* ================================================================
+         *  v2.60 NEW RULES (the 8 candidates, implemented conservatively)
+         *  All use existing liveness/CPU/SP/MMIO gates.  Complex multi-
+         *  instruction or size-risky forms stay researched-only.
+         * ================================================================ */
+
+        /* P900 (candidate 3): movzx Rwide, Rnarrow / test Rwide, Rwide
+         *  -> test Rnarrow, Rnarrow  when Rwide is dead after the test.
+         *  movzx guarantees high bits are zero, so ZF/SF/PF from the
+         *  narrow test are identical.  CF/OF stay 0 (same as test).
+         *  AF undefined both ways.  386+.  Intel preferred. */
+        if (g_curcpu >= 8 && !pi->haslabel && !pi->toobig &&
+            ci_eq(pi->mnem, "movzx") && pi->nops == 2 &&
+            pi->dreg >= 0) {
+            int rwide = pi->dreg;
+            int rnarrow = find_reg(pi->op1);
+            j = next_code(i);
+            if (rnarrow >= 0 &&
+                (g_regs[rwide].hi - g_regs[rwide].lo) >
+                (g_regs[rnarrow].hi - g_regs[rnarrow].lo) &&
+                g_regs[rwide].fam == g_regs[rnarrow].fam &&
+                j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    ci_eq(pj->mnem, "test") && pj->nops == 2 &&
+                    find_reg(pj->op0) == rwide && find_reg(pj->op1) == rwide &&
+                    reg_dead_cf(next_code(j), rwide)) {
+                    /* rewrite the test to the narrow register */
+                    strcpy(g_build, pj->prefix);
+                    strcat(g_build, "test ");
+                    strcat(g_build, pi->op1);
+                    strcat(g_build, ", ");
+                    strcat(g_build, pi->op1);
+                    vlog("smartpp: line %ld: movzx+test -> test narrow (P900)\n",
+                         i + 1);
+                    replace_line(j, g_build);
+                    DEL(i) = 1;
+                    st[900]++;
+                    continue;
+                }
+            }
+        }
+
+        /* P901 (candidate 1, COMPLETE): setcc R8 / movzx Rwide, R8
+         *  with Rwide dead after and flags dead after → rewrite to the
+         *  dependency-breaking form preferred by modern cores:
+         *      xor R32, R32
+         *      setcc R8
+         *  (R32 = 32-bit parent of the same family).  The low byte ends
+         *  up with the setcc result and the high bits are zero — exactly
+         *  what movzx produced.  xor defines flags, so flags_clear is
+         *  required.  386+.  Fallback: only delete the dead movzx. */
+        if (g_curcpu >= 8 && !pi->haslabel && !pi->toobig &&
+            pi->nops == 1 && ci_eq_n(pi->mnem, "set", 3)) {
+            int r8 = find_reg(pi->op0);
+            j = next_code(i);
+            if (r8 >= 0 && (g_regs[r8].hi - g_regs[r8].lo) == 8 &&
+                j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    ci_eq(pj->mnem, "movzx") && pj->nops == 2 &&
+                    find_reg(pj->op1) == r8 && pj->dreg >= 0 &&
+                    (g_regs[pj->dreg].hi - g_regs[pj->dreg].lo) > 8 &&
+                    reg_dead_cf(next_code(j), pj->dreg) &&
+                    flags_clear(next_code(j), F_ALL6)) {
+                    int fam = g_regs[r8].fam;
+                    int r32 = -1, kk;
+                    for (kk = 0; g_regs[kk].name != NULL; kk++) {
+                        if (g_regs[kk].fam == fam &&
+                            (g_regs[kk].hi - g_regs[kk].lo) == 32) {
+                            r32 = kk; break;
+                        }
+                    }
+                    if (r32 >= 0 && g_regs[r32].fam != 4) {
+                        char setl[MAXTOK];
+                        /* Build "xor r32, r32" */
+                        strcpy(g_build, pi->prefix);
+                        strcat(g_build, "xor ");
+                        strcat(g_build, g_regs[r32].name);
+                        strcat(g_build, ", ");
+                        strcat(g_build, g_regs[r32].name);
+                        vlog("smartpp: line %ld: setcc+movzx -> xor+setcc (P901 complete)\n",
+                             i + 1);
+                        /* 1. turn the setcc line into the xor */
+                        replace_line(i, g_build);
+                        /* 2. re-emit the original setcc immediately after */
+                        strcpy(setl, pi->prefix);
+                        strcat(setl, pi->mnem);
+                        strcat(setl, " ");
+                        strcat(setl, pi->op0);
+                        insert_line_after(i, setl);
+                        /* 3. delete the movzx (shifted by +1 because of the insert) */
+                        DEL(j + 1) = 1;
+                        st[901]++;
+                        continue;
+                    } else {
+                        vlog("smartpp: line %ld: setcc+movzx (wide dead) -> del movzx (P901)\n",
+                             j + 1);
+                        DEL(j) = 1;
+                        st[901]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* P902 (candidate 6 generalization): on x64, after a 32-bit
+         *  GP write the upper 32 bits of the 64-bit register are zero.
+         *  A following "movzx r64, r32" of the same family is therefore
+         *  an identity and can be deleted when the destination is the
+         *  same family (the movzx would re-zero bits already zero).
+         *  Conservative: only pure movzx r64, r32 same-family. */
+        if (g_curcpu >= 128 && !pi->haslabel && !pi->toobig &&
+            pi->dreg >= 0 &&
+            (g_regs[pi->dreg].hi - g_regs[pi->dreg].lo) == 32) {
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    ci_eq(pj->mnem, "movzx") && pj->nops == 2 &&
+                    pj->dreg >= 0 &&
+                    (g_regs[pj->dreg].hi - g_regs[pj->dreg].lo) == 64 &&
+                    g_regs[pj->dreg].fam == g_regs[pi->dreg].fam &&
+                    find_reg(pj->op1) >= 0 &&
+                    g_regs[find_reg(pj->op1)].fam == g_regs[pi->dreg].fam &&
+                    (g_regs[find_reg(pj->op1)].hi - g_regs[find_reg(pj->op1)].lo) == 32) {
+                    vlog("smartpp: line %ld: deleted identity movzx r64,r32 after 32-bit write (P902 x64)\n",
+                         j + 1);
+                    DEL(j) = 1;
+                    st[902]++;
+                    continue;
+                }
+            }
+        }
+
+        /* ================================================================
+         *  v2.60b  Seven additional simple high-value rules
+         * ================================================================ */
+
+        /* P908: setcc R8 / and R8, 1 → delete the and (value identity).
+         *  setcc already leaves 0 or 1; the and does not change the
+         *  register.  Require flags after the and to be dead. 386+. */
+        if (g_curcpu >= 8 && !pi->haslabel && !pi->toobig &&
+            pi->nops == 1 && ci_eq_n(pi->mnem, "set", 3)) {
+            int r8 = find_reg(pi->op0);
+            j = next_code(i);
+            if (r8 >= 0 && (g_regs[r8].hi - g_regs[r8].lo) == 8 &&
+                j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                long v;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    ci_eq(pj->mnem, "and") && pj->nops == 2 &&
+                    find_reg(pj->op0) == r8 &&
+                    try_parse_number(pj->op1, &v) && v == 1 &&
+                    flags_clear(next_code(j), F_ALL6)) {
+                    vlog("smartpp: line %ld: setcc / and R8,1 deleted (P908)\n",
+                         j + 1);
+                    DEL(j) = 1;
+                    st[908]++;
+                    continue;
+                }
+            }
+        }
+
+        /* P909: setcc R8 / mov R8,R8  or  setcc R8 / or R8,R8
+         *  → delete the second (idempotent).  Exact, no flags scan
+         *  needed for mov; for or we still require flags dead. */
+        if (g_curcpu >= 8 && !pi->haslabel && !pi->toobig &&
+            pi->nops == 1 && ci_eq_n(pi->mnem, "set", 3)) {
+            int r8 = find_reg(pi->op0);
+            j = next_code(i);
+            if (r8 >= 0 && (g_regs[r8].hi - g_regs[r8].lo) == 8 &&
+                j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig && pj->nops == 2 &&
+                    find_reg(pj->op0) == r8 && find_reg(pj->op1) == r8) {
+                    if (ci_eq(pj->mnem, "mov")) {
+                        vlog("smartpp: line %ld: setcc / mov R8,R8 deleted (P909)\n",
+                             j + 1);
+                        DEL(j) = 1;
+                        st[909]++;
+                        continue;
+                    }
+                    if ((ci_eq(pj->mnem, "or") || ci_eq(pj->mnem, "and")) &&
+                        flags_clear(next_code(j), F_ALL6)) {
+                        vlog("smartpp: line %ld: setcc / or|and R8,R8 deleted (P909)\n",
+                             j + 1);
+                        DEL(j) = 1;
+                        st[909]++;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        /* P910: strengthen "mov R,0 / setcc R8" (parent of R8).
+         *  If the parent register is dead after the setcc, the preceding
+         *  zeroing is pure dead weight.  P89 already covers some cases;
+         *  this catches the adjacent form more reliably. */
+        if (g_curcpu >= 8 && !pi->haslabel && !pi->toobig &&
+            pi->cls == I_MOV && pi->nops == 2 && pi->dreg >= 0) {
+            long v;
+            if (try_parse_number(pi->op1, &v) && v == 0) {
+                int rparent = pi->dreg;
+                j = next_code(i);
+                if (j >= 0 && !INDEF(j)) {
+                    struct pinfo *pj = &g_ppair;
+                    parse_line(j, pj);
+                    if (!pj->haslabel && !pj->toobig &&
+                        pj->nops == 1 && ci_eq_n(pj->mnem, "set", 3)) {
+                        int r8 = find_reg(pj->op0);
+                        if (r8 >= 0 &&
+                            g_regs[r8].fam == g_regs[rparent].fam &&
+                            (g_regs[r8].hi - g_regs[r8].lo) == 8 &&
+                            reg_dead_cf(next_code(j), rparent)) {
+                            vlog("smartpp: line %ld: mov 0 before setcc deleted (P910)\n",
+                                 i + 1);
+                            DEL(i) = 1;
+                            st[910]++;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* P911: residual LEA identities
+         *  lea R, [R] / lea R, [R+0] / lea R, [R*1] / lea R, [0+R]
+         *  → delete when the form is a pure identity (no scale other
+         *  than 1, no extra index).  Already partially covered by
+         *  P124; this catches a few more textual variants. */
+        if (!pi->haslabel && !pi->toobig && pi->cls == I_LEA &&
+            pi->nops == 2 && pi->dreg >= 0 &&
+            g_regs[pi->dreg].fam != 4) {
+            const char *mem = pi->op1;
+            int r = pi->dreg;
+            /* very conservative textual matches for identity forms */
+            if (mem[0] == '[') {
+                char buf[64];
+                int is_id = 0;
+                /* [reg] */
+                sprintf(buf, "[%s]", g_regs[r].name);
+                if (ci_eq(mem, buf)) is_id = 1;
+                /* [reg+0] / [reg+0h] */
+                sprintf(buf, "[%s+0]", g_regs[r].name);
+                if (ci_eq(mem, buf)) is_id = 1;
+                sprintf(buf, "[%s+0h]", g_regs[r].name);
+                if (ci_eq(mem, buf)) is_id = 1;
+                /* [reg*1] */
+                sprintf(buf, "[%s*1]", g_regs[r].name);
+                if (ci_eq(mem, buf)) is_id = 1;
+                /* [0+reg] */
+                sprintf(buf, "[0+%s]", g_regs[r].name);
+                if (ci_eq(mem, buf)) is_id = 1;
+                if (is_id) {
+                    vlog("smartpp: line %ld: identity lea deleted (P911)\n",
+                         i + 1);
+                    DEL(i) = 1;
+                    st[911]++;
+                    continue;
+                }
+            }
+        }
+
+        /* P912: strengthen 8-bit or/and R,R → test R,R
+         *  P8 already does this for many widths; this explicitly
+         *  catches pure 8-bit cases that may have been missed. */
+        if (!pi->haslabel && !pi->toobig && pi->nops == 2 &&
+            (ci_eq(pi->mnem, "or") || ci_eq(pi->mnem, "and"))) {
+            int ra = find_reg(pi->op0);
+            int rb = find_reg(pi->op1);
+            if (ra >= 0 && ra == rb &&
+                (g_regs[ra].hi - g_regs[ra].lo) == 8) {
+                /* exact flag equivalence → rewrite to test */
+                strcpy(g_build, pi->prefix);
+                strcat(g_build, "test ");
+                strcat(g_build, pi->op0);
+                strcat(g_build, ", ");
+                strcat(g_build, pi->op0);
+                vlog("smartpp: line %ld: 8-bit or/and R,R -> test (P912)\n",
+                     i + 1);
+                replace_line(i, g_build);
+                st[912]++;
+                continue;
+            }
+        }
+
+        /* P913: bt/btc/btr R, 0 with R dead + CF dead → delete
+         *  (specialisation of P862 for the extremely common constant 0).
+         *  bt R,0 just copies bit 0 into CF; when both are dead the
+         *  instruction is pure weight. */
+        if (g_curcpu >= 8 && !pi->haslabel && !pi->toobig &&
+            pi->nops == 2 &&
+            (ci_eq(pi->mnem, "bt") || ci_eq(pi->mnem, "btc") ||
+             ci_eq(pi->mnem, "btr") || ci_eq(pi->mnem, "bts"))) {
+            int rd = find_reg(pi->op0);
+            long v;
+            if (rd >= 0 && g_regs[rd].fam != 4 &&
+                try_parse_number(pi->op1, &v) && v == 0 &&
+                reg_dead_cf(next_code(i), rd) &&
+                flags_clear(next_code(i), F_CF)) {
+                vlog("smartpp: line %ld: bt* R,0 (R+CF dead) deleted (P913)\n",
+                     i + 1);
+                DEL(i) = 1;
+                st[913]++;
+                continue;
+            }
+        }
+
+        /* P914: test R,R / setz|setz R8  (or setnz) when R is dead
+         *  after → the test can sometimes be removed if flags are
+         *  already in the right state, but the safe adjacent form is
+         *  only to delete a following identical test.  Here we only
+         *  delete a redundant second test R,R (already partially
+         *  covered by P19/P150).  Full "test+setcc → setcc only"
+         *  needs the preceding instruction to have set the flags
+         *  identically; left conservative. */
+        if (!pi->haslabel && !pi->toobig &&
+            ci_eq(pi->mnem, "test") && pi->nops == 2 &&
+            find_reg(pi->op0) >= 0 && find_reg(pi->op0) == find_reg(pi->op1)) {
+            j = next_code(i);
+            if (j >= 0 && !INDEF(j)) {
+                struct pinfo *pj = &g_ppair;
+                parse_line(j, pj);
+                if (!pj->haslabel && !pj->toobig &&
+                    ci_eq(pj->mnem, "test") && pj->nops == 2 &&
+                    find_reg(pj->op0) == find_reg(pi->op0) &&
+                    find_reg(pj->op1) == find_reg(pi->op0)) {
+                    vlog("smartpp: line %ld: duplicate test R,R deleted (P914)\n",
+                         j + 1);
+                    DEL(j) = 1;
+                    st[914]++;
                     continue;
                 }
             }
@@ -19591,6 +19954,21 @@ static const struct rname_ext_s {
     { 897, "mov r64,r64 after 32-bit write -> del (x64)" },
     { 898, "imul R,31 strength-reduce (-Ox, researched)" },
     { 899, "lea R,[addr] / mov T,R -> mov T,[addr] (R dead)" },
+    { 900, "movzx+test Rwide -> test Rnarrow (Rwide dead)" },
+    { 901, "setcc+movzx -> xor r32,r32 + setcc (complete)" },
+    { 902, "movzx r64,r32 after 32-bit write -> del (x64)" },
+    { 903, "imul R,7 LEA form (covered by P380)" },
+    { 904, "setcc+test+jcc -> jcc (researched)" },
+    { 905, "deeper copy-prop (researched)" },
+    { 906, "bt+setc -> test/setnz (researched)" },
+    { 907, "imul*31/63 -> shl/sub (speed, via P380)" },
+    { 908, "setcc / and R8,1 -> del and" },
+    { 909, "setcc / mov|or|and R8,R8 -> del" },
+    { 910, "mov 0 / setcc -> del mov (parent dead)" },
+    { 911, "identity lea [R]/[R+0]/[R*1] -> del" },
+    { 912, "8-bit or/and R,R -> test" },
+    { 913, "bt* R,0 (R+CF dead) -> del" },
+    { 914, "duplicate test R,R -> del" },
     { 0, NULL }
 };
 
