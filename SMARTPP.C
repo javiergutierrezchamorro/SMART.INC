@@ -28,6 +28,51 @@
 *  v2.60b: seven additional simple rules P908-P914 (setcc+and1,
 *  setcc+idempotent, mov0+setcc, residual identity LEA, 8-bit or/and
 *  ->test, bt*R,0 dead, duplicate test R,R).
+*  v2.60c: CPU-safety fixes for 8086 builds:
+*    - P449 (table shl/shr/sal/sar 1+1->2): PRE_NO_CPU_8086.
+*      Imm shift count != 1 is 186+; C-side P4 already had the gate.
+*    - P47b (mov R,S / add R,S -> lea R,[S+S]): width >= 32 only.
+*      [S+S] illegal in 16-bit addressing; needs 386 SIB.
+*  v2.61: SOUNDNESS + coverage fixes from the 2026-11 full audit:
+*    - P862 (bts/btr/btc delete): PRE_FLAGS_DEAD_CF -> PRE_FLAGS_DEAD_ALL.
+*      BT leaves OF/SF/ZF/AF/PF undefined (Intel SDM Vol.2); require all
+*      six dead for strict bit-equivalence (was: only CF, not equivalent).
+*    - P884/P885 (movzx/and 0FFh/0FFFFh): p884_movzx_narrow_check now
+*      requires source width <= mask width (wm), not just wa>wb.  Fixes
+*      the movzx EAX,AX / and EAX,0FFh miscompile (AH lost); keeps every
+*      valid form firing.
+*    - P428 (lea R,[R+R] -> add R,R): p323_lea_rr_check now verifies the
+*      memory operand is exactly [R+R] (lea_two_regs, disp==0, base==
+*      index==R) and drops the bogus "if(opt_zopt)return 0" that inverted
+*      PRE_OZ and made the rule dead code.  Now fires under -Oz as intended.
+*    - P875 (test R,all-ones -> test R,R): drop the v<0 guard and compare
+*      against the width mask, so "test R,-1" (encodes as all-ones) is
+*      accepted, not just "test R,0FFh/0FFFFh/...".
+ *    - P433/P434/P435/P436 (add/sub constant fold): p433_fold_range_check
+ *      lower bound -limit -> -(limit+1), so the valid imm8 sum=-128
+ *      (and imm16/imm32 low ends) fold instead of being over-rejected.
+ *  v2.61 (cont.): x86-64 zero-extension + x87 stack soundness fixes from
+ *    the rule-by-rule re-audit.  In long mode a write to a 32-bit GPR
+ *    zero-extends bits 63..32 (clears them); a "restoring pair" (xor/xor,
+ *    add/sub, inc/dec, neg/neg, not/not, rol/ror, shl0/shr0, imul,1, ...)
+ *    restores the low 32 but CLEARS the upper 32, so deleting it preserves
+ *    the upper half and miscompiles any full-register reader.  Emulation
+ *    (Unicorn) confirmed the miscompiles; the fix adds the
+ *    g_curcpu>=128 && hi-lo==32 guard (same idiom as same_reg_noop_check)
+ *    to every affected site.  64-bit/16-bit dests and 32-bit mode still
+ *    fold (no over-rejection):
+ *    - C-side rules P58/P27/P39/P373 (xor/add-sub/rol-ror pairs),
+ *      P22/P24 (inc-dec/neg-neg), P38 (imul,1 identity), P49 (add/sub esp),
+ *      P511 (stack-frame reload delete).
+ *    - Table rules via two new guard checks (p_restoring_pair_imm_check,
+ *      p_restoring_pair_reg_check) for P459/P476-imm/P528/P528b and
+ *      P476-reg/P843/P844; and restoring_pair_x64_check for the 23
+ *      "delete both" restoring-pair entries (P23/P443/P453/P463/P464/P472/
+ *      P491/P524/P525/P540/P569/P570/P571/P711/P727/P728/P729/P730/P731/P876).
+ *    - P129/P130 (fld/fstp, fldz/fstp -> delete both): only st(0) is a true
+ *      push/pop no-op; for st(N), N>=1, the pair shifts the stack and
+ *      corrupts st(N-1).  New fld_fstp_st0_check restricts to lo==0.
+ *      (Emulation confirmed st(1) corruption before the fix.)
 *=====================================================================
 *  SMART.INC can only optimize inside a macro expansion: a macro
 *  sees its own arguments, never the surrounding instruction flow
@@ -1768,7 +1813,28 @@
 #define SMARTPP_HAS_ISATTY 0
 #endif
 
-#define SMARTPP_VERSION "2.60b"
+#define SMARTPP_VERSION "2.61"
+/* v2.60g: P382 requires lea_base_ok(S) so folded lea bases stay
+ *  legal on 8086 (BX/BP/SI/DI only). Completes the CPU-safety
+ *  pass for LEA rewrites that change the base register.
+ */
+/* v2.60f: remove unused `nb` in P380 (W202); keep Oz/Os/Ox policy:
+ *  safe size folds -> PRE_OZ / opt_zopt; safe speed -> default/-Os;
+ *  non-100%-safe (MMIO/alias risk) -> PRE_AGGRESSIVE / -Ox only.
+ */
+/* v2.60e: range_reads_reg_family also treats memory operands
+ *  as register reads (same class of bug as walk_classify in
+ *  2.60d).  Exhaustive differential fuzz of rewrite classes
+ *  (value+flags) and adversarial reg_dead tests passed.
+ */
+/* v2.60d: walk_classify WALK_REG treats registers that appear
+ *  only inside memory operands (e.g. [ecx+edx] in
+ *  `mov [ecx+edx], al`) as reads.  Without this, reg_dead_cf
+ *  returned true for a live address register and P869
+ *  rewrote `sub ecx,edi` -> `cmp` before a store through ecx,
+ *  corrupting the address.  Same hole affected any rule that
+ *  uses reg_dead_cf (P2, P85-87, P512, P860-862, P869, ...).
+ */
 /* Author name: use CP1252 on Windows (é = 0xE9), UTF-8 elsewhere.
  *  Windows consoles (cp850/cp1252) often mojibake UTF-8; CP1252 matches
  *  the OEM/ANSI code pages used by Spanish Windows. */
@@ -2027,7 +2093,7 @@ static int  g_nofpu     = 0;    /* .NO87 disables FPU rules; .287/.387/.8087 ena
 
 /* Per-rule hit counters, indexed by rule number (1..STSZ).
 *  st[0] is unused.  The driver prints non-zero entries by name. */
-#define STSZ 900             /* v2.52: headroom for curated high-value rules */
+#define STSZ 1024  /* v2.60c: was 900, rules go to P914 */             /* v2.52: headroom for curated high-value rules */
 static long st[STSZ];
 
 static int  g_gas = 0;           /* GAS conventions (comments, labels) */
@@ -4877,12 +4943,33 @@ static int walk_classify(struct walk_state *ws, struct pinfo *p,
          *  bottom of this block (lines ~4634) becomes a redundant
          *  safety net for the same case. */
         if (p->cls == I_PUSH) op0_reads_r = 1;
+        /* v2.60d SOUNDNESS FIX: registers that appear only inside a
+         *  memory operand are still READ.  Example:
+         *      sub  ecx, edi
+         *      mov  byte ptr [ecx+edx], al
+         *  find_reg(op0) of the mov is -1 (memory), so the pre-2.60d
+         *  code never consulted expr_uses_family on op0 and treated
+         *  ecx as dead -- P869 rewrote the sub to cmp and the store
+         *  used a stale address.  Apply the same scan to every operand
+         *  that is not a pure register destination kill. */
         killed = (dk >= 0 && covers(dk, ws->reg) && !op0_reads_r &&
                   !expr_uses_family(p->op1, ws->fam));
         if (killed) { *new_cd = 0; return WALK_SETTLED; }
         reads = !killed &&
                 ((dk >= 0 && g_regs[dk].fam == ws->fam) ||
                  expr_uses_family(p->op1, ws->fam));
+        /* Memory destination/source: base/index regs are live.  Also
+         *  covers LEA (op1 is the effective-address expression) and
+         *  any non-register op0 (byte ptr [...], dword ptr [...]). */
+        if (!reads) {
+            if (dk < 0 && p->nops >= 1 &&
+                expr_uses_family(p->op0, ws->fam))
+                reads = 1;
+            else if (p->nops >= 2 &&
+                     find_reg(p->op1) < 0 &&
+                     expr_uses_family(p->op1, ws->fam))
+                reads = 1;
+        }
         if (p->cls == I_PUSH || p->cls == I_PUSHF ||
             p->cls == I_PUSHA) {
             if (expr_uses_family(p->op0, ws->fam)) reads = 1;
@@ -5056,6 +5143,11 @@ static int range_reads_reg_family(long start, long end, int fam)
             return 1;
         /* op1 source read? */
         if (pk->nops >= 2 && expr_uses_family(pk->op1, fam))
+            return 1;
+        /* v2.60d: memory operands in op0 (e.g. mov [ecx],al or
+         *  mov eax,[ecx]) also read base/index registers. */
+        if (pk->nops >= 1 && find_reg(pk->op0) < 0 &&
+            expr_uses_family(pk->op0, fam))
             return 1;
     }
     return 0;
@@ -6310,27 +6402,48 @@ static int try_table_rules(long i)
  *  Use for shift counts, imm8 bounds, and similar range gates. */
 #define IMR_(lo, hi)         { OP_IMM_RANGE, 0, 0, 0, (lo), 1, (hi) }
 
-/* v2.17: P323/P324 check -- "lea R,[R+R]" (the [SIB base=index] form)
- *  needs the SIB byte (386+) AND a 32-bit or 64-bit register.  In
- *  16-bit addressing only BX/BP/SI/DI are legal base/index AND the
- *  same register cannot be both base and index, so "lea ax,[ax+ax]"
- *  is an assembler error (A2031 "must be index or base register")
- *  on every pre-386 build.  The old rule fired on any width and
- *  broke 4VIEW's 8086/386 real-mode code (five "lea ax,[ax+ax]"
- *  sites in StatLoad, PopUp, DrwSt).  This check keeps the rewrite
- *  to 386+ with EAX/ECX/EDX/EBX/ESP/EBP/ESI/EDI (and RAX..RDI on
- *  x64); 8/16-bit registers keep "shl R,1" intact. */
+/* v2.17 (v2.61 SOUNDNESS FIX): P323/P428 check -- "lea R,[R+R]" (the
+ *  SIB base=index form) needs the SIB byte (386+) AND a 32-bit or
+ *  64-bit register.  In 16-bit addressing only BX/BP/SI/DI are legal
+ *  base/index AND the same register cannot be both base and index, so
+ *  "lea ax,[ax+ax]" is an assembler error (A2031 "must be index or
+ *  base register") on every pre-386 build.  The old rule fired on any
+ *  width and broke 4VIEW's 8086/386 real-mode code (five "lea ax,
+ *  [ax+ax]" sites in StatLoad, PopUp, DrwSt); this check keeps the
+ *  rewrite to 386+ with EAX/ECX/EDX/EBX/ESP/EBP/ESI/EDI (and
+ *  RAX..RDI on x64); 8/16-bit registers keep "shl R,1" intact.
+ *
+ *  v2.61 FIX (two bugs): (1) the check never inspected the memory
+ *  operand -- ME_ matches ANY memory, so "lea eax,[eax+ebx]" or
+ *  "lea eax,[eax+eax*2]" would have rewritten to "add eax,eax"
+ *  (wrong).  We now call lea_two_regs() and require base == index ==
+ *  captured 'a', scale 1, displacement 0.  (2) the spurious
+ *  "if (opt_zopt) return 0;" line inverted this rule's own PRE_OZ gate
+ *  (PRE_OZ already restricts firing to -Oz at the generic level), so
+ *  the rule was dead code; the line is removed and the rule now fires
+ *  under -Oz as intended. */
 static int p323_lea_rr_check(const struct capent *cap, long i, long j2)
 {
     int ci = 'a' - 'a';
+    int ra, r1, r2;
+    long disp;
     (void)i; (void)j2;
-    if (opt_zopt) return 0;                 /* -Oz: shl R,1 is 2 bytes, lea is 3 */
+    if (cap == NULL) return 0;
     if (g_curcpu < 8) return 0;            /* SIB needs the 386 */
     if (ci < 0 || ci >= NCAP) return 0;
     if (cap[ci].fam < 0) return 0;
-    if (cap[ci].width == 32) return 1;
-    if (cap[ci].width == 64 && g_curcpu >= 128) return 1;  /* x64 */
-    return 0;
+    /* 32-bit dest, or 64-bit dest under long mode.  8/16-bit keep shl. */
+    if (cap[ci].width != 32 &&
+        !(cap[ci].width == 64 && g_curcpu >= 128)) return 0;
+    ra = cap_to_regidx(&cap[ci]);
+    if (ra < 0) return 0;
+    /* Verify the LEA operand is exactly [R+R] with R == captured 'a':
+     * two register terms, both equal to 'a', scale 1, displacement 0.
+     * lea_two_regs() rejects scaled forms ([R+R*K]) and 3-term forms. */
+    if (!lea_two_regs(g_pcur.op1, &r1, &r2, &disp)) return 0;
+    if (disp != 0) return 0;
+    if (r1 != ra || r2 != ra) return 0;
+    return 1;
 }
 
 /* v2.24: P430 check -- "or R,c1 / and R,c2 / or R,c3" 3-op chain.
@@ -6415,7 +6528,12 @@ static int p433_fold_range_check(const struct capent *cap,
     if (ridx < 0) return 0;
     w = g_regs[ridx].hi - g_regs[ridx].lo;
     limit = width_imm_limit(w);
-    return sum >= -limit && sum <= limit;
+    /* Signed imm encoding range is [-(limit+1), limit]: imm8 is
+     *  [-128, 127], imm16 [-32768, 32767], imm32 [-2^31, 2^31-1].
+     *  v2.61 FIX: the old `sum >= -limit` rejected the valid low end
+     *  (e.g. sum = -128 for imm8), a missed fold.  Match p40's
+     *  `-(lim+1)` form exactly. */
+    return sum >= -(limit + 1) && sum <= limit;
 }
 
 
@@ -6491,18 +6609,43 @@ static int p891_r64_only_check(const struct capent *cap, long i, long j2)
     return (g_regs[ra].hi - g_regs[ra].lo) == 64;
 }
 
-/* v2.59: P884/P885 — movzx dest must be strictly wider than source,
- *  otherwise "and with low mask" is not an identity on the full
- *  register. */
+/* v2.59 (v2.61 SOUNDNESS FIX): P884/P885 -- "movzx Rwide,Rnarrow /
+ *  and Rwide,MASK -> del and" (flags dead).  movzx zero-extends S into
+ *  R, so bits [wb, wa) of R are 0.  AND with an all-ones MASK of width
+ *  wm keeps bits [0, wm) and clears [wm, wa).  The AND is an identity
+ *  (R unchanged) iff it clears only bits movzx already zeroed, i.e.
+ *  iff wm >= wb.  The table pins MASK to 0FFh (P884, wm=8) or 0FFFFh
+ *  (P885, wm=16); we re-parse the immediate from the second instruction,
+ *  derive wm, and require wb <= wm.
+ *
+ *  The old test (wa > wb) was unsound: it accepted "movzx EAX,AX /
+ *  and EAX,0FFh" (wa=32 > wb=16) even though AH may be non-zero and the
+ *  AND clears it.  The new test rejects that case (wb=16 > wm=8) while
+ *  still firing for every valid form -- movzx r*,r8 / and 0FFh and
+ *  movzx r*,r8|r16 / and 0FFFFh.  386+ (movzx). */
 static int p884_movzx_narrow_check(const struct capent *cap, long i, long j2)
 {
-    int ra, rb;
+    int ra, rb, wa, wb, wm;
+    long maskv;
+    unsigned long m;
     (void)i; (void)j2;
     if (cap == NULL) return 0;
     ra = cap_to_regidx(&cap['a' - 'a']);
     rb = cap_to_regidx(&cap['b' - 'a']);
     if (ra < 0 || rb < 0) return 0;
-    return (g_regs[ra].hi - g_regs[ra].lo) > (g_regs[rb].hi - g_regs[rb].lo);
+    wa = g_regs[ra].hi - g_regs[ra].lo;
+    wb = g_regs[rb].hi - g_regs[rb].lo;
+    /* Read the AND immediate from the second instruction (g_ppair.op1);
+     * the table pattern already pins it to 0FFh / 0FFFFh. */
+    if (!try_parse_number(g_ppair.op1, &maskv)) return 0;
+    /* wm = width of the contiguous low all-ones mask (8 for 0FFh, 16 for
+     *  0FFFFh); reject anything that is not exactly 0..01..1. */
+    m = (unsigned long)maskv;
+    wm = 0;
+    while (wm < 64 && (m & 1UL)) { m >>= 1; wm++; }
+    if (m != 0) return 0;            /* stray high bits: not a clean mask */
+    if (wm > wa) return 0;           /* mask wider than the destination */
+    return wb <= wm;                 /* identity iff source fits the mask */
 }
 
 /* v2.57 (P527): "mov R,S / mov R,T" -- the first mov is dead only if the
@@ -6550,6 +6693,81 @@ static int p459_same_imm_check(const struct capent *cap, long i, long j2)
     if (!try_parse_number(a.op1, &va) || !try_parse_number(b.op1, &vb))
         return 0;
     return va == vb;
+}
+
+/* v2.61 SOUNDNESS FIX: the restoring-pair delete rules write the dest
+ *  register twice and restore its low half (xor/xor, add/sub, ror/rol are
+ *  all involutions).  In x64 a 32-bit write ZERO-EXTENDS bits 63..32
+ *  (clears them), so executing the pair clears the upper 32 while deleting
+ *  preserves them -- a later reader of the full register is miscompiled.
+ *  Reject 32-bit dest in long mode (same guard as same_reg_noop_check).
+ *
+ *  The imm-form restoring pairs: P459 (ror/rol), P476-imm (xor/xor),
+ *  P528/P528b (add/sub, sub/add).  Their SOUND siblings stay on
+ *  p459_same_imm_check: P470 (test/test) and P471 (cmp/cmp) do not write
+ *  the dest at all; P487 (and/and) and P487-or (or/or) are idempotent --
+ *  the 2nd write produces the SAME value, hence the SAME zero-extension,
+ *  so deleting the 2nd is exact. */
+static int p_restoring_pair_imm_check(const struct capent *cap, long i, long j2)
+{
+    int ra;
+    if (cap == NULL) return 0;
+    ra = cap_to_regidx(&cap['a' - 'a']);
+    if (ra >= 0 && g_curcpu >= 128 && g_regs[ra].hi - g_regs[ra].lo == 32)
+        return 0;
+    return p459_same_imm_check(cap, i, j2);
+}
+
+/* Reg-form restoring pairs: P476-reg (xor R,S / xor R,S), P843 (add/sub),
+ *  P844 (sub/add).  P240/P396 load-fold stay on p32_diff_regs_check: their
+ *  dest is proven dead via PRE_REG_DEAD_RA, so the zero-extension is
+ *  unobservable and folding remains sound (and must not be over-rejected). */
+static int p_restoring_pair_reg_check(const struct capent *cap, long i, long j2)
+{
+    int ra;
+    if (cap == NULL) return 0;
+    ra = cap_to_regidx(&cap['a' - 'a']);
+    if (ra >= 0 && g_curcpu >= 128 && g_regs[ra].hi - g_regs[ra].lo == 32)
+        return 0;
+    return p32_diff_regs_check(cap, i, j2);
+}
+
+/* v2.61 SOUNDNESS FIX: P129 (fld st / fstp st) and P130 (fldz / fstp st)
+ *  are true push/pop no-ops ONLY when the fstp target is st(0).  For
+ *  st(N), N>=1, the pair is NOT a no-op: fld st(N) pushes a copy (growing
+ *  the stack) and fstp st(N) writes st(0) into st(N-1) then pops -- so
+ *  st(N-1) is overwritten and the stack depth changes.  The pattern's
+ *  RR_('a')/SM_('a') match any st(N); this check restricts it to st(0)
+ *  (lo==0), enforcing the "trivial st-st(0) pair" the rule comment
+ *  promises.  Emulation confirmed st(1) corruption before the fix. */
+static int fld_fstp_st0_check(const struct capent *cap, long i, long j2)
+{
+    (void)i; (void)j2;
+    if (cap == NULL) return 0;
+    if (cap['a' - 'a'].fam != 8) return 0;          /* x87 stack family */
+    return cap['a' - 'a'].lo == 0;                  /* st(0) only */
+}
+
+/* v2.61 SOUNDNESS FIX: the "delete both" restoring-pair table rules
+ *  (not/not, neg/neg, inc/dec, add0/add0, sub0/sub0, or0/or0, and-1/and-1,
+ *  shl0/shr0, rol0/ror0, add1/dec, sub1/inc, not/xor-1, add0/adc0,
+ *  sub0/sbb0, clc/sbb0, add0/sub0, sub2/add2, ...) delete two instructions
+ *  that each WRITE the dest register and restore its low half.  In x64 a
+ *  32-bit write zero-extends bits 63..32 (clears them), so the pair clears
+ *  the upper 32 while deleting preserves it -- a later full-register
+ *  reader is miscompiled.  Reject 32-bit dest in long mode (the dest is
+ *  captured as operand 'a').  Same guard as same_reg_noop_check.  This is
+ *  a pure guard (returns 1 otherwise) -- it does NOT duplicate the imm /
+ *  width checks the individual rules' PRE flags already enforce. */
+static int restoring_pair_x64_check(const struct capent *cap, long i, long j2)
+{
+    int ra;
+    (void)i; (void)j2;
+    if (cap == NULL) return 1;
+    ra = cap_to_regidx(&cap['a' - 'a']);
+    if (ra >= 0 && g_curcpu >= 128 && g_regs[ra].hi - g_regs[ra].lo == 32)
+        return 0;
+    return 1;
 }
 
 /* P433 check: add R,c1 / add R,c2 -> add R,c1+c2 (sum fits). */
@@ -6909,12 +7127,14 @@ static int p875_test_allones_check(const struct capent *cap,
            (w == 16) ? 0xFFFFUL :
            (w == 32) ? 0xFFFFFFFFUL :
                        0xFFFFFFFFFFFFFFFFUL;
-    /* Compare: the immediate must equal the all-ones mask.
-     *  v is signed long; mask is unsigned long.  Compare as
-     *  unsigned by casting (v is non-negative for all-ones
-     *  in every width <= 63 bits). */
-    if (v < 0) return 0;
-    return ((unsigned long)v) == mask;
+    /* Compare: the immediate must be the all-ones mask for this width.
+     *  Mask the parsed value to the register width first, so the signed
+     *  spelling "-1" (which the assembler encodes identically to 0FFh /
+     *  0FFFFh / 0FFFFFFFFh -- all ones) is accepted, not only the non-
+     *  negative spelling.  Both forms produce the same machine encoding,
+     *  so both are correct candidates for the rewrite; rejecting "-1"
+     *  (the old `if (v < 0) return 0;` guard) was a missed optimization. */
+    return ((unsigned long)v & mask) == mask;
 }
 
 /* v2.56: P484 check -- reject memory sources for "mov R, X / xor R, R".
@@ -7072,7 +7292,7 @@ static const struct rule g_rule_tbl[] = {
         { "fstp", 0, SM_('a'), AN_, 1 } },
       PRE_FPU,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "fld st / fstp st -> delete (push/pop)", NULL },
+      "fld st / fstp st -> delete (push/pop)", fld_fstp_st0_check },
 
     /* P130 (v1.87): "fldz / fstp st" -> delete both.  Pushing zero and
      *  popping it immediately is a no-op on the stack (the pop
@@ -7082,7 +7302,7 @@ static const struct rule g_rule_tbl[] = {
         { "fstp", 0, RR_('a'), AN_, 1 } },
       PRE_FPU,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "fldz / fstp st -> delete (push 0/pop)", NULL },
+      "fldz / fstp st -> delete (push 0/pop)", fld_fstp_st0_check },
 
     /* P131 (v1.87): "fchs / fchs" -> delete both.  Negating the top of
      *  stack twice is a no-op (double negation).  fchs leaves the
@@ -8315,13 +8535,13 @@ static const struct rule g_rule_tbl[] = {
         { "adc", 0, SM_('a'), IV_(0), 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "add R,0 / adc R,0 -> delete both (flags dead)", NULL },
+      "add R,0 / adc R,0 -> delete both (flags dead)", restoring_pair_x64_check },
     { 2, 443,
       { { "sub", 0, RR_('a'), IV_(0), 2 },
         { "sbb", 0, SM_('a'), IV_(0), 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "sub R,0 / sbb R,0 -> delete both (flags dead)", NULL },
+      "sub R,0 / sbb R,0 -> delete both (flags dead)", restoring_pair_x64_check },
 
 
     /* ---- v2.28: identity / strength migrations + new table rules ---- */
@@ -8373,7 +8593,7 @@ static const struct rule g_rule_tbl[] = {
         { "not", 0, SM_('a'), AN_, 1 } },
       0,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "not R / not R -> delete both", NULL },
+      "not R / not R -> delete both", restoring_pair_x64_check },
 
     /* P25 (v2.28, migrated): "cmc / cmc" -> delete both.
      *  Carry inverted twice is restored; no other flag touched. */
@@ -8395,7 +8615,7 @@ static const struct rule g_rule_tbl[] = {
         { "sbb", 0, RR_('a'), IV_(0), 2 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "clc / sbb R,0 -> delete both (flags dead)", NULL },
+      "clc / sbb R,0 -> delete both (flags dead)", restoring_pair_x64_check },
     /* P445 (v2.56 REMOVED: exact dup of P720) */
 
     /* P446 (v2.28): "mov R,0 / and R,K" -> "mov R,0" (flags dead).
@@ -8411,29 +8631,33 @@ static const struct rule g_rule_tbl[] = {
 
     /* P449 (v2.28): "shl R,1 / shl R,1" -> "shl R,2" when OF dead
      *  (fused count > 1 leaves OF undefined vs two count-1 shifts).
-     *  Cousin of C P4 / table P155; explicit table form. */
+     *  Cousin of C P4 / table P155; explicit table form.
+     *  v2.60c: PRE_NO_CPU_8086 -- imm count != 1 is 186+ only
+     *  (8086/8088 only allow shift-by-1 or shift-by-CL). Matches
+     *  the C-side P4 gate (g_curcpu >= 2). Without this, -m86
+     *  output failed WASM with E002 on shl/sar R,2. */
     { 2, 449,
       { { "shl", 0, RR_('a'), IV_(1), 2 },
         { "shl", 0, SM_('a'), IV_(1), 2 } },
-      PRE_FLAGS_DEAD_OF,
+      PRE_FLAGS_DEAD_OF | PRE_NO_CPU_8086,
       { { ACT_REW, "shl $a, 2" }, { ACT_DEL, NULL } },
       "shl R,1 / shl R,1 -> shl R,2 (OF dead)", NULL },
     { 2, 449,
       { { "shr", 0, RR_('a'), IV_(1), 2 },
         { "shr", 0, SM_('a'), IV_(1), 2 } },
-      PRE_FLAGS_DEAD_OF,
+      PRE_FLAGS_DEAD_OF | PRE_NO_CPU_8086,
       { { ACT_REW, "shr $a, 2" }, { ACT_DEL, NULL } },
       "shr R,1 / shr R,1 -> shr R,2 (OF dead)", NULL },
     { 2, 449,
       { { "sal", 0, RR_('a'), IV_(1), 2 },
         { "sal", 0, SM_('a'), IV_(1), 2 } },
-      PRE_FLAGS_DEAD_OF,
+      PRE_FLAGS_DEAD_OF | PRE_NO_CPU_8086,
       { { ACT_REW, "sal $a, 2" }, { ACT_DEL, NULL } },
       "sal R,1 / sal R,1 -> sal R,2 (OF dead)", NULL },
     { 2, 449,
       { { "sar", 0, RR_('a'), IV_(1), 2 },
         { "sar", 0, SM_('a'), IV_(1), 2 } },
-      PRE_FLAGS_DEAD_OF,
+      PRE_FLAGS_DEAD_OF | PRE_NO_CPU_8086,
       { { ACT_REW, "sar $a, 2" }, { ACT_DEL, NULL } },
       "sar R,1 / sar R,1 -> sar R,2 (OF dead)", NULL },
 
@@ -8461,14 +8685,14 @@ static const struct rule g_rule_tbl[] = {
         { "inc", 0, SM_('a'), AN_, 1 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "dec R / inc R -> delete both (flags dead)", NULL },
+      "dec R / inc R -> delete both (flags dead)", restoring_pair_x64_check },
     /* P459 (v2.56 REMOVED: shadowed by C-rule P373 (rol/ror same-k pair)) */
     { 2, 459,
       { { "ror", 0, RR_('a'), IM_, 2 },
         { "rol", 0, SM_('a'), IM_, 2 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "ror R,k / rol R,k -> delete both (same k, flags dead)", p459_same_imm_check },
+      "ror R,k / rol R,k -> delete both (same k, flags dead)", p_restoring_pair_imm_check },
 
     /* P460 (v2.28): "mov R,S / mov R,S" -> delete second (P153). */
     { 2, 460,
@@ -8523,7 +8747,7 @@ static const struct rule g_rule_tbl[] = {
         { "add", 0, SM_('a'), IV_(0), 2 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "add R,0 / add R,0 -> delete both (flags dead)", NULL },
+      "add R,0 / add R,0 -> delete both (flags dead)", restoring_pair_x64_check },
 
     /* P464: "sub R,0 / sub R,0" -> delete both (flags dead). */
     { 2, 464,
@@ -8531,7 +8755,7 @@ static const struct rule g_rule_tbl[] = {
         { "sub", 0, SM_('a'), IV_(0), 2 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "sub R,0 / sub R,0 -> delete both (flags dead)", NULL },
+      "sub R,0 / sub R,0 -> delete both (flags dead)", restoring_pair_x64_check },
     /* P465 (v2.56 REMOVED: exact dup of P737 (also shadowed by C P3)) */
 
     /* P466: "clc / clc" already P21; "stc / clc" -> clc (second wins).
@@ -8591,13 +8815,13 @@ static const struct rule g_rule_tbl[] = {
         { "xor", 0, SM_('a'), IV_(-1), 2 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "not R / xor R,-1 -> delete both (flags dead)", NULL },
+      "not R / xor R,-1 -> delete both (flags dead)", restoring_pair_x64_check },
     { 2, 472,
       { { "xor", 0, RR_('a'), IV_(-1), 2 },
         { "not", 0, SM_('a'), AN_, 1 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "xor R,-1 / not R -> delete both (flags dead)", NULL },
+      "xor R,-1 / not R -> delete both (flags dead)", restoring_pair_x64_check },
     /* P474 (v2.56 REMOVED: shadowed by C-rule P8 (or R,R / and R,R)) */
 
     /* P475: "add R,0 / sub R,0" -> delete both (flags dead). */
@@ -8616,13 +8840,13 @@ static const struct rule g_rule_tbl[] = {
         { "xor", 0, SM_('a'), SM_('b'), 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "xor R,S / xor R,S -> delete both (flags dead)", p32_diff_regs_check },
+      "xor R,S / xor R,S -> delete both (flags dead)", p_restoring_pair_reg_check },
     { 2, 476,
       { { "xor", 0, RR_('a'), IM_, 2 },
         { "xor", 0, SM_('a'), IM_, 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "xor R,K / xor R,K -> delete both (flags dead)", p459_same_imm_check },
+      "xor R,K / xor R,K -> delete both (flags dead)", p_restoring_pair_imm_check },
 
     /* P477: "test R,R / or R,R" -> delete or (flags dead): or R,R after
      *  test is redundant on R; flags from or match test for SF/ZF/PF. */
@@ -8804,7 +9028,7 @@ static const struct rule g_rule_tbl[] = {
         { "add", 0, SM_('a'), IV_(2), 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "sub R,2 / add R,2 -> delete both (flags dead)", NULL },
+      "sub R,2 / add R,2 -> delete both (flags dead)", restoring_pair_x64_check },
 
     /* P492: "shl R,2 / shr R,2" -> delete both when flags dead —
      *  NOT sound (bits lost). WITHDRAWN. */
@@ -9011,7 +9235,7 @@ static const struct rule g_rule_tbl[] = {
         { "or", 0, SM_('a'), IV_(0), 2 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "or R,0 / or R,0 -> delete both (flags dead)", NULL },
+      "or R,0 / or R,0 -> delete both (flags dead)", restoring_pair_x64_check },
 
     /* P525: "and R,-1 / and R,-1" -> delete both when flags dead. */
     { 2, 525,
@@ -9019,7 +9243,7 @@ static const struct rule g_rule_tbl[] = {
         { "and", 0, SM_('a'), IV_(-1), 2 } },
       PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "and R,-1 / and R,-1 -> delete both (flags dead)", NULL },
+      "and R,-1 / and R,-1 -> delete both (flags dead)", restoring_pair_x64_check },
 
     /* P526: "cmc / clc -> clc" and "cmc / stc -> stc" (second wins). */
     { 2, 526,
@@ -9052,13 +9276,13 @@ static const struct rule g_rule_tbl[] = {
         { "sub", 0, SM_('a'), IM_, 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "add R,K / sub R,K -> delete both (same K, flags dead)", p459_same_imm_check },
+      "add R,K / sub R,K -> delete both (same K, flags dead)", p_restoring_pair_imm_check },
     { 2, 528,
       { { "sub", 0, RR_('a'), IM_, 2 },
         { "add", 0, SM_('a'), IM_, 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "sub R,K / add R,K -> delete both (same K, flags dead)", p459_same_imm_check },
+      "sub R,K / add R,K -> delete both (same K, flags dead)", p_restoring_pair_imm_check },
 
     /* P529: "xor R,K / xor R,K" same K already P476.  "neg R / add R,0"
      *  -> delete add (flags dead). */
@@ -9103,13 +9327,13 @@ static const struct rule g_rule_tbl[] = {
         { "sub", 0, SM_('a'), IV_(1), 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "inc R / sub R,1 -> delete both (flags dead)", NULL },
+      "inc R / sub R,1 -> delete both (flags dead)", restoring_pair_x64_check },
     { 2, 540,
       { { "dec", 0, RR_('a'), AN_, 1 },
         { "add", 0, SM_('a'), IV_(1), 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "dec R / add R,1 -> delete both (flags dead)", NULL },
+      "dec R / add R,1 -> delete both (flags dead)", restoring_pair_x64_check },
 
 
     /* ---- v2.40: bulk high-frequency null/identity rules (92) ---- */
@@ -9339,7 +9563,7 @@ static const struct rule g_rule_tbl[] = {
         { ACT_DEL, NULL },
         { ACT_DEL, NULL }
       },
-      "not/not -> delete both (flags dead)", NULL },
+      "not/not -> delete both (flags dead)", restoring_pair_x64_check },
 
     { 2, 570,
       {
@@ -9351,7 +9575,7 @@ static const struct rule g_rule_tbl[] = {
         { ACT_DEL, NULL },
         { ACT_DEL, NULL }
       },
-      "add R,1 / dec R -> delete both (flags dead)", NULL },
+      "add R,1 / dec R -> delete both (flags dead)", restoring_pair_x64_check },
 
     { 2, 571,
       {
@@ -9363,7 +9587,7 @@ static const struct rule g_rule_tbl[] = {
         { ACT_DEL, NULL },
         { ACT_DEL, NULL }
       },
-      "sub R,1 / inc R -> delete both (flags dead)", NULL },
+      "sub R,1 / inc R -> delete both (flags dead)", restoring_pair_x64_check },
 
     { 2, 572,
       {
@@ -10842,7 +11066,7 @@ static const struct rule g_rule_tbl[] = {
         { ACT_DEL, NULL },
         { ACT_DEL, NULL }
       },
-      "neg/neg -> delete both (flags dead)", NULL },
+      "neg/neg -> delete both (flags dead)", restoring_pair_x64_check },
 
     /* P712 (REMOVED v2.54): duplicate of P301 (line ~6956) which fires
      *  first via the hash chain.  rname[712] kept as doc. */
@@ -11025,7 +11249,7 @@ static const struct rule g_rule_tbl[] = {
         { ACT_DEL, NULL },
         { ACT_DEL, NULL }
       },
-      "add R,0 / sub R,0 -> delete both (flags dead)", NULL },
+      "add R,0 / sub R,0 -> delete both (flags dead)", restoring_pair_x64_check },
 
     { 2, 728,
       {
@@ -11037,7 +11261,7 @@ static const struct rule g_rule_tbl[] = {
         { ACT_DEL, NULL },
         { ACT_DEL, NULL }
       },
-      "sub R,0 / add R,0 -> delete both (flags dead)", NULL },
+      "sub R,0 / add R,0 -> delete both (flags dead)", restoring_pair_x64_check },
 
     { 2, 729,
       {
@@ -11049,7 +11273,7 @@ static const struct rule g_rule_tbl[] = {
         { ACT_DEL, NULL },
         { ACT_DEL, NULL }
       },
-      "shl R,0 / shr R,0 -> delete both (flags dead)", NULL },
+      "shl R,0 / shr R,0 -> delete both (flags dead)", restoring_pair_x64_check },
 
     { 2, 730,
       {
@@ -11061,7 +11285,7 @@ static const struct rule g_rule_tbl[] = {
         { ACT_DEL, NULL },
         { ACT_DEL, NULL }
       },
-      "rol R,0 / ror R,0 -> delete both (flags dead)", NULL },
+      "rol R,0 / ror R,0 -> delete both (flags dead)", restoring_pair_x64_check },
 
     { 2, 731,
       {
@@ -11073,7 +11297,7 @@ static const struct rule g_rule_tbl[] = {
         { ACT_DEL, NULL },
         { ACT_DEL, NULL }
       },
-      "ror R,0 / rol R,0 -> delete both (flags dead)", NULL },
+      "ror R,0 / rol R,0 -> delete both (flags dead)", restoring_pair_x64_check },
 
 
     { 2, 732,
@@ -11390,7 +11614,7 @@ static const struct rule g_rule_tbl[] = {
         { "sub", 0, SM_('a'), SM_('b'), 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "add R,S / sub R,S -> delete both (flags dead)", p32_diff_regs_check },
+      "add R,S / sub R,S -> delete both (flags dead)", p_restoring_pair_reg_check },
 
     /* P844 (v2.56 FIX): "sub R,S / add R,S" -> delete both (flags dead,
      *  not SP).  Same R==S fix as P843. */
@@ -11399,7 +11623,7 @@ static const struct rule g_rule_tbl[] = {
         { "add", 0, SM_('a'), SM_('b'), 2 } },
       PRE_FLAGS_DEAD_ALL | PRE_NOT_SP,
       { { ACT_DEL, NULL }, { ACT_DEL, NULL } },
-      "sub R,S / add R,S -> delete both (flags dead)", p32_diff_regs_check },
+      "sub R,S / add R,S -> delete both (flags dead)", p_restoring_pair_reg_check },
 
     /* ================================================================
      *  v2.53 NEW RULES (research: MSVC /FA, GCC -S, Clang -S, Delphi)
@@ -11435,33 +11659,36 @@ static const struct rule g_rule_tbl[] = {
       "movsx R,S (same fam, S narrower, R dead) -> delete",
       p860_movzx_same_fam_check },
 
-    /* P862 (v2.53): "bts R, K" with R dead after AND CF dead after
-     *  -> delete.  The BT family has only two observable effects:
-     *  writing bit K of R, and writing CF to the old value of bit K.
-     *  When both are dead, the instruction is pure dead weight.
-     *  This is the "delete form" complement to P415 (the "convert
-     *  to or/and/xor form", which fires when R is alive and all six
-     *  flags are dead).  386+ (bt* encoding).  Imm form only:
-     *  variable-count `bts R, CL` reads CL, which could be live
-     *  even with R and CF dead; the table cannot prove CL dead, so
-     *  OP_IMM restricts to constant K.  Research: Agner Fog
-     *  instruction_tables (BT-family microcoded on some cores);
-     *  Intel optimization guide "avoid BT for constant bit tests". */
+    /* P862 (v2.53, v2.61 SOUNDNESS FIX): "bts R, K" with R dead after
+     *  AND all six status flags dead after -> delete.  The BT family
+     *  (Intel SDM Vol.2, BT/BTS/BTR/BTC) writes CF to the old value of
+     *  bit K and leaves OF, SF, ZF, AF, PF *undefined*.  Deleting the
+     *  instruction leaves those five flags at their prior value instead
+     *  of undefined, so for strict bit-equivalence we require
+     *  PRE_FLAGS_DEAD_ALL (not just CF): every status flag must be
+     *  proven dead before any reader.  This is the "delete form"
+     *  complement to P415 (the "convert to or/and/xor form", which
+     *  fires when R is alive and all six flags are dead).  386+ (bt*
+     *  encoding).  Imm form only: variable-count `bts R, CL` reads CL,
+     *  which could be live even with R and the flags dead; the table
+     *  cannot prove CL dead, so OP_IMM restricts to constant K.
+     *  Research: Agner Fog instruction_tables (BT-family microcoded on
+     *  some cores); Intel SDM Vol.2 BT-family flag rules. */
     { 1, 862,
       { { "bts", 0, RR_('a'), IM_, 2 } },
-      PRE_CPU_386 | PRE_REG_DEAD_RA | PRE_FLAGS_DEAD_CF,
+      PRE_CPU_386 | PRE_REG_DEAD_RA | PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL } },
-      "bts R,K (R dead, CF dead) -> delete", NULL },
+      "bts R,K (R dead, flags dead) -> delete", NULL },
     { 1, 862,
       { { "btr", 0, RR_('a'), IM_, 2 } },
-      PRE_CPU_386 | PRE_REG_DEAD_RA | PRE_FLAGS_DEAD_CF,
+      PRE_CPU_386 | PRE_REG_DEAD_RA | PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL } },
-      "btr R,K (R dead, CF dead) -> delete", NULL },
+      "btr R,K (R dead, flags dead) -> delete", NULL },
     { 1, 862,
       { { "btc", 0, RR_('a'), IM_, 2 } },
-      PRE_CPU_386 | PRE_REG_DEAD_RA | PRE_FLAGS_DEAD_CF,
+      PRE_CPU_386 | PRE_REG_DEAD_RA | PRE_FLAGS_DEAD_ALL,
       { { ACT_DEL, NULL } },
-      "btc R,K (R dead, CF dead) -> delete", NULL },
+      "btc R,K (R dead, flags dead) -> delete", NULL },
 
     /* P863 (v2.53): "mov R8, K / movzx R32, R8" -> single "mov R32,
      *  (K & 0xFF)" (or R16 dest).  The first mov writes R8 = K;
@@ -13415,7 +13642,14 @@ static long run_pass(void)
                     int k = 0;
                     long vv = v;
                     while (vv > 1) { vv >>= 1; k++; }
-                    if (k == 0 && flags_clear(next_code(i), F_ALL6)) {
+                    if (k == 0 && flags_clear(next_code(i), F_ALL6) &&
+                        /* v2.61 SOUNDNESS FIX: x64+32-bit imul zero-extends
+                         *  bits 63..32; "imul R,1" restores R but CLEARS the
+                         *  upper 32, while deleting preserves it.  The shl
+                         *  / neg rewrites below are sound (both forms
+                         *  zero-extend the same result); only the identity
+                         *  delete needs the guard. */
+                        !(g_curcpu >= 128 && w == 32)) {
                         vlog("smartpp: line %ld: deleted 'imul %s, 1' (identity, P38)\n",
                             i + 1, pi->op0);
                         DEL(i) = 1;
@@ -13564,7 +13798,11 @@ static long run_pass(void)
             pi->nops == 1 &&
             (ci_eq(pi->mnem, "inc") || ci_eq(pi->mnem, "dec"))) {
             int r22 = find_reg(pi->op0);
-            if (r22 >= 0 && g_regs[r22].fam != 4) {
+            if (r22 >= 0 && g_regs[r22].fam != 4 &&
+                /* v2.61 SOUNDNESS FIX: x64+32-bit inc/dec zero-extends
+                 *  bits 63..32; the restoring pair clears them while
+                 *  deleting preserves them.  Same guard as P58. */
+                !(g_curcpu >= 128 && g_regs[r22].hi - g_regs[r22].lo == 32)) {
                 j = next_code(i);
                 if (j >= 0 && !INDEF(j)) {
                     struct pinfo *pj = &g_ppair;
@@ -13595,7 +13833,11 @@ static long run_pass(void)
         if (!pi->haslabel && !pi->toobig && pi->cls == I_OTHER &&
             pi->nops == 1 && ci_eq(pi->mnem, "neg")) {
             int r24 = find_reg(pi->op0);
-            if (r24 >= 0 && g_regs[r24].fam != 4) {
+            if (r24 >= 0 && g_regs[r24].fam != 4 &&
+                /* v2.61 SOUNDNESS FIX: x64+32-bit neg zero-extends bits
+                 *  63..32; restoring pair clears them, delete preserves.
+                 *  Same guard as P58. */
+                !(g_curcpu >= 128 && g_regs[r24].hi - g_regs[r24].lo == 32)) {
                 j = next_code(i);
                 if (j >= 0 && !INDEF(j)) {
                     struct pinfo *pj = &g_ppair;
@@ -13674,7 +13916,14 @@ static long run_pass(void)
             int x_disjoint = (x58 < 0) || r58 < 0 ||
                              (g_regs[x58].fam != g_regs[r58].fam);
             if (r58 >= 0 && g_regs[r58].fam != 4 && op1_ok &&
-                x_disjoint) {
+                x_disjoint &&
+                /* v2.61 SOUNDNESS FIX: in x64 a 32-bit xor writes the
+                 *  32-bit half and zero-extends bits 63..32 of the full
+                 *  register.  The pair restores the low 32 but CLEARS the
+                 *  upper 32, whereas deleting preserves it -- so a later
+                 *  reader of the full register gets the wrong value.
+                 *  Same guard as same_reg_noop_check. */
+                !(g_curcpu >= 128 && g_regs[r58].hi - g_regs[r58].lo == 32)) {
                 j = next_code(i);
                 if (j >= 0 && !INDEF(j)) {
                     struct pinfo *pj = &g_ppair;
@@ -13710,7 +13959,11 @@ static long run_pass(void)
             int s27 = find_reg(pi->op1);
             if (r27 >= 0 && s27 >= 0 &&
                 g_regs[r27].fam != g_regs[s27].fam &&
-                g_regs[r27].fam != 4) {
+                g_regs[r27].fam != 4 &&
+                /* v2.61 SOUNDNESS FIX: x64+32-bit add/sub zero-extends
+                 *  bits 63..32; deleting the restoring pair preserves
+                 *  them, so a full-register reader is miscompiled. */
+                !(g_curcpu >= 128 && g_regs[r27].hi - g_regs[r27].lo == 32)) {
                 j = next_code(i);
                 if (j >= 0 && !INDEF(j)) {
                     struct pinfo *pj = &g_ppair;
@@ -13748,7 +14001,11 @@ static long run_pass(void)
             int r39 = find_reg(pi->op0);
             long c1;
             if (r39 >= 0 && g_regs[r39].fam != 4 &&
-                try_parse_number(pi->op1, &c1) && c1 != 0) {
+                try_parse_number(pi->op1, &c1) && c1 != 0 &&
+                /* v2.61 SOUNDNESS FIX: x64+32-bit add/sub zero-extends
+                 *  bits 63..32; deleting the restoring pair preserves
+                 *  them.  Same guard as same_reg_noop_check. */
+                !(g_curcpu >= 128 && g_regs[r39].hi - g_regs[r39].lo == 32)) {
                 j = next_code(i);
                 if (j >= 0 && !INDEF(j)) {
                     struct pinfo *pj = &g_ppair;
@@ -13789,6 +14046,14 @@ static long run_pass(void)
             long c1;
             if (r49 >= 0 && g_regs[r49].fam == 4 &&
                 (g_regs[r49].hi == 16 || g_regs[r49].hi == 32) &&
+                /* v2.61 SOUNDNESS FIX: in x64, "add esp,c / sub esp,c"
+                 *  writes the 32-bit esp and zero-extends rsp (clears bits
+                 *  63..32); the pair restores esp but CLEARS the upper 32,
+                 *  while deleting preserves rsp -- a real miscompile since
+                 *  rsp is a full 64-bit stack address.  Reject the 32-bit
+                 *  (esp) form in long mode; the 16-bit (sp) form is 16-bit
+                 *  mode only and unaffected. */
+                !(g_curcpu >= 128 && g_regs[r49].hi == 32) &&
                 try_parse_number(pi->op1, &c1) && c1 != 0 &&
                 (c1 & ((g_regs[r49].hi == 16) ? 1 : 3)) == 0) {
                 j = next_code(i);
@@ -15502,18 +15767,26 @@ static long run_pass(void)
             }
         }
 
-        /* ---- v2.23: rol R,k / ror R,k (same k) -> delete both ---- */
+        /* ---- v2.23: rol R,k / ror R,k (same k) -> delete both ----
+         *  v2.61 SOUNDNESS FIX: in x64 a 32-bit rol/ror writes the 32-bit
+         *  half and zero-extends bits 63..32 of the full register.  The
+         *  pair restores the low 32 but CLEARS the upper 32, whereas
+         *  deleting preserves it -- so a later reader of the full register
+         *  gets the wrong value.  Same guard as same_reg_noop_check. */
         if (!pi->toobig && !pi->haslabel &&
             (ci_eq(pi->mnem, "rol") || ci_eq(pi->mnem, "ror")) &&
-            pi->nops == 2 && find_reg(pi->op0) >= 0) {
+            pi->nops == 2) {
+            int r373 = find_reg(pi->op0);
             long j = next_code(i);
             long k1, k2;
-            if (j >= 0 && !DEL(j) &&
+            if (r373 >= 0 &&
+                !(g_curcpu >= 128 && g_regs[r373].hi - g_regs[r373].lo == 32) &&
+                j >= 0 && !DEL(j) &&
                 try_parse_number(pi->op1, &k1)) {
                 struct pinfo *pj = &g_ppair;
                 parse_line(j, pj);
                 if (!pj->haslabel && !pj->toobig && pj->nops == 2 &&
-                    find_reg(pj->op0) == find_reg(pi->op0) &&
+                    find_reg(pj->op0) == r373 &&
                     try_parse_number(pj->op1, &k2) && k1 == k2 &&
                     ((ci_eq(pi->mnem, "rol") && ci_eq(pj->mnem, "ror")) ||
                      (ci_eq(pi->mnem, "ror") && ci_eq(pj->mnem, "rol"))) &&
@@ -15661,14 +15934,8 @@ static long run_pass(void)
                         a > 0 ? " + shl" : "");
                     replace_line(i, g_build);
                     if (a > 0) {
-                        char shln[MAXTOK];
-                        char nb[16];
-                        strcpy(shln, pi->prefix);
-                        strcat(shln, "shl ");
-                        strcat(shln, pi->op0);
-                        strcat(shln, ", ");
-                        sprintf(nb, "%d", a);
-                        strcat(shln, nb);
+                        char shln[MAXLINE];
+                        sprintf(shln, "%sshl %s, %d", pi->prefix, pi->op0, a);
                         insert_line_after(i, shln);
                     }
                     st[380]++;
@@ -15682,7 +15949,6 @@ static long run_pass(void)
                     int shamt = (m == 31) ? 5 : 6;
                     int t = find_dead_scratch(next_code(i), dst_r, w);
                     if (t >= 0 && g_regs[t].fam != g_regs[src_r].fam) {
-                        char nb[16];
                         /* mov T, src */
                         sprintf(g_build, "%smov %s, %s", pi->prefix,
                                 g_regs[t].name, src_name);
@@ -15724,8 +15990,7 @@ static long run_pass(void)
                          *  the first lea destroys it before the second */
                         if (t >= 0 && g_regs[t].fam == g_regs[src_r].fam) t = -1;
                         if (t >= 0) {
-                            char shln[MAXTOK];
-                            char nb[16];
+                            char shln[MAXLINE];
                             /* T = src + src*t_s */
                             sprintf(g_build, "%slea %s, ", pi->prefix,
                                 g_regs[t].name);
@@ -15746,12 +16011,7 @@ static long run_pass(void)
                                 g_regs[t].name, t2->f_s);
                             insert_line_after(i, g_build);
                             if (a > 0) {
-                                strcpy(shln, pi->prefix);
-                                strcat(shln, "shl ");
-                                strcat(shln, pi->op0);
-                                strcat(shln, ", ");
-                                sprintf(nb, "%d", a);
-                                strcat(shln, nb);
+                                sprintf(shln, "%sshl %s, %d", pi->prefix, pi->op0, a);
                                 insert_line_after(i + 1, shln);
                             }
                             st[380]++;
@@ -15828,7 +16088,13 @@ static long run_pass(void)
                     lea_bracket(pj->op1, &base, &disp) &&
                     base == pi->dreg &&
                     find_reg(pj->op0) != pi->dreg &&
-                    reg_dead_cf(next_code(j), pi->dreg)) {
+                    reg_dead_cf(next_code(j), pi->dreg) &&
+                    /* v2.60f: new base S must be a legal addressing
+                     *  register for the current width/CPU.  On 8086
+                     *  only BX/BP/SI/DI; otherwise `lea dx,[cx+4]`
+                     *  would be emitted from `mov ax,cx / lea dx,[ax+4]`
+                     *  after folding -- illegal form. */
+                    lea_base_ok(pi->sreg, reg_width(pi->sreg))) {
                     char opnd[MAXTOK];
                     emit_lea_disp(opnd, pi->sreg, disp);
                     strcpy(g_build, pj->prefix);
@@ -16225,8 +16491,14 @@ static long run_pass(void)
                         continue;
                     }
                     /* v2.35 P47b: mov R,S / add R,S -> lea R,[S+S]
-                     *  (R was S, add is *2).  Same gates as P47. */
-                    if (!pj->haslabel && !pj->toobig &&
+                     *  (R was S, add is *2).  Same outer gates as P47.
+                     *  v2.60c: [S+S] is NOT a legal 16-bit addressing
+                     *  mode (only [BX|BP]+[SI|DI] pairs).  Same-register
+                     *  base+index needs the 386 SIB byte.  Restrict to
+                     *  32/64-bit (already implies g_curcpu >= 8 above).
+                     *  Matches the p323_lea_rr_check discipline. */
+                    if (w47 >= 32 &&
+                        !pj->haslabel && !pj->toobig &&
                         pj->cls == I_OTHER && pj->nops == 2 &&
                         ci_eq(pj->mnem, "add") &&
                         find_reg(pj->op0) == pi->dreg &&
@@ -18000,7 +18272,16 @@ static long run_pass(void)
                     if (g_regs[pj->dreg].fam == g_regs[rsrc].fam &&
                         (g_regs[pj->dreg].hi - g_regs[pj->dreg].lo) ==
                         (g_regs[rsrc].hi - g_regs[rsrc].lo) &&
-                        g_regs[pj->dreg].lo == g_regs[rsrc].lo) {
+                        g_regs[pj->dreg].lo == g_regs[rsrc].lo &&
+                        /* v2.61 SOUNDNESS FIX: the reload "mov R,[rbp+n]"
+                         *  writes R and zero-extends bits 63..32 in x64;
+                         *  deleting it preserves the upper 32 that the
+                         *  load would clear.  Reject 32-bit dest in long
+                         *  mode.  (The "different reg" mov S,R rewrite
+                         *  below is sound -- both forms zero-extend S to
+                         *  the same value.) */
+                        !(g_curcpu >= 128 &&
+                          (g_regs[pj->dreg].hi - g_regs[pj->dreg].lo) == 32)) {
                         /* same register: load is pure redundant */
                         vlog("smartpp: line %ld: deleted stack reload (P511)\\n",
                             j + 1);
